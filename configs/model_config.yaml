@@ -1,0 +1,94 @@
+forecast_model:
+  source_model_path: assets/fuxi_teacher/short.onnx
+  input_size: [181, 360]
+  time_steps: 2
+  in_chans: 70
+  aux_chans: 5
+  out_chans: 70
+  forecast_steps: 2
+  temb_dim: 12
+  patch_size: [4, 4]
+  embed_dim: 768
+  num_heads: 16
+  window_size: 9
+  depths: [4, 4, 4, 4]
+  num_groups: 32
+  mlp_hidden_dim: 2048
+  d_high: 768
+  device: meta
+  dtype: float16
+
+intrinsic_model:
+  d_intrinsic: 16
+  hidden_dims: [2048, 512]
+  apply_tanh: true
+  device: meta
+  dtype: float16
+
+data:
+  dataset_url: gs://gcp-public-data-arco-era5/ar/1959-2022-1h-360x181_equiangular_with_poles_conservative.zarr
+  input_time_offsets_hours: [-1, 0]
+  lead_time_hours: 1
+  forecast_steps: 2
+  sample_stride_hours: 1
+  pressure_levels: [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
+  upper_air_variables: [geopotential, temperature, u_component_of_wind, v_component_of_wind, relative_humidity]
+  surface_variables: [2m_temperature, 10m_u_component_of_wind, 10m_v_component_of_wind, mean_sea_level_pressure, total_precipitation]
+  static_variables: [land_sea_mask, orography, cos_latitude, cos_longitude, sin_longitude]
+  humidity_source: auto
+  orography_source: geopotential_at_surface
+  convert_geopotential_to_height: true
+  latitude_descending: true
+  gcs_token: anon
+
+train_main:
+  batch_size: 1
+  num_workers: 0
+  learning_rate: 1.0e-4
+  weight_decay: 0.05
+  max_epochs: 1
+  device: auto
+  model_dtype: float16
+  use_amp: false
+  amp_dtype: float16
+  gradient_clip_norm: null
+  output_dir: runs/main
+  checkpoint_name: main_last.pt
+  best_checkpoint_name: main_best.pt
+  train_start_time: 2018-01-01 01:00:00
+  train_end_time: 2018-01-07 23:00:00
+  val_start_time: 2018-01-08 00:00:00
+  val_end_time: 2018-01-08 23:00:00
+  max_train_batches: 10
+  max_val_batches: 2
+  log_every: 1
+  print_model_summary: true
+  summary_depth: 3
+  random_smoke_batch_size: 1
+
+train_intrinsic:
+  batch_size: 1
+  num_workers: 0
+  learning_rate: 1.0e-4
+  weight_decay: 0.05
+  max_epochs: 1
+  device: auto
+  model_dtype: float32
+  use_amp: false
+  amp_dtype: float16
+  gradient_clip_norm: null
+  output_dir: runs/intrinsic
+  checkpoint_name: intrinsic_last.pt
+  best_checkpoint_name: intrinsic_best.pt
+  main_checkpoint_path: runs/main/main_last.pt
+  detach_z_high: true
+  train_start_time: 2018-01-01 01:00:00
+  train_end_time: 2018-01-07 23:00:00
+  val_start_time: 2018-01-08 00:00:00
+  val_end_time: 2018-01-08 23:00:00
+  max_train_batches: 10
+  max_val_batches: 2
+  log_every: 1
+  print_model_summary: true
+  summary_depth: 3
+  random_smoke_batch_size: 1

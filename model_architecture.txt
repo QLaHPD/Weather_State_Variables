@@ -1,0 +1,338 @@
+FuXi Lower-Resolution Architecture Flow
+=======================================
+
+This file documents the proposed data flow of a modified lower-resolution FuXi-style
+model with a spatial high-level latent bottleneck `Z_high` and a separate intrinsic
+latent branch `Z_intrinsic`.
+
+Source recipe
+-------------
+- Starts from the current lower-resolution FuXi-style model implemented in
+  `weather_state_variables/models/fuxi_lower_res.py`
+- Preserves the outer geometry:
+  - time embedding MLP
+  - patch embedding after time/channel merge
+  - one down block
+  - four Swin V2 stages
+  - one up block
+  - linear patch head
+- Main architectural change:
+  - remove the end-of-core 4-stage FPN concatenation/projection
+  - split the transformer core into two stage pairs
+  - fuse the first pair with `concat(S0, S1) -> project back to 1536 -> Z_high`
+  - fuse the second pair with `concat(S2, S3) -> project back to 1536`
+  - use a spatial high-level latent `Z_high` as the only bottleneck in the main forecast path
+- Auxiliary architectural change:
+  - add a separate intrinsic autoencoder branch operating on flattened `Z_high`
+  - this branch produces `Z_intrinsic`
+  - this branch is trained with reconstruction + smoothness + space-filling losses
+  - the main model only uses `Z_high` as its bottleneck and is trained with forecast loss only
+
+
+Default lower-resolution inputs
+-------------------------------
+- `x`: `[B, 2, 70, 181, 360]`
+- `temb`: `[B, 12]`
+- `static_features` optional:
+  - `[B, 5, 181, 360]`, or
+  - `[B, 2, 5, 181, 360]`
+- If `static_features` is omitted, the model uses zeros with shape `[1, 5, 181, 360]`
+
+
+Proposed latent dimensions
+--------------------------
+- `D_high`: spatial bottleneck width for `Z_high`
+  - example: `64`, `96`, or `128`
+- `D_intrinsic`: intrinsic latent width for `Z_intrinsic`
+  - example: `8`, `16`, `32`, or other chosen intrinsic size
+- `Z_high` is spatial:
+  - `[B, D_high, 23, 45]`
+- `Z_intrinsic` is vector-valued:
+  - `[B, D_intrinsic]`
+
+
+Flow through the modified lower-resolution model
+------------------------------------------------
+
+1. Weather input
+- `x`: `[B, 2, 70, 181, 360]`
+
+2. Resize to patch-compatible spatial size
+- `x -> bilinear resize -> [B, 2, 70, 180, 360]`
+- `static_features -> bilinear resize -> [B, 2, 5, 180, 360]`
+- Only height changes here: `181 -> 180`
+
+3. Per-time-step feature augmentation
+- Concatenate weather channels and the broadcast static 5-channel map for each time step
+- `[B, 2, 70, 180, 360] + [B, 2, 5, 180, 360]`
+- Result: `[B, 2, 75, 180, 360]`
+
+4. Merge time into channels
+- Combine the 2 time steps along channel dimension
+- `[B, 2, 75, 180, 360] -> [B, 150, 180, 360]`
+
+5. Patch embedding
+- `Conv2d(in=150, out=1536, kernel=4, stride=4)`
+- `[B, 150, 180, 360] -> [B, 1536, 45, 90]`
+- Convert to channel-last and apply `LayerNorm`
+- `[B, 1536, 45, 90] -> [B, 45, 90, 1536]`
+
+6. Time embedding
+- `temb: [B, 12]`
+- `Linear(12 -> 1536) -> SiLU -> Linear(1536 -> 1536)`
+- Result: `[B, 1536]`
+
+7. Down block
+- Convert patch features back to channel-first
+- `[B, 45, 90, 1536] -> [B, 1536, 45, 90]`
+- Downsample:
+  - `Conv2d(1536 -> 1536, kernel=3, stride=2, padding=1)`
+  - `[B, 1536, 45, 90] -> [B, 1536, 23, 45]`
+- Time-conditioned residual block:
+  - `GroupNorm -> SiLU -> Conv3x3`
+  - `temb -> SiLU -> Linear(1536 -> 3072) -> split into scale and shift`
+  - `GroupNorm -> scale/shift modulation -> SiLU -> Conv3x3`
+  - Residual add
+- Output and skip tensor:
+  - `skip = [B, 1536, 23, 45]`
+
+8. Transformer core input
+- Convert to channel-last for Swin V2 blocks
+- `[B, 1536, 23, 45] -> [B, 23, 45, 1536]`
+
+- Each transformer block keeps shape `[B, 23, 45, 1536]`
+
+- Each transformer block uses:
+  - `LayerNorm`
+  - window attention with:
+    - `num_heads = 24`
+    - `window_size = 9`
+    - alternating shift: `0`, then `4`, then `0`, then `4`, ...
+    - dynamic mask so non-divisible grids like `23 x 45` still work
+  - residual add
+  - reshape to token form when entering the MLP path
+  - `LayerNorm`
+  - gated GELU MLP:
+    - `fc1: 1536 -> 8192`
+    - split into two `4096` halves
+    - `GELU(gate_half) * value_half`
+    - `fc2: 4096 -> 1536`
+  - residual add
+
+9. Transformer core, first pair
+- Stage 0:
+  - 12 blocks
+  - input: `[B, 23, 45, 1536]`
+  - output: `S0 = [B, 23, 45, 1536]`
+
+- Stage 1:
+  - 12 blocks
+  - input: `S0`
+  - output: `S1 = [B, 23, 45, 1536]`
+
+10. First pair fusion
+- Concatenate the outputs of Stage 0 and Stage 1 along channel dimension
+- `[B, 23, 45, 1536] + [B, 23, 45, 1536] -> [B, 23, 45, 3072]`
+
+- Project the fused pair back to model width
+- `Linear(3072 -> 1536)`
+- Result:
+  - `F01 = [B, 23, 45, 1536]`
+
+11. Midpoint spatial bottleneck: `Z_high`
+- Convert fused first-pair features to channel-first
+- `[B, 23, 45, 1536] -> [B, 1536, 23, 45]`
+
+- Project to spatial latent with a `1x1` convolution
+- `Conv2d(1536 -> D_high, kernel=1, stride=1)`
+- Result:
+  - `Z_high = [B, D_high, 23, 45]`
+
+- `Z_high` is the only bottleneck used by the main forecast path
+
+12. Expand `Z_high` back to hidden width
+- `Conv2d(D_high -> 1536, kernel=1, stride=1)`
+- `[B, D_high, 23, 45] -> [B, 1536, 23, 45]`
+- Convert back to channel-last
+- `[B, 1536, 23, 45] -> [B, 23, 45, 1536]`
+
+13. Transformer core, second pair
+- Continue the transformer core using the expanded bottleneck representation
+
+- Stage 2:
+  - 12 blocks
+  - input: `[B, 23, 45, 1536]`
+  - output: `S2 = [B, 23, 45, 1536]`
+
+- Stage 3:
+  - 12 blocks
+  - input: `S2`
+  - output: `S3 = [B, 23, 45, 1536]`
+
+14. Second pair fusion
+- Concatenate the outputs of Stage 2 and Stage 3 along channel dimension
+- `[B, 23, 45, 1536] + [B, 23, 45, 1536] -> [B, 23, 45, 3072]`
+
+- Project the fused pair back to model width
+- `Linear(3072 -> 1536)`
+- Result:
+  - `F23 = [B, 23, 45, 1536]`
+
+- The main path now follows:
+  - input features
+  - Stage 0
+  - Stage 1
+  - `concat(S0, S1)`
+  - project back to `1536`
+  - `Z_high` bottleneck
+  - expand back to `1536`
+  - Stage 2
+  - Stage 3
+  - `concat(S2, S3)`
+  - project back to `1536`
+
+- No 4-stage concatenation is used in this variant
+- No `Linear(6144 -> 1536)` FPN projection is used in this variant
+
+15. Up block
+- Convert final fused transformer features back to channel-first
+- `[B, 23, 45, 1536] -> [B, 1536, 23, 45]`
+- Concatenate with skip tensor from the down block
+- `[B, 1536, 23, 45] + [B, 1536, 23, 45] -> [B, 3072, 23, 45]`
+- Time-conditioned residual block:
+  - main path starts with `Conv3x3(3072 -> 1536)`
+  - skip path uses `Conv1x1(3072 -> 1536)`
+  - time conditioning again uses `Linear(1536 -> 3072)` and scale/shift modulation
+- Result after residual block: `[B, 1536, 23, 45]`
+- Upsample:
+  - `ConvTranspose2d(1536 -> 1536, kernel=4, stride=2, padding=1)`
+  - `[B, 1536, 23, 45] -> [B, 1536, 46, 90]`
+
+16. Linear patch head
+- Convert to channel-last
+- `[B, 1536, 46, 90] -> [B, 46, 90, 1536]`
+- `Linear(1536 -> 1120)`
+- `1120 = 70 * 4 * 4`
+- Result: `[B, 46, 90, 1120]`
+
+17. Reconstruct weather grid from patches
+- Reshape patch vectors into spatial patches
+- `[B, 46, 90, 1120]`
+- `-> [B, 46, 90, 4, 4, 70]`
+- `-> [B, 70, 184, 360]`
+
+18. Final resize back to requested lower-resolution grid
+- Bilinear resize
+- `[B, 70, 184, 360] -> [B, 70, 181, 360]`
+
+19. Main model outputs
+- `forecast = prediction -> [B, 2, 70, 181, 360]`
+- `forecast[:, 0] = X_{t+1}`
+- `forecast[:, 1] = X_{t+2}`
+- `z_high -> [B, D_high, 23, 45]`
+- Forward return:
+- `{"forecast": forecast, "z_high": z_high}`
+
+
+Auxiliary intrinsic latent branch
+---------------------------------
+This branch is separate from the main forecast path.
+
+1. Branch input
+- Start from `Z_high`
+- `Z_high: [B, D_high, 23, 45]`
+
+2. Optional gradient isolation
+- If the intrinsic branch should not influence the main model, use:
+  - `Z_high_detached = stop_gradient(Z_high)`
+- This keeps the main model trained only by the forecast loss
+
+3. Flatten spatial latent
+- `[B, D_high, 23, 45] -> [B, D_high * 23 * 45]`
+
+4. Intrinsic encoder
+- MLP encoder maps flattened `Z_high` to a compact vector
+- Example:
+  - `Linear(D_high*23*45 -> H1) -> SiLU`
+  - `Linear(H1 -> H2) -> SiLU`
+  - `Linear(H2 -> D_intrinsic)`
+- Result:
+  - `Z_intrinsic = [B, D_intrinsic]`
+
+5. Intrinsic latent bounding
+- Optionally apply `tanh` to the encoder output
+- This bounds `Z_intrinsic` to `[-1, 1]`
+- This is convenient when using a space-filling loss over a fixed latent domain
+
+6. Intrinsic decoder
+- MLP decoder reconstructs flattened `Z_high`
+- Example:
+  - `Linear(D_intrinsic -> H2) -> SiLU`
+  - `Linear(H2 -> H1) -> SiLU`
+  - `Linear(H1 -> D_high*23*45)`
+- Reconstructed output:
+  - `Z_high_recon_flat = [B, D_high * 23 * 45]`
+
+7. Optional reshape for inspection
+- `Z_high_recon_flat -> [B, D_high, 23, 45]`
+
+8. Branch role
+- `Z_intrinsic` is not used by the main forecast path in this version
+- `Z_intrinsic` exists to learn a compact intrinsic state from `Z_high`
+- The branch is trained with dedicated latent-space losses
+
+
+Losses
+------
+
+Main forecast model loss
+------------------------
+The main forecast model is trained only with regular reconstruction error on weather
+targets.
+
+- Let:
+  - `y_pred = forecast`
+  - `y_true = target future weather states`
+
+- Forecast loss:
+- `L_forecast = MSE(y_pred, y_true)`
+
+- No intrinsic smoothness loss is applied directly to the main forecast path
+- No intrinsic space-filling loss is applied directly to the main forecast path
+
+
+Auxiliary intrinsic branch loss
+-------------------------------
+The intrinsic branch is trained separately on sequences of `Z_high` values.
+
+- Let:
+  - `z_t = flatten(Z_high_t)`
+  - `v_t = Z_intrinsic_t`
+
+1. Reconstruction loss
+- Reconstruct flattened `Z_high` from `Z_intrinsic`
+- `L_reconstruct = MSE(z_recon_t, z_t)`
+
+2. Smoothness loss
+- Apply smoothness in intrinsic space over temporal sequences
+- `L_smooth = max(0, ||v_{t+2Δt} - v_t|| - 2L0) + η * max(0, ||v_{t+Δt} - v_t|| - L0)`
+
+- `L0 > 0` is a threshold
+- `η` controls whether the one-step term is included
+
+3. Space-filling loss
+- Encourage the intrinsic states to use the latent domain instead of collapsing to a
+  tiny region
+- If `v_t` is bounded to `[-1, 1]^{D_intrinsic}`, define:
+- `L_space = SinkhornDistance(distribution({v_t}), Uniform([-1,1]^{D_intrinsic}))`
+
+4. Intrinsic branch total loss
+- `L_intrinsic = w_reconstruct * L_reconstruct + β * (w_smooth * L_smooth + w_space * L_space)`
+
+5. Cyclic annealing for `β`
+- Train the intrinsic branch with cyclic annealing:
+  - start with `β = 0`
+  - optimize mostly reconstruction first
+  - gradually increase `β` toward `1`
+  - hold for a period
+  - reset and repeat

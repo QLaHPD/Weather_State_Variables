@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Large local model artifacts
+assets/fuxi_teacher/short
+assets/fuxi_teacher/*.onnx
+assets/fuxi_teacher/*.pt
+
+# Local training outputs
+runs/
+
+# Editor/OS noise
+.DS_Store

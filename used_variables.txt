@@ -1,0 +1,183 @@
+FuXi Input Variables
+====================
+
+This file lists the input variables needed by the current FuXi-style models in this
+repo.
+
+The dynamic weather input uses 2 time steps:
+- x: [B, 2, 70, H, W]
+
+The 70 dynamic channels are the official FuXi variables, in the exact order documented
+by the original repository.
+
+
+1. Volumetric / Upper-Air Variables
+-----------------------------------
+These are 5 meteorological variables on 13 pressure levels each, for a total of 65
+channels.
+
+Pressure levels used:
+- 50 hPa
+- 100 hPa
+- 150 hPa
+- 200 hPa
+- 250 hPa
+- 300 hPa
+- 400 hPa
+- 500 hPa
+- 600 hPa
+- 700 hPa
+- 850 hPa
+- 925 hPa
+- 1000 hPa
+
+Variables:
+- Z: geopotential
+- T: temperature
+- U: u-component of wind
+- V: v-component of wind
+- R: relative humidity
+
+Exact channel order:
+- Z50
+- Z100
+- Z150
+- Z200
+- Z250
+- Z300
+- Z400
+- Z500
+- Z600
+- Z700
+- Z850
+- Z925
+- Z1000
+- T50
+- T100
+- T150
+- T200
+- T250
+- T300
+- T400
+- T500
+- T600
+- T700
+- T850
+- T925
+- T1000
+- U50
+- U100
+- U150
+- U200
+- U250
+- U300
+- U400
+- U500
+- U600
+- U700
+- U850
+- U925
+- U1000
+- V50
+- V100
+- V150
+- V200
+- V250
+- V300
+- V400
+- V500
+- V600
+- V700
+- V850
+- V925
+- V1000
+- R50
+- R100
+- R150
+- R200
+- R250
+- R300
+- R400
+- R500
+- R600
+- R700
+- R850
+- R925
+- R1000
+
+
+2. 2D Surface Variables
+-----------------------
+These are the last 5 channels of the 70-channel dynamic input.
+
+Exact channel order:
+- T2M: 2-meter temperature
+- U10: 10-meter u wind
+- V10: 10-meter v wind
+- MSL: mean sea-level pressure
+- TP: total precipitation
+
+
+3. Static Auxiliary Channels
+----------------------------
+The checkpoint also uses 5 static channels:
+- static_features: [B, 5, H, W]
+
+Important note:
+- Public FuXi/FuXi-ENS descriptions usually name 4 geographical inputs:
+  - orography
+  - land-sea mask
+  - latitude
+  - longitude
+- But the actual short.onnx checkpoint stores 5 static tensor channels.
+- From direct inspection of the ONNX weights, the 5 channels used by this checkpoint are:
+
+1. Land-sea mask or land fraction map
+- Inferred from the ONNX tensor statistics.
+- Values are in [0, 1].
+
+2. Orography / terrain height map
+- Inferred from the ONNX tensor statistics.
+- Stored as a normalized continuous field.
+
+3. cos(latitude)
+- Verified directly from the ONNX tensor values.
+
+4. cos(longitude)
+- Verified directly from the ONNX tensor values.
+
+5. sin(longitude)
+- Verified directly from the ONNX tensor values.
+
+So the model effectively uses:
+- 65 upper-air channels
+- 5 surface channels
+- 5 static channels
+
+
+4. Time Embedding Input
+-----------------------
+The model also requires a separate temporal embedding input:
+- temb: [B, 12]
+
+This is not part of the 70 weather channels or the 5 static channels.
+
+
+5. Summary
+----------
+To run the model, you need:
+- x with shape [B, 2, 70, H, W]
+- the 70 channels in the exact order listed above
+- static_features with shape [B, 5, H, W] or a broadcast-compatible equivalent
+- temb with shape [B, 12]
+
+
+Sources
+-------
+- Official FuXi repo variable order:
+  - https://github.com/tpys/FuXi
+- Earth2Studio FuXi docs:
+  - https://nvidia.github.io/earth2studio/modules/generated/models/px/earth2studio.models.px.FuXi.html
+- Local ONNX checkpoint inspected in this repo:
+  - assets/fuxi_teacher/short.onnx
+  - assets/fuxi_teacher/short

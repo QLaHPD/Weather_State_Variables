@@ -2,6 +2,7 @@
 
 from .pipeline import (
     IntrinsicTrainingConfig,
+    LatitudeWeightedCharbonnierLoss,
     MainTrainingConfig,
     run_intrinsic_model_smoke_test,
     run_main_model_smoke_test,
@@ -11,6 +12,7 @@ from .pipeline import (
 
 __all__ = [
     "IntrinsicTrainingConfig",
+    "LatitudeWeightedCharbonnierLoss",
     "MainTrainingConfig",
     "run_intrinsic_model_smoke_test",
     "run_main_model_smoke_test",

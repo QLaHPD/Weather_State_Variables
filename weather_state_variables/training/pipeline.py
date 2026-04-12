@@ -3,16 +3,22 @@ from __future__ import annotations
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
 import json
+import os
 from pathlib import Path
 from typing import Any, Iterable
 
 import pandas as pd
 import torch
+import torch.distributed as dist
 from torch import Tensor, nn
 from torch.nn import functional as F
+from torch.nn.parallel import DistributedDataParallel
 from torch.optim import AdamW
-from torch.utils.data import DataLoader
-from torchinfo import summary as torchinfo_summary
+from torch.utils.data import DataLoader, Sampler
+try:
+    from torchinfo import summary as torchinfo_summary
+except ImportError:
+    torchinfo_summary = None
 
 from ..config import (
     DEFAULT_MODEL_CONFIG_PATH,
@@ -20,7 +26,12 @@ from ..config import (
     resolve_repo_path,
     resolve_torch_dtype,
 )
-from ..data import ArcoEra5FuXiDataConfig, ArcoEra5FuXiDataset, build_arco_era5_dataloader
+from ..data import (
+    ArcoEra5FuXiDataConfig,
+    ArcoEra5FuXiDataset,
+    ContiguousDistributedSampler,
+    build_arco_era5_dataloader,
+)
 from ..models import (
     FuXiIntrinsic,
     FuXiIntrinsicConfig,
@@ -30,10 +41,91 @@ from ..models import (
 )
 
 
+@dataclass(frozen=True)
+class DistributedRuntime:
+    enabled: bool
+    backend: str | None
+    rank: int
+    local_rank: int
+    world_size: int
+    device: torch.device
+
+    @property
+    def is_primary(self) -> bool:
+        return self.rank == 0
+
+
 def _resolve_device(device_name: str) -> torch.device:
     if device_name == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(device_name)
+
+
+def _resolve_distributed_runtime(device_name: str) -> DistributedRuntime:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    enabled = world_size > 1
+
+    if enabled:
+        if device_name in {"auto", "cuda"} and torch.cuda.is_available():
+            device = torch.device("cuda", local_rank)
+        else:
+            device = _resolve_device(device_name)
+
+        if device.type == "cuda":
+            torch.cuda.set_device(device)
+            backend = "nccl"
+        else:
+            backend = "gloo"
+
+        if not dist.is_initialized():
+            dist.init_process_group(backend=backend)
+
+        return DistributedRuntime(
+            enabled=True,
+            backend=backend,
+            rank=rank,
+            local_rank=local_rank,
+            world_size=world_size,
+            device=device,
+        )
+
+    return DistributedRuntime(
+        enabled=False,
+        backend=None,
+        rank=0,
+        local_rank=0,
+        world_size=1,
+        device=_resolve_device(device_name),
+    )
+
+
+def _cleanup_distributed_runtime(runtime: DistributedRuntime) -> None:
+    if runtime.enabled and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def _wrap_for_distributed_training(
+    model: nn.Module,
+    runtime: DistributedRuntime,
+    *,
+    find_unused_parameters: bool = False,
+) -> nn.Module:
+    if not runtime.enabled:
+        return model
+
+    kwargs: dict[str, Any] = {"find_unused_parameters": find_unused_parameters}
+    if runtime.device.type == "cuda":
+        kwargs["device_ids"] = [runtime.local_rank]
+        kwargs["output_device"] = runtime.local_rank
+    return DistributedDataParallel(model, **kwargs)
+
+
+def _unwrap_model(model: nn.Module) -> nn.Module:
+    if isinstance(model, DistributedDataParallel):
+        return model.module
+    return model
 
 
 def _to_optional_timestamp(value: Any) -> pd.Timestamp | None:
@@ -52,6 +144,15 @@ def _to_optional_float(value: Any) -> float | None:
     if value in {None, ""}:
         return None
     return float(value)
+
+
+def _to_positive_int(value: Any, *, default: int = 1, field_name: str) -> int:
+    if value in {None, ""}:
+        return default
+    parsed = int(value)
+    if parsed <= 0:
+        raise ValueError(f"{field_name} must be positive, got {parsed}")
+    return parsed
 
 
 def _to_plain_data(value: Any) -> Any:
@@ -76,6 +177,51 @@ def _amp_autocast_context(use_amp: bool, device: torch.device, amp_dtype: torch.
     if device.type not in {"cuda", "cpu"}:
         return nullcontext()
     return torch.autocast(device_type=_device_type_for_amp(device), dtype=amp_dtype)
+
+
+def _build_grad_scaler(use_amp: bool, device: torch.device):
+    enabled = use_amp and device.type == "cuda"
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+    return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+def _validate_training_precision_config(
+    *,
+    section_name: str,
+    use_amp: bool,
+    model_dtype: torch.dtype,
+    amp_dtype: torch.dtype | None,
+) -> None:
+    if use_amp and model_dtype == torch.float16:
+        raise ValueError(
+            f"{section_name}.model_dtype=float16 is not supported with AMP training in this pipeline. "
+            "Use float32 master weights with AMP instead: set "
+            f"{section_name}.model_dtype=float32 and keep {section_name}.amp_dtype=float16."
+        )
+    if use_amp and amp_dtype is None:
+        raise ValueError(f"{section_name}.use_amp=true requires a valid {section_name}.amp_dtype.")
+
+
+def _build_main_forecast_criterion(
+    train_config: MainTrainingConfig,
+    data_config: ArcoEra5FuXiDataConfig,
+) -> nn.Module:
+    loss_name = train_config.forecast_loss.strip().lower()
+    if loss_name == "mse":
+        return nn.MSELoss()
+    if loss_name == "charbonnier":
+        return LatitudeWeightedCharbonnierLoss(
+            data_config.channel_names,
+            epsilon=train_config.charbonnier_epsilon,
+            upper_air_weight=train_config.upper_air_loss_weight,
+            surface_weight=train_config.surface_loss_weight,
+            latitude_descending=data_config.latitude_descending,
+        )
+    raise ValueError(
+        f"Unsupported train_main.forecast_loss {train_config.forecast_loss!r}. "
+        "Expected 'charbonnier' or 'mse'."
+    )
 
 
 def _move_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
@@ -103,6 +249,41 @@ def _print_json_block(title: str, payload: Any) -> None:
     print(json.dumps(_to_plain_data(payload), indent=2, sort_keys=True))
 
 
+def _print_if_primary(runtime: DistributedRuntime, message: str) -> None:
+    if runtime.is_primary:
+        print(message)
+
+
+def _reduced_sum_and_count(
+    value_sum: float,
+    count: int,
+    runtime: DistributedRuntime,
+) -> tuple[float, int]:
+    if not runtime.enabled:
+        return value_sum, count
+
+    tensor = torch.tensor([value_sum, float(count)], device=runtime.device, dtype=torch.float64)
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    return float(tensor[0].item()), int(tensor[1].item())
+
+
+def _reduced_mean_scalar(value: float, runtime: DistributedRuntime) -> float:
+    if not runtime.enabled:
+        return value
+
+    tensor = torch.tensor([value], device=runtime.device, dtype=torch.float64)
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    tensor /= runtime.world_size
+    return float(tensor.item())
+
+
+def _limited_length(loader: DataLoader[dict[str, Any]], max_batches: int | None) -> int:
+    total = len(loader)
+    if max_batches is None:
+        return total
+    return min(total, max_batches)
+
+
 def _print_model_and_summary(
     title: str,
     model: nn.Module,
@@ -114,6 +295,11 @@ def _print_model_and_summary(
     print(f"\n== {title} ==")
     print(model)
     if not print_summary:
+        return
+    if torchinfo_summary is None:
+        print("torchinfo summary unavailable: torchinfo is not installed")
+        if hasattr(model, "summary"):
+            _print_json_block("fallback_summary", model.summary())
         return
     try:
         info = torchinfo_summary(
@@ -166,7 +352,7 @@ def _make_intrinsic_random_inputs(
     dtype = intrinsic_config.dtype or torch.float32
     return torch.randn(
         batch_size,
-        intrinsic_config.d_high,
+        intrinsic_config.feature_channels,
         *intrinsic_config.spatial_size,
         device=device,
         dtype=dtype,
@@ -207,14 +393,17 @@ def run_intrinsic_model_smoke_test(
     x, temb, static_features = _make_main_random_inputs(encoder.config, batch_size=batch_size, device=device)
     with torch.no_grad():
         encoded = encoder(x, temb, static_features=static_features)
-        outputs = intrinsic_model(encoded.z_high)
+        outputs = intrinsic_model(encoded.second_block_features)
     report = {
         "encoder_input": {
             "x": {"shape": list(x.shape), "dtype": str(x.dtype)},
             "temb": {"shape": list(temb.shape), "dtype": str(temb.dtype)},
             "static_features": {"shape": list(static_features.shape), "dtype": str(static_features.dtype)},
         },
-        "z_high": {"shape": list(encoded.z_high.shape), "dtype": str(encoded.z_high.dtype)},
+        "second_block_features": {
+            "shape": list(encoded.second_block_features.shape),
+            "dtype": str(encoded.second_block_features.dtype),
+        },
         "intrinsic_output": _tensor_tree_shapes(outputs),
     }
     if print_outputs:
@@ -222,10 +411,104 @@ def run_intrinsic_model_smoke_test(
     return report
 
 
+def _latitude_weight_vector(
+    height: int,
+    *,
+    latitude_descending: bool,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tensor:
+    if height <= 1:
+        return torch.ones(height, device=device, dtype=dtype)
+
+    start, end = (90.0, -90.0) if latitude_descending else (-90.0, 90.0)
+    latitudes = torch.linspace(start, end, height, device=device, dtype=torch.float32)
+    weights = torch.cos(torch.deg2rad(latitudes)).clamp_min(0.0)
+    mean_weight = weights.mean().clamp_min(torch.finfo(weights.dtype).eps)
+    return (weights / mean_weight).to(dtype=dtype)
+
+
+def _forecast_channel_weight_vector(
+    channel_names: list[str] | tuple[str, ...],
+    *,
+    upper_air_weight: float,
+    surface_weight: float,
+    device: torch.device | None = None,
+    dtype: torch.dtype | None = None,
+) -> Tensor:
+    surface_channels = {"T2M", "U10", "V10", "MSL", "TP"}
+    weights = [
+        surface_weight if channel_name in surface_channels else upper_air_weight
+        for channel_name in channel_names
+    ]
+    return torch.tensor(weights, device=device, dtype=dtype or torch.float32)
+
+
+class LatitudeWeightedCharbonnierLoss(nn.Module):
+    def __init__(
+        self,
+        channel_names: list[str] | tuple[str, ...],
+        *,
+        epsilon: float = 1.0e-3,
+        upper_air_weight: float = 1.0,
+        surface_weight: float = 0.1,
+        latitude_descending: bool = True,
+    ) -> None:
+        super().__init__()
+        if epsilon <= 0.0:
+            raise ValueError(f"epsilon must be positive, got {epsilon}")
+        self.epsilon = float(epsilon)
+        self.latitude_descending = latitude_descending
+        self.register_buffer(
+            "channel_weights",
+            _forecast_channel_weight_vector(
+                list(channel_names),
+                upper_air_weight=upper_air_weight,
+                surface_weight=surface_weight,
+            ),
+            persistent=False,
+        )
+
+    def forward(self, prediction: Tensor, target: Tensor) -> Tensor:
+        if prediction.shape != target.shape:
+            raise ValueError(
+                f"Expected prediction and target to have the same shape, got "
+                f"{tuple(prediction.shape)} and {tuple(target.shape)}"
+            )
+        if prediction.ndim != 5:
+            raise ValueError(
+                f"Expected forecast tensors shaped [B, T, C, H, W], got {tuple(prediction.shape)}"
+            )
+        if prediction.shape[2] != int(self.channel_weights.shape[0]):
+            raise ValueError(
+                f"Expected {int(self.channel_weights.shape[0])} forecast channels, got {prediction.shape[2]}"
+            )
+
+        prediction = prediction.float()
+        target = target.float()
+        latitude_weights = _latitude_weight_vector(
+            int(prediction.shape[-2]),
+            latitude_descending=self.latitude_descending,
+            device=prediction.device,
+            dtype=prediction.dtype,
+        ).view(1, 1, 1, -1, 1)
+        channel_weights = self.channel_weights.to(device=prediction.device, dtype=prediction.dtype).view(
+            1,
+            1,
+            -1,
+            1,
+            1,
+        )
+        weighted_diff = latitude_weights * (prediction - target)
+        charbonnier = torch.sqrt(weighted_diff.square() + self.epsilon**2)
+        return (channel_weights * charbonnier).mean()
+
+
 @dataclass(frozen=True)
 class MainTrainingConfig:
     batch_size: int = 1
     num_workers: int = 0
+    gradient_accumulation_steps: int = 1
     learning_rate: float = 1e-4
     weight_decay: float = 0.0
     max_epochs: int = 1
@@ -233,6 +516,10 @@ class MainTrainingConfig:
     model_dtype: str = "float32"
     use_amp: bool = False
     amp_dtype: str = "float16"
+    forecast_loss: str = "charbonnier"
+    charbonnier_epsilon: float = 1.0e-3
+    upper_air_loss_weight: float = 1.0
+    surface_loss_weight: float = 0.1
     gradient_clip_norm: float | None = None
     output_dir: Path = Path("runs/main")
     checkpoint_name: str = "main_last.pt"
@@ -255,6 +542,11 @@ class MainTrainingConfig:
         return cls(
             batch_size=int(data.get("batch_size", 1)),
             num_workers=int(data.get("num_workers", 0)),
+            gradient_accumulation_steps=_to_positive_int(
+                data.get("gradient_accumulation_steps"),
+                default=1,
+                field_name="train_main.gradient_accumulation_steps",
+            ),
             learning_rate=float(data.get("learning_rate", 1e-4)),
             weight_decay=float(data.get("weight_decay", 0.0)),
             max_epochs=int(data.get("max_epochs", 1)),
@@ -262,6 +554,10 @@ class MainTrainingConfig:
             model_dtype=str(data.get("model_dtype", "float32")),
             use_amp=bool(data.get("use_amp", False)),
             amp_dtype=str(data.get("amp_dtype", "float16")),
+            forecast_loss=str(data.get("forecast_loss", "charbonnier")),
+            charbonnier_epsilon=float(data.get("charbonnier_epsilon", 1.0e-3)),
+            upper_air_loss_weight=float(data.get("upper_air_loss_weight", 1.0)),
+            surface_loss_weight=float(data.get("surface_loss_weight", 0.1)),
             gradient_clip_norm=_to_optional_float(data.get("gradient_clip_norm")),
             output_dir=resolve_repo_path(data.get("output_dir", "runs/main"), config_path=resolved_config_path),
             checkpoint_name=str(data.get("checkpoint_name", "main_last.pt")),
@@ -284,6 +580,7 @@ class MainTrainingConfig:
 class IntrinsicTrainingConfig:
     batch_size: int = 1
     num_workers: int = 0
+    gradient_accumulation_steps: int = 1
     learning_rate: float = 1e-4
     weight_decay: float = 0.0
     max_epochs: int = 1
@@ -296,7 +593,7 @@ class IntrinsicTrainingConfig:
     checkpoint_name: str = "intrinsic_last.pt"
     best_checkpoint_name: str = "intrinsic_best.pt"
     main_checkpoint_path: Path | None = None
-    detach_z_high: bool = True
+    detach_second_block_features: bool = True
     train_start_time: pd.Timestamp | None = None
     train_end_time: pd.Timestamp | None = None
     val_start_time: pd.Timestamp | None = None
@@ -319,6 +616,11 @@ class IntrinsicTrainingConfig:
         return cls(
             batch_size=int(data.get("batch_size", 1)),
             num_workers=int(data.get("num_workers", 0)),
+            gradient_accumulation_steps=_to_positive_int(
+                data.get("gradient_accumulation_steps"),
+                default=1,
+                field_name="train_intrinsic.gradient_accumulation_steps",
+            ),
             learning_rate=float(data.get("learning_rate", 1e-4)),
             weight_decay=float(data.get("weight_decay", 0.0)),
             max_epochs=int(data.get("max_epochs", 1)),
@@ -331,7 +633,12 @@ class IntrinsicTrainingConfig:
             checkpoint_name=str(data.get("checkpoint_name", "intrinsic_last.pt")),
             best_checkpoint_name=str(data.get("best_checkpoint_name", "intrinsic_best.pt")),
             main_checkpoint_path=checkpoint_path,
-            detach_z_high=bool(data.get("detach_z_high", True)),
+            detach_second_block_features=bool(
+                data.get(
+                    "detach_second_block_features",
+                    data.get("detach_z_high", True),
+                )
+            ),
             train_start_time=_to_optional_timestamp(data.get("train_start_time")),
             train_end_time=_to_optional_timestamp(data.get("train_end_time")),
             val_start_time=_to_optional_timestamp(data.get("val_start_time")),
@@ -348,22 +655,35 @@ class IntrinsicTrainingConfig:
 
 def _build_main_training_objects(
     config_path: str | Path,
-) -> tuple[MainTrainingConfig, FuXiLowerResConfig, ArcoEra5FuXiDataConfig, torch.device, torch.dtype, torch.dtype | None]:
+) -> tuple[
+    MainTrainingConfig,
+    FuXiLowerResConfig,
+    ArcoEra5FuXiDataConfig,
+    DistributedRuntime,
+    torch.dtype,
+    torch.dtype | None,
+]:
     train_config = MainTrainingConfig.from_yaml(config_path)
-    device = _resolve_device(train_config.device)
+    runtime = _resolve_distributed_runtime(train_config.device)
     model_dtype = resolve_torch_dtype(train_config.model_dtype) or torch.float32
     amp_dtype = resolve_torch_dtype(train_config.amp_dtype)
+    _validate_training_precision_config(
+        section_name="train_main",
+        use_amp=train_config.use_amp,
+        model_dtype=model_dtype,
+        amp_dtype=amp_dtype,
+    )
 
     model_config = replace(
         FuXiLowerResConfig.from_yaml(config_path),
-        device=device,
+        device=runtime.device,
         dtype=model_dtype,
     )
     data_config = replace(
         ArcoEra5FuXiDataConfig.from_yaml(config_path),
         forecast_steps=model_config.forecast_steps,
     )
-    return train_config, model_config, data_config, device, model_dtype, amp_dtype
+    return train_config, model_config, data_config, runtime, model_dtype, amp_dtype
 
 
 def _build_intrinsic_training_objects(
@@ -373,32 +693,38 @@ def _build_intrinsic_training_objects(
     FuXiLowerResConfig,
     FuXiIntrinsicConfig,
     ArcoEra5FuXiDataConfig,
-    torch.device,
+    DistributedRuntime,
     torch.dtype,
     torch.dtype | None,
 ]:
     train_config = IntrinsicTrainingConfig.from_yaml(config_path)
-    device = _resolve_device(train_config.device)
+    runtime = _resolve_distributed_runtime(train_config.device)
     model_dtype = resolve_torch_dtype(train_config.model_dtype) or torch.float32
     amp_dtype = resolve_torch_dtype(train_config.amp_dtype)
+    _validate_training_precision_config(
+        section_name="train_intrinsic",
+        use_amp=train_config.use_amp,
+        model_dtype=model_dtype,
+        amp_dtype=amp_dtype,
+    )
 
     encoder_config = replace(
         FuXiLowerResConfig.from_yaml(config_path),
-        device=device,
+        device=runtime.device,
         dtype=model_dtype,
     )
     intrinsic_config = replace(
         FuXiIntrinsicConfig.from_yaml(config_path),
-        device=device,
+        device=runtime.device,
         dtype=model_dtype,
-        d_high=encoder_config.d_high,
+        feature_channels=encoder_config.embed_dim,
         spatial_size=encoder_config.latent_grid,
     )
     data_config = replace(
         ArcoEra5FuXiDataConfig.from_yaml(config_path),
         forecast_steps=encoder_config.forecast_steps,
     )
-    return train_config, encoder_config, intrinsic_config, data_config, device, model_dtype, amp_dtype
+    return train_config, encoder_config, intrinsic_config, data_config, runtime, model_dtype, amp_dtype
 
 
 def _build_split_dataloaders(
@@ -406,12 +732,18 @@ def _build_split_dataloaders(
     *,
     batch_size: int,
     num_workers: int,
+    runtime: DistributedRuntime,
     train_start_time: pd.Timestamp | None,
     train_end_time: pd.Timestamp | None,
     val_start_time: pd.Timestamp | None,
     val_end_time: pd.Timestamp | None,
     pin_memory: bool,
-) -> tuple[DataLoader[dict[str, Any]], DataLoader[dict[str, Any]] | None]:
+) -> tuple[
+    DataLoader[dict[str, Any]],
+    DataLoader[dict[str, Any]] | None,
+    Sampler[Any] | None,
+    Sampler[Any] | None,
+]:
     train_dataset = ArcoEra5FuXiDataset(
         replace(
             data_config,
@@ -419,16 +751,24 @@ def _build_split_dataloaders(
             end_time=train_end_time,
         )
     )
+    train_sampler: Sampler[Any] | None = None
+    if runtime.enabled:
+        train_sampler = ContiguousDistributedSampler(
+            train_dataset,
+            num_replicas=runtime.world_size,
+            rank=runtime.rank,
+        )
     train_loader = build_arco_era5_dataloader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        sampler=train_sampler,
     )
 
     if val_start_time is None and val_end_time is None:
-        return train_loader, None
+        return train_loader, None, train_sampler, None
 
     val_dataset = ArcoEra5FuXiDataset(
         replace(
@@ -437,14 +777,22 @@ def _build_split_dataloaders(
             end_time=val_end_time,
         )
     )
+    val_sampler: Sampler[Any] | None = None
+    if runtime.enabled:
+        val_sampler = ContiguousDistributedSampler(
+            val_dataset,
+            num_replicas=runtime.world_size,
+            rank=runtime.rank,
+        )
     val_loader = build_arco_era5_dataloader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        sampler=val_sampler,
     )
-    return train_loader, val_loader
+    return train_loader, val_loader, train_sampler, val_sampler
 
 
 def _save_checkpoint(path: Path, payload: dict[str, Any]) -> None:
@@ -476,123 +824,241 @@ def _iter_limited(loader: Iterable[dict[str, Any]], max_batches: int | None) -> 
         yield batch_index, batch
 
 
+def _accumulation_divisor(total_batches: int, batch_index: int, accumulation_steps: int) -> int:
+    if total_batches <= 0:
+        return accumulation_steps
+
+    remainder = total_batches % accumulation_steps
+    if remainder == 0:
+        return accumulation_steps
+
+    first_final_group_index = total_batches - remainder
+    if batch_index >= first_final_group_index:
+        return remainder
+    return accumulation_steps
+
+
+def _should_optimizer_step(total_batches: int, batch_index: int, accumulation_steps: int) -> bool:
+    batch_number = batch_index + 1
+    return batch_number % accumulation_steps == 0 or batch_number == total_batches
+
+
 def train_main_model(
     config_path: str | Path = DEFAULT_MODEL_CONFIG_PATH,
     *,
     smoke_only: bool = False,
 ) -> dict[str, Any]:
-    train_config, model_config, data_config, device, _model_dtype, amp_dtype = _build_main_training_objects(config_path)
-    model = FuXiLowerRes(model_config).to(device)
+    train_config, model_config, data_config, runtime, _model_dtype, amp_dtype = _build_main_training_objects(config_path)
+    try:
+        model = FuXiLowerRes(model_config).to(runtime.device)
+        smoke_report: dict[str, Any] | None = None
 
-    smoke_inputs = _make_main_random_inputs(
-        model_config,
-        batch_size=train_config.random_smoke_batch_size,
-        device=device,
-    )
-    _print_model_and_summary(
-        "Forecast Model",
-        model,
-        input_data=smoke_inputs,
-        depth=train_config.summary_depth,
-        print_summary=train_config.print_model_summary,
-    )
-    smoke_report = run_main_model_smoke_test(
-        model,
-        batch_size=train_config.random_smoke_batch_size,
-        print_outputs=True,
-    )
-    if smoke_only:
-        return {"smoke_only": True, "smoke_report": smoke_report}
+        if runtime.is_primary:
+            smoke_inputs = _make_main_random_inputs(
+                model_config,
+                batch_size=train_config.random_smoke_batch_size,
+                device=runtime.device,
+            )
+            _print_model_and_summary(
+                "Forecast Model",
+                model,
+                input_data=smoke_inputs,
+                depth=train_config.summary_depth,
+                print_summary=train_config.print_model_summary,
+            )
+            smoke_report = run_main_model_smoke_test(
+                model,
+                batch_size=train_config.random_smoke_batch_size,
+                print_outputs=True,
+            )
+        if smoke_only:
+            return {"smoke_only": True, "smoke_report": smoke_report}
 
-    pin_memory = device.type == "cuda"
-    train_loader, val_loader = _build_split_dataloaders(
-        data_config,
-        batch_size=train_config.batch_size,
-        num_workers=train_config.num_workers,
-        train_start_time=train_config.train_start_time,
-        train_end_time=train_config.train_end_time,
-        val_start_time=train_config.val_start_time,
-        val_end_time=train_config.val_end_time,
-        pin_memory=pin_memory,
-    )
+        model = _wrap_for_distributed_training(model, runtime)
+        pin_memory = runtime.device.type == "cuda"
+        train_loader, val_loader, train_sampler, val_sampler = _build_split_dataloaders(
+            data_config,
+            batch_size=train_config.batch_size,
+            num_workers=train_config.num_workers,
+            runtime=runtime,
+            train_start_time=train_config.train_start_time,
+            train_end_time=train_config.train_end_time,
+            val_start_time=train_config.val_start_time,
+            val_end_time=train_config.val_end_time,
+            pin_memory=pin_memory,
+        )
 
-    optimizer = AdamW(model.parameters(), lr=train_config.learning_rate, weight_decay=train_config.weight_decay)
-    criterion = nn.MSELoss()
+        optimizer = AdamW(model.parameters(), lr=train_config.learning_rate, weight_decay=train_config.weight_decay)
+        scaler = _build_grad_scaler(train_config.use_amp, runtime.device)
+        criterion = _build_main_forecast_criterion(train_config, data_config).to(runtime.device)
 
-    best_val_loss = float("inf")
-    history: list[dict[str, float]] = []
-    output_dir = train_config.output_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
+        best_val_loss = float("inf")
+        history: list[dict[str, float]] = []
+        output_dir = train_config.output_dir
+        if runtime.is_primary:
+            output_dir.mkdir(parents=True, exist_ok=True)
 
-    for epoch in range(1, train_config.max_epochs + 1):
-        model.train()
-        running_loss = 0.0
-        train_steps = 0
+        effective_batch_size = (
+            train_config.batch_size * runtime.world_size * train_config.gradient_accumulation_steps
+        )
+        _print_if_primary(
+            runtime,
+            (
+                f"[main] device={runtime.device} world_size={runtime.world_size} "
+                f"gradient_accumulation_steps={train_config.gradient_accumulation_steps} "
+                f"effective_batch_size={effective_batch_size}"
+            ),
+        )
 
-        for batch_index, batch in _iter_limited(train_loader, train_config.max_train_batches):
-            batch = _move_batch_to_device(batch, device)
+        total_train_batches = _limited_length(train_loader, train_config.max_train_batches)
+        total_val_batches = 0 if val_loader is None else _limited_length(val_loader, train_config.max_val_batches)
+
+        for epoch in range(1, train_config.max_epochs + 1):
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
+            if val_sampler is not None:
+                val_sampler.set_epoch(epoch)
+
+            model.train()
             optimizer.zero_grad(set_to_none=True)
-            with _amp_autocast_context(train_config.use_amp, device, amp_dtype):
-                outputs = model(batch["x"], batch["temb"], static_features=batch["static_features"])
-                loss = criterion(outputs["forecast"], batch["target"])
-            loss.backward()
-            if train_config.gradient_clip_norm is not None:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), train_config.gradient_clip_norm)
-            optimizer.step()
+            running_loss = 0.0
+            train_steps = 0
 
-            running_loss += float(loss.item())
-            train_steps += 1
-            if (batch_index + 1) % max(train_config.log_every, 1) == 0:
-                print(f"[main][epoch {epoch}] batch {batch_index + 1} loss={loss.item():.6f}")
+            for batch_index, batch in _iter_limited(train_loader, train_config.max_train_batches):
+                batch = _move_batch_to_device(batch, runtime.device)
+                should_step = _should_optimizer_step(
+                    total_train_batches,
+                    batch_index,
+                    train_config.gradient_accumulation_steps,
+                )
+                loss_divisor = float(
+                    _accumulation_divisor(
+                        total_train_batches,
+                        batch_index,
+                        train_config.gradient_accumulation_steps,
+                    )
+                )
+                sync_context = nullcontext()
+                if runtime.enabled and isinstance(model, DistributedDataParallel) and not should_step:
+                    sync_context = model.no_sync()
 
-        train_loss = running_loss / max(train_steps, 1)
-        val_loss: float | None = None
-
-        if val_loader is not None:
-            model.eval()
-            val_running_loss = 0.0
-            val_steps = 0
-            with torch.no_grad():
-                for _batch_index, batch in _iter_limited(val_loader, train_config.max_val_batches):
-                    batch = _move_batch_to_device(batch, device)
-                    with _amp_autocast_context(train_config.use_amp, device, amp_dtype):
-                        outputs = model(batch["x"], batch["temb"], static_features=batch["static_features"])
+                with sync_context:
+                    with _amp_autocast_context(train_config.use_amp, runtime.device, amp_dtype):
+                        outputs = model(
+                            batch["x"],
+                            batch["temb"],
+                            static_features=batch["static_features"],
+                        )
                         loss = criterion(outputs["forecast"], batch["target"])
-                    val_running_loss += float(loss.item())
-                    val_steps += 1
-            val_loss = val_running_loss / max(val_steps, 1)
+                        scaled_loss = loss / loss_divisor
 
-        epoch_record = {"epoch": float(epoch), "train_loss": train_loss}
-        if val_loss is not None:
-            epoch_record["val_loss"] = val_loss
-        history.append(epoch_record)
-        print(f"[main][epoch {epoch}] train_loss={train_loss:.6f}" + (f" val_loss={val_loss:.6f}" if val_loss is not None else ""))
+                    if scaler.is_enabled():
+                        scaler.scale(scaled_loss).backward()
+                    else:
+                        scaled_loss.backward()
 
-        checkpoint_payload = {
-            "epoch": epoch,
-            "model_state_dict": model.state_dict(),
-            "encoder_state_dict": model.encoder.state_dict(),
-            "decoder_state_dict": model.decoder.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
+                if should_step:
+                    if train_config.gradient_clip_norm is not None:
+                        if scaler.is_enabled():
+                            scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(
+                            _unwrap_model(model).parameters(),
+                            train_config.gradient_clip_norm,
+                        )
+
+                    if scaler.is_enabled():
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+
+                running_loss += float(loss.item())
+                train_steps += 1
+                if (batch_index + 1) % max(train_config.log_every, 1) == 0:
+                    display_loss = _reduced_mean_scalar(float(loss.item()), runtime)
+                    _print_if_primary(
+                        runtime,
+                        f"[main][epoch {epoch}] batch {batch_index + 1} loss={display_loss:.6f}",
+                    )
+
+            train_loss_sum, global_train_steps = _reduced_sum_and_count(running_loss, train_steps, runtime)
+            train_loss = train_loss_sum / max(global_train_steps, 1)
+            val_loss: float | None = None
+
+            if val_loader is not None:
+                model.eval()
+                val_running_loss = 0.0
+                val_steps = 0
+                with torch.no_grad():
+                    for _batch_index, batch in _iter_limited(val_loader, train_config.max_val_batches):
+                        batch = _move_batch_to_device(batch, runtime.device)
+                        with _amp_autocast_context(train_config.use_amp, runtime.device, amp_dtype):
+                            outputs = model(
+                                batch["x"],
+                                batch["temb"],
+                                static_features=batch["static_features"],
+                            )
+                            loss = criterion(outputs["forecast"], batch["target"])
+                        val_running_loss += float(loss.item())
+                        val_steps += 1
+
+                val_loss_sum, global_val_steps = _reduced_sum_and_count(val_running_loss, val_steps, runtime)
+                val_loss = val_loss_sum / max(global_val_steps, 1)
+
+            epoch_record = {"epoch": float(epoch), "train_loss": train_loss}
+            if val_loss is not None:
+                epoch_record["val_loss"] = val_loss
+            history.append(epoch_record)
+            _print_if_primary(
+                runtime,
+                f"[main][epoch {epoch}] train_loss={train_loss:.6f}"
+                + (f" val_loss={val_loss:.6f}" if val_loss is not None else ""),
+            )
+
+            if runtime.is_primary:
+                base_model = _unwrap_model(model)
+                checkpoint_payload = {
+                    "epoch": epoch,
+                    "model_state_dict": base_model.state_dict(),
+                    "encoder_state_dict": base_model.encoder.state_dict(),
+                    "decoder_state_dict": base_model.decoder.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "history": history,
+                    "train_config": _to_plain_data(asdict(train_config)),
+                    "model_config": _to_plain_data(asdict(model_config)),
+                    "data_config": _to_plain_data(asdict(data_config)),
+                    "distributed_runtime": {
+                        "enabled": runtime.enabled,
+                        "backend": runtime.backend,
+                        "world_size": runtime.world_size,
+                    },
+                    "effective_batch_size": effective_batch_size,
+                    "gradient_accumulation_steps": train_config.gradient_accumulation_steps,
+                }
+                _save_checkpoint(output_dir / train_config.checkpoint_name, checkpoint_payload)
+
+                if val_loss is not None and val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    _save_checkpoint(output_dir / train_config.best_checkpoint_name, checkpoint_payload)
+
+        result = {
+            "smoke_report": smoke_report,
             "history": history,
-            "train_config": _to_plain_data(asdict(train_config)),
-            "model_config": _to_plain_data(asdict(model_config)),
-            "data_config": _to_plain_data(asdict(data_config)),
+            "checkpoint_path": str(output_dir / train_config.checkpoint_name),
+            "best_checkpoint_path": str(output_dir / train_config.best_checkpoint_name),
+            "distributed": runtime.enabled,
+            "world_size": runtime.world_size,
+            "effective_batch_size": effective_batch_size,
+            "gradient_accumulation_steps": train_config.gradient_accumulation_steps,
+            "train_batches": total_train_batches,
+            "val_batches": total_val_batches,
         }
-        _save_checkpoint(output_dir / train_config.checkpoint_name, checkpoint_payload)
-
-        if val_loss is not None and val_loss < best_val_loss:
-            best_val_loss = val_loss
-            _save_checkpoint(output_dir / train_config.best_checkpoint_name, checkpoint_payload)
-
-    result = {
-        "smoke_report": smoke_report,
-        "history": history,
-        "checkpoint_path": str(output_dir / train_config.checkpoint_name),
-        "best_checkpoint_path": str(output_dir / train_config.best_checkpoint_name),
-    }
-    _print_json_block("main_training_result", result)
-    return result
+        if runtime.is_primary:
+            _print_json_block("main_training_result", result)
+        return result
+    finally:
+        _cleanup_distributed_runtime(runtime)
 
 
 def train_intrinsic_model(
@@ -605,163 +1071,265 @@ def train_intrinsic_model(
         encoder_config,
         intrinsic_config,
         data_config,
-        device,
+        runtime,
         _model_dtype,
         amp_dtype,
     ) = _build_intrinsic_training_objects(config_path)
+    try:
+        encoder = FuXiLowerResEncoder(encoder_config).to(runtime.device)
+        if train_config.main_checkpoint_path is not None:
+            _load_encoder_checkpoint(encoder, train_config.main_checkpoint_path)
+        elif not smoke_only:
+            raise FileNotFoundError(
+                "train_intrinsic.main_checkpoint_path is required for intrinsic training after the main model."
+            )
+        encoder.eval()
+        encoder.requires_grad_(False)
 
-    encoder = FuXiLowerResEncoder(encoder_config).to(device)
-    if train_config.main_checkpoint_path is not None:
-        _load_encoder_checkpoint(encoder, train_config.main_checkpoint_path)
-    elif not smoke_only:
-        raise FileNotFoundError(
-            "train_intrinsic.main_checkpoint_path is required for intrinsic training after the main model."
+        intrinsic_model = FuXiIntrinsic(intrinsic_config).to(runtime.device)
+        smoke_report: dict[str, Any] | None = None
+
+        if runtime.is_primary:
+            smoke_inputs = _make_main_random_inputs(
+                encoder_config,
+                batch_size=train_config.random_smoke_batch_size,
+                device=runtime.device,
+            )
+            _print_model_and_summary(
+                "Frozen Forecast Encoder",
+                encoder,
+                input_data=smoke_inputs,
+                depth=train_config.summary_depth,
+                print_summary=train_config.print_model_summary,
+            )
+            intrinsic_smoke_input = (
+                _make_intrinsic_random_inputs(
+                    intrinsic_config,
+                    batch_size=train_config.random_smoke_batch_size,
+                    device=runtime.device,
+                ),
+            )
+            _print_model_and_summary(
+                "Intrinsic Model",
+                intrinsic_model,
+                input_data=intrinsic_smoke_input,
+                depth=train_config.summary_depth,
+                print_summary=train_config.print_model_summary,
+            )
+            smoke_report = run_intrinsic_model_smoke_test(
+                encoder,
+                intrinsic_model,
+                batch_size=train_config.random_smoke_batch_size,
+                print_outputs=True,
+            )
+        if smoke_only:
+            return {"smoke_only": True, "smoke_report": smoke_report}
+
+        intrinsic_model = _wrap_for_distributed_training(intrinsic_model, runtime)
+        pin_memory = runtime.device.type == "cuda"
+        train_loader, val_loader, train_sampler, val_sampler = _build_split_dataloaders(
+            data_config,
+            batch_size=train_config.batch_size,
+            num_workers=train_config.num_workers,
+            runtime=runtime,
+            train_start_time=train_config.train_start_time,
+            train_end_time=train_config.train_end_time,
+            val_start_time=train_config.val_start_time,
+            val_end_time=train_config.val_end_time,
+            pin_memory=pin_memory,
         )
-    encoder.eval()
-    encoder.requires_grad_(False)
 
-    intrinsic_model = FuXiIntrinsic(intrinsic_config).to(device)
+        optimizer = AdamW(
+            intrinsic_model.parameters(),
+            lr=train_config.learning_rate,
+            weight_decay=train_config.weight_decay,
+        )
+        scaler = _build_grad_scaler(train_config.use_amp, runtime.device)
+        criterion = nn.MSELoss()
 
-    smoke_inputs = _make_main_random_inputs(
-        encoder_config,
-        batch_size=train_config.random_smoke_batch_size,
-        device=device,
-    )
-    _print_model_and_summary(
-        "Frozen Forecast Encoder",
-        encoder,
-        input_data=smoke_inputs,
-        depth=train_config.summary_depth,
-        print_summary=train_config.print_model_summary,
-    )
-    intrinsic_smoke_input = (
-        _make_intrinsic_random_inputs(
-            intrinsic_config,
-            batch_size=train_config.random_smoke_batch_size,
-            device=device,
-        ),
-    )
-    _print_model_and_summary(
-        "Intrinsic Model",
-        intrinsic_model,
-        input_data=intrinsic_smoke_input,
-        depth=train_config.summary_depth,
-        print_summary=train_config.print_model_summary,
-    )
-    smoke_report = run_intrinsic_model_smoke_test(
-        encoder,
-        intrinsic_model,
-        batch_size=train_config.random_smoke_batch_size,
-        print_outputs=True,
-    )
-    if smoke_only:
-        return {"smoke_only": True, "smoke_report": smoke_report}
+        best_val_loss = float("inf")
+        history: list[dict[str, float]] = []
+        output_dir = train_config.output_dir
+        if runtime.is_primary:
+            output_dir.mkdir(parents=True, exist_ok=True)
 
-    pin_memory = device.type == "cuda"
-    train_loader, val_loader = _build_split_dataloaders(
-        data_config,
-        batch_size=train_config.batch_size,
-        num_workers=train_config.num_workers,
-        train_start_time=train_config.train_start_time,
-        train_end_time=train_config.train_end_time,
-        val_start_time=train_config.val_start_time,
-        val_end_time=train_config.val_end_time,
-        pin_memory=pin_memory,
-    )
+        effective_batch_size = (
+            train_config.batch_size * runtime.world_size * train_config.gradient_accumulation_steps
+        )
+        _print_if_primary(
+            runtime,
+            (
+                f"[intrinsic] device={runtime.device} world_size={runtime.world_size} "
+                f"gradient_accumulation_steps={train_config.gradient_accumulation_steps} "
+                f"effective_batch_size={effective_batch_size}"
+            ),
+        )
 
-    optimizer = AdamW(
-        intrinsic_model.parameters(),
-        lr=train_config.learning_rate,
-        weight_decay=train_config.weight_decay,
-    )
-    criterion = nn.MSELoss()
+        total_train_batches = _limited_length(train_loader, train_config.max_train_batches)
+        total_val_batches = 0 if val_loader is None else _limited_length(val_loader, train_config.max_val_batches)
 
-    best_val_loss = float("inf")
-    history: list[dict[str, float]] = []
-    output_dir = train_config.output_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
+        for epoch in range(1, train_config.max_epochs + 1):
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
+            if val_sampler is not None:
+                val_sampler.set_epoch(epoch)
 
-    for epoch in range(1, train_config.max_epochs + 1):
-        intrinsic_model.train()
-        running_loss = 0.0
-        train_steps = 0
-
-        for batch_index, batch in _iter_limited(train_loader, train_config.max_train_batches):
-            batch = _move_batch_to_device(batch, device)
+            intrinsic_model.train()
             optimizer.zero_grad(set_to_none=True)
-            with torch.no_grad():
-                encoded = encoder(batch["x"], batch["temb"], static_features=batch["static_features"])
-                z_high = encoded.z_high.detach() if train_config.detach_z_high else encoded.z_high
-            with _amp_autocast_context(train_config.use_amp, device, amp_dtype):
-                outputs = intrinsic_model(z_high)
-                loss = criterion(outputs["z_high_recon"], z_high)
-            loss.backward()
-            if train_config.gradient_clip_norm is not None:
-                torch.nn.utils.clip_grad_norm_(intrinsic_model.parameters(), train_config.gradient_clip_norm)
-            optimizer.step()
+            running_loss = 0.0
+            train_steps = 0
 
-            running_loss += float(loss.item())
-            train_steps += 1
-            if (batch_index + 1) % max(train_config.log_every, 1) == 0:
-                print(f"[intrinsic][epoch {epoch}] batch {batch_index + 1} loss={loss.item():.6f}")
+            for batch_index, batch in _iter_limited(train_loader, train_config.max_train_batches):
+                batch = _move_batch_to_device(batch, runtime.device)
+                should_step = _should_optimizer_step(
+                    total_train_batches,
+                    batch_index,
+                    train_config.gradient_accumulation_steps,
+                )
+                loss_divisor = float(
+                    _accumulation_divisor(
+                        total_train_batches,
+                        batch_index,
+                        train_config.gradient_accumulation_steps,
+                    )
+                )
+                sync_context = nullcontext()
+                if runtime.enabled and isinstance(intrinsic_model, DistributedDataParallel) and not should_step:
+                    sync_context = intrinsic_model.no_sync()
 
-        train_loss = running_loss / max(train_steps, 1)
-        val_loss: float | None = None
-
-        if val_loader is not None:
-            intrinsic_model.eval()
-            val_running_loss = 0.0
-            val_steps = 0
-            with torch.no_grad():
-                for _batch_index, batch in _iter_limited(val_loader, train_config.max_val_batches):
-                    batch = _move_batch_to_device(batch, device)
+                with torch.no_grad():
                     encoded = encoder(batch["x"], batch["temb"], static_features=batch["static_features"])
-                    z_high = encoded.z_high.detach() if train_config.detach_z_high else encoded.z_high
-                    with _amp_autocast_context(train_config.use_amp, device, amp_dtype):
-                        outputs = intrinsic_model(z_high)
-                        loss = criterion(outputs["z_high_recon"], z_high)
-                    val_running_loss += float(loss.item())
-                    val_steps += 1
-            val_loss = val_running_loss / max(val_steps, 1)
+                    second_block_features = (
+                        encoded.second_block_features.detach()
+                        if train_config.detach_second_block_features
+                        else encoded.second_block_features
+                    )
 
-        epoch_record = {"epoch": float(epoch), "train_loss": train_loss}
-        if val_loss is not None:
-            epoch_record["val_loss"] = val_loss
-        history.append(epoch_record)
-        print(
-            f"[intrinsic][epoch {epoch}] train_loss={train_loss:.6f}"
-            + (f" val_loss={val_loss:.6f}" if val_loss is not None else "")
-        )
+                with sync_context:
+                    with _amp_autocast_context(train_config.use_amp, runtime.device, amp_dtype):
+                        outputs = intrinsic_model(second_block_features)
+                        loss = criterion(
+                            outputs["second_block_features_recon"],
+                            second_block_features,
+                        )
+                        scaled_loss = loss / loss_divisor
 
-        checkpoint_payload = {
-            "epoch": epoch,
-            "intrinsic_state_dict": intrinsic_model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
+                    if scaler.is_enabled():
+                        scaler.scale(scaled_loss).backward()
+                    else:
+                        scaled_loss.backward()
+
+                if should_step:
+                    if train_config.gradient_clip_norm is not None:
+                        if scaler.is_enabled():
+                            scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(
+                            _unwrap_model(intrinsic_model).parameters(),
+                            train_config.gradient_clip_norm,
+                        )
+
+                    if scaler.is_enabled():
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+
+                running_loss += float(loss.item())
+                train_steps += 1
+                if (batch_index + 1) % max(train_config.log_every, 1) == 0:
+                    display_loss = _reduced_mean_scalar(float(loss.item()), runtime)
+                    _print_if_primary(
+                        runtime,
+                        f"[intrinsic][epoch {epoch}] batch {batch_index + 1} loss={display_loss:.6f}",
+                    )
+
+            train_loss_sum, global_train_steps = _reduced_sum_and_count(running_loss, train_steps, runtime)
+            train_loss = train_loss_sum / max(global_train_steps, 1)
+            val_loss: float | None = None
+
+            if val_loader is not None:
+                intrinsic_model.eval()
+                val_running_loss = 0.0
+                val_steps = 0
+                with torch.no_grad():
+                    for _batch_index, batch in _iter_limited(val_loader, train_config.max_val_batches):
+                        batch = _move_batch_to_device(batch, runtime.device)
+                        encoded = encoder(batch["x"], batch["temb"], static_features=batch["static_features"])
+                        second_block_features = (
+                            encoded.second_block_features.detach()
+                            if train_config.detach_second_block_features
+                            else encoded.second_block_features
+                        )
+                        with _amp_autocast_context(train_config.use_amp, runtime.device, amp_dtype):
+                            outputs = intrinsic_model(second_block_features)
+                            loss = criterion(
+                                outputs["second_block_features_recon"],
+                                second_block_features,
+                            )
+                        val_running_loss += float(loss.item())
+                        val_steps += 1
+
+                val_loss_sum, global_val_steps = _reduced_sum_and_count(val_running_loss, val_steps, runtime)
+                val_loss = val_loss_sum / max(global_val_steps, 1)
+
+            epoch_record = {"epoch": float(epoch), "train_loss": train_loss}
+            if val_loss is not None:
+                epoch_record["val_loss"] = val_loss
+            history.append(epoch_record)
+            _print_if_primary(
+                runtime,
+                f"[intrinsic][epoch {epoch}] train_loss={train_loss:.6f}"
+                + (f" val_loss={val_loss:.6f}" if val_loss is not None else ""),
+            )
+
+            if runtime.is_primary:
+                checkpoint_payload = {
+                    "epoch": epoch,
+                    "intrinsic_state_dict": _unwrap_model(intrinsic_model).state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "history": history,
+                    "train_config": _to_plain_data(asdict(train_config)),
+                    "encoder_config": _to_plain_data(asdict(encoder_config)),
+                    "intrinsic_config": _to_plain_data(asdict(intrinsic_config)),
+                    "data_config": _to_plain_data(asdict(data_config)),
+                    "main_checkpoint_path": str(train_config.main_checkpoint_path) if train_config.main_checkpoint_path else None,
+                    "distributed_runtime": {
+                        "enabled": runtime.enabled,
+                        "backend": runtime.backend,
+                        "world_size": runtime.world_size,
+                    },
+                    "effective_batch_size": effective_batch_size,
+                    "gradient_accumulation_steps": train_config.gradient_accumulation_steps,
+                }
+                _save_checkpoint(output_dir / train_config.checkpoint_name, checkpoint_payload)
+
+                if val_loss is not None and val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    _save_checkpoint(output_dir / train_config.best_checkpoint_name, checkpoint_payload)
+
+        result = {
+            "smoke_report": smoke_report,
             "history": history,
-            "train_config": _to_plain_data(asdict(train_config)),
-            "encoder_config": _to_plain_data(asdict(encoder_config)),
-            "intrinsic_config": _to_plain_data(asdict(intrinsic_config)),
-            "data_config": _to_plain_data(asdict(data_config)),
-            "main_checkpoint_path": str(train_config.main_checkpoint_path) if train_config.main_checkpoint_path else None,
+            "checkpoint_path": str(output_dir / train_config.checkpoint_name),
+            "best_checkpoint_path": str(output_dir / train_config.best_checkpoint_name),
+            "distributed": runtime.enabled,
+            "world_size": runtime.world_size,
+            "effective_batch_size": effective_batch_size,
+            "gradient_accumulation_steps": train_config.gradient_accumulation_steps,
+            "train_batches": total_train_batches,
+            "val_batches": total_val_batches,
         }
-        _save_checkpoint(output_dir / train_config.checkpoint_name, checkpoint_payload)
-
-        if val_loss is not None and val_loss < best_val_loss:
-            best_val_loss = val_loss
-            _save_checkpoint(output_dir / train_config.best_checkpoint_name, checkpoint_payload)
-
-    result = {
-        "smoke_report": smoke_report,
-        "history": history,
-        "checkpoint_path": str(output_dir / train_config.checkpoint_name),
-        "best_checkpoint_path": str(output_dir / train_config.best_checkpoint_name),
-    }
-    _print_json_block("intrinsic_training_result", result)
-    return result
+        if runtime.is_primary:
+            _print_json_block("intrinsic_training_result", result)
+        return result
+    finally:
+        _cleanup_distributed_runtime(runtime)
 
 
 __all__ = [
     "IntrinsicTrainingConfig",
+    "LatitudeWeightedCharbonnierLoss",
     "MainTrainingConfig",
     "run_intrinsic_model_smoke_test",
     "run_main_model_smoke_test",

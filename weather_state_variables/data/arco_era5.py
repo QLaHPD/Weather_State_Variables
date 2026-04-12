@@ -1,7 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections import OrderedDict
+from dataclasses import dataclass, replace
+import math
 from pathlib import Path
+import json
+import shutil
 from typing import Any, Sequence
 from urllib.parse import urlparse
 
@@ -12,10 +16,13 @@ import requests
 import torch
 import xarray as xr
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Sampler
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover
+    tqdm = None
 
-from ..config import DEFAULT_MODEL_CONFIG_PATH, load_config_section
-from ..models.fuxi_lower_res import FuXiLowerResConfig
-from ..models.fuxi_short import build_fuxi_time_embeddings
+from ..config import DEFAULT_MODEL_CONFIG_PATH, load_config_section, load_yaml_config
 
 
 DEFAULT_ARCO_ERA5_URL = (
@@ -44,6 +51,7 @@ FUXI_STATIC_VARIABLES = (
     "cos_longitude",
     "sin_longitude",
 )
+FUXI_STATIC_SOURCE_VARIABLES = ("land_sea_mask", "geopotential_at_surface")
 
 _STANDARD_GRAVITY = 9.80665
 _EPSILON = 0.622
@@ -63,7 +71,15 @@ def _as_timestamp(value: str | np.datetime64 | pd.Timestamp | None) -> pd.Timest
     return pd.Timestamp(value)
 
 
-def _normalize_arco_gs_url(dataset_url: str) -> str:
+def _maybe_local_zarr_path(dataset_url: str | Path) -> Path | None:
+    candidate = Path(str(dataset_url)).expanduser()
+    if candidate.exists():
+        return candidate.resolve()
+    return None
+
+
+def _normalize_arco_gs_url(dataset_url: str | Path) -> str:
+    dataset_url = str(dataset_url)
     if dataset_url.startswith("gs://"):
         return dataset_url.rstrip("/")
 
@@ -93,6 +109,124 @@ def _arco_https_prefix(dataset_url: str) -> str:
 
 def arco_metadata_url(dataset_url: str) -> str:
     return _arco_https_prefix(dataset_url) + "/.zmetadata"
+
+
+def open_arco_era5_dataset(
+    dataset_url: str | Path = DEFAULT_ARCO_ERA5_URL,
+    *,
+    gcs_token: str = "anon",
+) -> xr.Dataset:
+    local_path = _maybe_local_zarr_path(dataset_url)
+    if local_path is not None:
+        return xr.open_zarr(local_path, consolidated=None)
+
+    fs = gcsfs.GCSFileSystem(token=gcs_token)
+    store = gcsfs.mapping.GCSMap(
+        _normalize_arco_gs_url(dataset_url)[len("gs://") :],
+        gcs=fs,
+        check=False,
+    )
+    return xr.open_zarr(store, consolidated=True)
+
+
+def describe_arco_era5_dataset_location(dataset_url: str | Path) -> str:
+    local_path = _maybe_local_zarr_path(dataset_url)
+    if local_path is not None:
+        return str(local_path)
+    return _normalize_arco_gs_url(dataset_url)
+
+
+def _read_json_file(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _write_json_file(path: Path, payload: dict[str, Any]) -> None:
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def inspect_local_zarr_time_axes(zarr_path: str | Path) -> list[dict[str, Any]]:
+    root = Path(zarr_path).resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f"Zarr store not found: {root}")
+
+    entries: list[dict[str, Any]] = []
+    for child in sorted(root.iterdir()):
+        if not child.is_dir():
+            continue
+        zarray_path = child / ".zarray"
+        zattrs_path = child / ".zattrs"
+        if not zarray_path.is_file() or not zattrs_path.is_file():
+            continue
+
+        zarray = _read_json_file(zarray_path)
+        zattrs = _read_json_file(zattrs_path)
+        dims = tuple(zattrs.get("_ARRAY_DIMENSIONS", []))
+        if "time" not in dims:
+            continue
+
+        time_dim_index = dims.index("time")
+        shape = [int(value) for value in zarray["shape"]]
+        chunks = [int(value) for value in zarray["chunks"]]
+        entries.append(
+            {
+                "name": child.name,
+                "dims": list(dims),
+                "shape": shape,
+                "chunks": chunks,
+                "time_dim_index": time_dim_index,
+                "time_size": shape[time_dim_index],
+                "zarray_path": str(zarray_path),
+            }
+        )
+    return entries
+
+
+def repair_local_zarr_time_consistency(
+    zarr_path: str | Path,
+    *,
+    target_time_size: int | None = None,
+    verbose: bool = True,
+) -> dict[str, Any]:
+    root = Path(zarr_path).resolve()
+    entries = inspect_local_zarr_time_axes(root)
+    if not entries:
+        raise ValueError(f"No time-dependent arrays were found in {root}")
+
+    observed_sizes = sorted({int(entry["time_size"]) for entry in entries})
+    resolved_target = int(target_time_size) if target_time_size is not None else min(observed_sizes)
+    if resolved_target <= 0:
+        raise ValueError(f"Invalid target_time_size {resolved_target} for {root}")
+
+    touched_arrays: list[str] = []
+    for entry in entries:
+        if int(entry["time_size"]) <= resolved_target:
+            continue
+        zarray_path = Path(entry["zarray_path"])
+        zarray = _read_json_file(zarray_path)
+        zarray["shape"][int(entry["time_dim_index"])] = resolved_target
+        _write_json_file(zarray_path, zarray)
+        touched_arrays.append(str(entry["name"]))
+
+    if (root / ".zmetadata").exists():
+        (root / ".zmetadata").unlink()
+
+    import zarr
+
+    zarr.consolidate_metadata(str(root))
+
+    summary = {
+        "zarr_path": str(root),
+        "observed_time_sizes": observed_sizes,
+        "target_time_size": resolved_target,
+        "touched_arrays": touched_arrays,
+        "touched_array_count": len(touched_arrays),
+    }
+    if verbose:
+        print(
+            "[repair_local_zarr_time_consistency] "
+            f"trimmed {len(touched_arrays)} arrays to time_size={resolved_target}"
+        )
+    return summary
 
 
 def fetch_arco_zarr_metadata(dataset_url: str, timeout: int = 30) -> dict[str, Any]:
@@ -156,6 +290,107 @@ def specific_humidity_to_relative_humidity(
     saturation_vapor_pressure = 611.2 * np.exp((17.67 * temperature_c) / (temperature_c + 243.5))
     relative_humidity = 100.0 * vapor_pressure / saturation_vapor_pressure
     return relative_humidity.clip(min=0.0, max=100.0).transpose(*specific_humidity.dims).astype(np.float32)
+
+
+def prepare_arco_spatial_dataarray(
+    data_array: xr.DataArray,
+    *,
+    latitude_descending: bool = True,
+) -> xr.DataArray:
+    ordered_dims = [dim for dim in ("time", "level", "latitude", "longitude") if dim in data_array.dims]
+    data_array = data_array.transpose(*ordered_dims)
+    if (
+        "latitude" in data_array.coords
+        and latitude_descending
+        and data_array["latitude"].values.shape[0] > 1
+        and data_array["latitude"].values[0] < data_array["latitude"].values[-1]
+    ):
+        data_array = data_array.isel(latitude=slice(None, None, -1))
+    return data_array.astype(np.float32)
+
+
+def build_fuxi_derived_static_maps(
+    latitude: np.ndarray | Sequence[float],
+    longitude: np.ndarray | Sequence[float],
+) -> dict[str, np.ndarray]:
+    latitude_values = np.asarray(latitude, dtype=np.float32)
+    longitude_values = np.asarray(longitude, dtype=np.float32)
+    if latitude_values.ndim != 1:
+        raise ValueError(f"Expected 1D latitude coordinates, got shape {latitude_values.shape}")
+    if longitude_values.ndim != 1:
+        raise ValueError(f"Expected 1D longitude coordinates, got shape {longitude_values.shape}")
+
+    lat_grid, lon_grid = np.meshgrid(latitude_values, longitude_values, indexing="ij")
+    return {
+        "cos_latitude": np.cos(np.deg2rad(lat_grid)).astype(np.float32),
+        "cos_longitude": np.cos(np.deg2rad(lon_grid)).astype(np.float32),
+        "sin_longitude": np.sin(np.deg2rad(lon_grid)).astype(np.float32),
+    }
+
+
+def load_arco_static_source_maps(
+    dataset_url: str | Path = DEFAULT_ARCO_ERA5_URL,
+    *,
+    orography_source: str = "geopotential_at_surface",
+    convert_geopotential_to_height: bool = True,
+    latitude_descending: bool = True,
+    gcs_token: str = "anon",
+) -> dict[str, np.ndarray]:
+    ds = open_arco_era5_dataset(dataset_url, gcs_token=gcs_token)
+
+    land_sea_mask = prepare_arco_spatial_dataarray(
+        ds["land_sea_mask"],
+        latitude_descending=latitude_descending,
+    ).load().values
+    orography = prepare_arco_spatial_dataarray(
+        ds[orography_source],
+        latitude_descending=latitude_descending,
+    ).load().values
+    if convert_geopotential_to_height and orography_source == "geopotential_at_surface":
+        orography = orography / _STANDARD_GRAVITY
+
+    latitude = prepare_arco_spatial_dataarray(
+        ds["latitude"],
+        latitude_descending=latitude_descending,
+    ).values
+    longitude = prepare_arco_spatial_dataarray(
+        ds["longitude"],
+        latitude_descending=latitude_descending,
+    ).values
+    return {
+        "land_sea_mask": land_sea_mask.astype(np.float32),
+        "orography": orography.astype(np.float32),
+        "latitude": latitude.astype(np.float32),
+        "longitude": longitude.astype(np.float32),
+    }
+
+
+def build_fuxi_static_maps(
+    dataset_url: str | Path = DEFAULT_ARCO_ERA5_URL,
+    *,
+    static_variables: Sequence[str] = FUXI_STATIC_VARIABLES,
+    orography_source: str = "geopotential_at_surface",
+    convert_geopotential_to_height: bool = True,
+    latitude_descending: bool = True,
+    gcs_token: str = "anon",
+) -> dict[str, np.ndarray]:
+    source_maps = load_arco_static_source_maps(
+        dataset_url,
+        orography_source=orography_source,
+        convert_geopotential_to_height=convert_geopotential_to_height,
+        latitude_descending=latitude_descending,
+        gcs_token=gcs_token,
+    )
+    derived_maps = build_fuxi_derived_static_maps(
+        source_maps["latitude"],
+        source_maps["longitude"],
+    )
+    all_maps = {
+        "land_sea_mask": source_maps["land_sea_mask"],
+        "orography": source_maps["orography"],
+        **derived_maps,
+    }
+    return {name: all_maps[name] for name in static_variables}
 
 
 @dataclass(frozen=True)
@@ -222,13 +457,7 @@ def inspect_arco_era5_dataset(dataset_url: str = DEFAULT_ARCO_ERA5_URL) -> ArcoE
     latitude_size = int(metadata["latitude/.zarray"]["shape"][0])
     longitude_size = int(metadata["longitude/.zarray"]["shape"][0])
 
-    fs = gcsfs.GCSFileSystem(token="anon")
-    store = gcsfs.mapping.GCSMap(
-        _normalize_arco_gs_url(dataset_url)[len("gs://") :],
-        gcs=fs,
-        check=False,
-    )
-    ds = xr.open_zarr(store, consolidated=True)
+    ds = open_arco_era5_dataset(dataset_url, gcs_token="anon")
     available_levels = tuple(int(level) for level in ds["level"].values.tolist())
 
     return ArcoEra5CompatibilityReport(
@@ -260,6 +489,7 @@ class ArcoEra5FuXiDataConfig:
     orography_source: str = "geopotential_at_surface"
     convert_geopotential_to_height: bool = True
     latitude_descending: bool = True
+    include_sample_metadata: bool = False
     gcs_token: str = "anon"
     start_time: pd.Timestamp | None = None
     end_time: pd.Timestamp | None = None
@@ -303,6 +533,7 @@ class ArcoEra5FuXiDataConfig:
             orography_source=str(data.get("orography_source", "geopotential_at_surface")),
             convert_geopotential_to_height=bool(data.get("convert_geopotential_to_height", True)),
             latitude_descending=bool(data.get("latitude_descending", True)),
+            include_sample_metadata=bool(data.get("include_sample_metadata", False)),
             gcs_token=str(data.get("gcs_token", "anon")),
             start_time=_as_timestamp(data.get("start_time")),
             end_time=_as_timestamp(data.get("end_time")),
@@ -312,6 +543,451 @@ class ArcoEra5FuXiDataConfig:
     @property
     def channel_names(self) -> list[str]:
         return build_fuxi_channel_names(self.pressure_levels)
+
+
+@dataclass(frozen=True)
+class ArcoEra5DownloadPlan:
+    source_pressure_variables: tuple[str, ...]
+    source_surface_variables: tuple[str, ...]
+    source_static_variables: tuple[str, ...]
+    output_dynamic_variables: tuple[str, ...]
+    derive_relative_humidity: bool
+    pressure_levels: tuple[int, ...]
+
+    @property
+    def source_variables(self) -> tuple[str, ...]:
+        ordered: list[str] = []
+        for name in (
+            *self.source_pressure_variables,
+            *self.source_surface_variables,
+            *self.source_static_variables,
+        ):
+            if name not in ordered:
+                ordered.append(name)
+        return tuple(ordered)
+
+
+@dataclass(frozen=True)
+class ArcoEra5DownloadWindow:
+    anchor_start: pd.Timestamp | None
+    anchor_end: pd.Timestamp | None
+    raw_start: pd.Timestamp | None
+    raw_end: pd.Timestamp | None
+
+    def summary(self) -> dict[str, str | None]:
+        return {
+            "anchor_start": None if self.anchor_start is None else str(self.anchor_start),
+            "anchor_end": None if self.anchor_end is None else str(self.anchor_end),
+            "raw_start": None if self.raw_start is None else str(self.raw_start),
+            "raw_end": None if self.raw_end is None else str(self.raw_end),
+        }
+
+
+def build_arco_era5_download_plan(
+    available_variables: Sequence[str],
+    config: ArcoEra5FuXiDataConfig | None = None,
+    *,
+    include_static_sources: bool = True,
+) -> ArcoEra5DownloadPlan:
+    data_config = config or ArcoEra5FuXiDataConfig.from_yaml()
+    available = {str(name) for name in available_variables}
+    missing: list[str] = []
+    source_pressure_variables: list[str] = []
+    source_surface_variables: list[str] = []
+    source_static_variables: list[str] = []
+    derive_relative_humidity = False
+
+    def add_unique(target: list[str], name: str) -> None:
+        if name not in target:
+            target.append(name)
+
+    for variable_name in data_config.upper_air_variables:
+        if variable_name == "relative_humidity":
+            if "relative_humidity" in available:
+                add_unique(source_pressure_variables, "relative_humidity")
+            elif {"specific_humidity", "temperature"}.issubset(available):
+                derive_relative_humidity = True
+                add_unique(source_pressure_variables, "temperature")
+                add_unique(source_pressure_variables, "specific_humidity")
+            else:
+                missing.append("relative_humidity")
+            continue
+
+        if variable_name not in available:
+            missing.append(variable_name)
+            continue
+        add_unique(source_pressure_variables, variable_name)
+
+    for variable_name in data_config.surface_variables:
+        if variable_name not in available:
+            missing.append(variable_name)
+            continue
+        add_unique(source_surface_variables, variable_name)
+
+    if include_static_sources:
+        for variable_name in ("land_sea_mask", data_config.orography_source):
+            if variable_name not in available:
+                missing.append(variable_name)
+                continue
+            add_unique(source_static_variables, variable_name)
+
+    if missing:
+        missing_names = ", ".join(sorted(set(missing)))
+        raise KeyError(f"Source dataset is missing required variables: {missing_names}")
+
+    return ArcoEra5DownloadPlan(
+        source_pressure_variables=tuple(source_pressure_variables),
+        source_surface_variables=tuple(source_surface_variables),
+        source_static_variables=tuple(source_static_variables),
+        output_dynamic_variables=tuple((*data_config.upper_air_variables, *data_config.surface_variables)),
+        derive_relative_humidity=derive_relative_humidity,
+        pressure_levels=data_config.pressure_levels,
+    )
+
+
+def resolve_arco_era5_download_window(
+    config_path: str | Path = DEFAULT_MODEL_CONFIG_PATH,
+    *,
+    section_names: Sequence[str] = ("train_main", "train_intrinsic"),
+) -> ArcoEra5DownloadWindow:
+    resolved_config_path, config = load_yaml_config(config_path)
+    data_config = ArcoEra5FuXiDataConfig.from_yaml(resolved_config_path)
+
+    start_candidates: list[pd.Timestamp] = []
+    end_candidates: list[pd.Timestamp] = []
+
+    for section_name in section_names:
+        section_value = config.get(section_name)
+        if not isinstance(section_value, dict):
+            continue
+        for start_key in ("train_start_time", "val_start_time"):
+            start_value = _as_timestamp(section_value.get(start_key))
+            if start_value is not None:
+                start_candidates.append(start_value)
+        for end_key in ("train_end_time", "val_end_time"):
+            end_value = _as_timestamp(section_value.get(end_key))
+            if end_value is not None:
+                end_candidates.append(end_value)
+
+    anchor_start = min(start_candidates) if start_candidates else None
+    anchor_end = max(end_candidates) if end_candidates else None
+
+    raw_start = None
+    if anchor_start is not None:
+        raw_start = anchor_start + pd.Timedelta(hours=min(data_config.input_time_offsets_hours))
+
+    raw_end = None
+    if anchor_end is not None:
+        raw_end = anchor_end + pd.Timedelta(hours=data_config.lead_time_hours * data_config.forecast_steps)
+
+    return ArcoEra5DownloadWindow(
+        anchor_start=anchor_start,
+        anchor_end=anchor_end,
+        raw_start=raw_start,
+        raw_end=raw_end,
+    )
+
+
+def _build_download_chunk_dataset(
+    source_chunk: xr.Dataset,
+    plan: ArcoEra5DownloadPlan,
+    data_config: ArcoEra5FuXiDataConfig,
+    *,
+    include_static_sources: bool,
+) -> xr.Dataset:
+    data_vars: dict[str, xr.DataArray] = {}
+    level_values = source_chunk["level"].sel(level=list(plan.pressure_levels))
+
+    for variable_name in plan.source_pressure_variables:
+        array = source_chunk[variable_name].sel(level=list(plan.pressure_levels)).astype(np.float32)
+        data_vars[variable_name] = array
+
+    if plan.derive_relative_humidity:
+        relative_humidity = specific_humidity_to_relative_humidity(
+            data_vars["specific_humidity"],
+            data_vars["temperature"],
+            level_values,
+        )
+        relative_humidity.name = "relative_humidity"
+        data_vars["relative_humidity"] = relative_humidity
+        del data_vars["specific_humidity"]
+
+    for variable_name in plan.source_surface_variables:
+        data_vars[variable_name] = source_chunk[variable_name].astype(np.float32)
+
+    if include_static_sources:
+        for variable_name in plan.source_static_variables:
+            data_vars[variable_name] = source_chunk[variable_name].astype(np.float32)
+
+    output = xr.Dataset(data_vars=data_vars)
+    if data_config.latitude_descending and "latitude" in output.coords:
+        latitude_values = output["latitude"].values
+        if latitude_values.shape[0] > 1 and latitude_values[0] < latitude_values[-1]:
+            output = output.isel(latitude=slice(None, None, -1))
+    return output
+
+
+def download_arco_era5_subset(
+    output_path: str | Path,
+    *,
+    config_path: str | Path = DEFAULT_MODEL_CONFIG_PATH,
+    dataset_url: str | Path | None = None,
+    start_time: str | pd.Timestamp | None = None,
+    end_time: str | pd.Timestamp | None = None,
+    include_static_sources: bool = True,
+    overwrite: bool = False,
+    resume: bool = False,
+    chunk_size: int = 24,
+    gcs_token: str | None = None,
+    verbose: bool = True,
+    show_progress: bool = True,
+    repair_inconsistent_resume_store: bool = True,
+) -> dict[str, Any]:
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+
+    data_config = ArcoEra5FuXiDataConfig.from_yaml(config_path)
+    if dataset_url is not None:
+        data_config = replace(data_config, dataset_url=str(dataset_url))
+    if gcs_token is not None:
+        data_config = replace(data_config, gcs_token=str(gcs_token))
+
+    download_window = resolve_arco_era5_download_window(config_path)
+    requested_start = _as_timestamp(start_time) if start_time is not None else download_window.raw_start
+    requested_end = _as_timestamp(end_time) if end_time is not None else download_window.raw_end
+
+    source_dataset = open_arco_era5_dataset(data_config.dataset_url, gcs_token=data_config.gcs_token)
+    download_plan = build_arco_era5_download_plan(
+        tuple(source_dataset.data_vars),
+        data_config,
+        include_static_sources=include_static_sources,
+    )
+
+    selected = source_dataset
+    if requested_start is not None or requested_end is not None:
+        selected = selected.sel(time=slice(requested_start, requested_end))
+    selected = selected.sel(level=list(download_plan.pressure_levels))
+
+    if selected.sizes.get("time", 0) == 0:
+        raise ValueError(
+            "Selected ARCO ERA5 slice is empty. "
+            f"Requested time range: {requested_start!s} -> {requested_end!s}"
+        )
+
+    resolved_output_path = Path(output_path).resolve()
+    start_index = 0
+    resumed_from_time_steps = 0
+    already_complete = False
+    if resolved_output_path.exists():
+        if overwrite:
+            if resolved_output_path.is_dir():
+                shutil.rmtree(resolved_output_path)
+            else:
+                resolved_output_path.unlink()
+        elif resume:
+            try:
+                existing = xr.open_zarr(resolved_output_path, consolidated=None)
+            except ValueError as exc:
+                if (
+                    repair_inconsistent_resume_store
+                    and "conflicting sizes for dimension 'time'" in str(exc)
+                ):
+                    if verbose:
+                        print(
+                            "[download_arco_era5_subset] detected an inconsistent partial Zarr store. "
+                            "Attempting automatic time-axis repair before resuming."
+                        )
+                    repair_summary = repair_local_zarr_time_consistency(
+                        resolved_output_path,
+                        verbose=verbose,
+                    )
+                    if verbose:
+                        print(
+                            "[download_arco_era5_subset] repair summary: "
+                            f"{json.dumps(repair_summary, sort_keys=True)}"
+                        )
+                    existing = xr.open_zarr(resolved_output_path, consolidated=None)
+                else:
+                    raise
+            existing_time_size = int(existing.sizes.get("time", 0))
+            if existing_time_size > int(selected.sizes["time"]):
+                raise ValueError(
+                    f"Existing output has {existing_time_size} time steps, "
+                    f"but the requested slice has only {int(selected.sizes['time'])}."
+                )
+
+            expected_dynamic_variables = set(download_plan.output_dynamic_variables)
+            existing_variables = set(existing.data_vars)
+            missing_dynamic = expected_dynamic_variables - existing_variables
+            if missing_dynamic:
+                missing_names = ", ".join(sorted(missing_dynamic))
+                raise ValueError(
+                    f"Existing output cannot be resumed because it is missing dynamic variables: {missing_names}"
+                )
+
+            if include_static_sources:
+                expected_static_variables = set(download_plan.source_static_variables)
+                missing_static = expected_static_variables - existing_variables
+                if missing_static:
+                    missing_names = ", ".join(sorted(missing_static))
+                    raise ValueError(
+                        f"Existing output cannot be resumed because it is missing static variables: {missing_names}"
+                    )
+
+            if int(existing.sizes.get("latitude", -1)) != int(selected.sizes["latitude"]):
+                raise ValueError("Existing output latitude size does not match the requested source slice.")
+            if int(existing.sizes.get("longitude", -1)) != int(selected.sizes["longitude"]):
+                raise ValueError("Existing output longitude size does not match the requested source slice.")
+
+            existing_times = pd.Index(pd.to_datetime(existing["time"].values))
+            source_prefix_times = pd.Index(
+                pd.to_datetime(selected["time"].isel(time=slice(0, existing_time_size)).values)
+            )
+            if not existing_times.equals(source_prefix_times):
+                raise ValueError(
+                    "Existing output time coordinates are not a prefix of the requested source slice, "
+                    "so automatic resume would risk corrupting the dataset."
+                )
+
+            start_index = existing_time_size
+            resumed_from_time_steps = existing_time_size
+            already_complete = existing_time_size == int(selected.sizes["time"])
+        else:
+            raise FileExistsError(
+                f"Output path already exists: {resolved_output_path}. "
+                "Pass overwrite=True, use --overwrite, or resume=True / --resume."
+            )
+    resolved_output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    time_size = int(selected.sizes["time"])
+    remaining_time_steps = max(time_size - start_index, 0)
+    total_chunks = (remaining_time_steps + chunk_size - 1) // chunk_size if remaining_time_steps else 0
+    first_chunk_time_size = 0
+    if already_complete:
+        summary = {
+            "output_path": str(resolved_output_path),
+            "dataset_url": describe_arco_era5_dataset_location(data_config.dataset_url),
+            "gcs_token": data_config.gcs_token,
+            "time_start": str(pd.Timestamp(selected["time"].values[0])),
+            "time_end": str(pd.Timestamp(selected["time"].values[-1])),
+            "time_steps": time_size,
+            "first_chunk_time_steps": first_chunk_time_size,
+            "chunk_size": chunk_size,
+            "chunk_count": total_chunks,
+            "latitude_size": int(selected.sizes["latitude"]),
+            "longitude_size": int(selected.sizes["longitude"]),
+            "pressure_levels": list(download_plan.pressure_levels),
+            "source_variables": list(download_plan.source_variables),
+            "dynamic_variables": list(download_plan.output_dynamic_variables),
+            "static_source_variables": list(download_plan.source_static_variables),
+            "derived_relative_humidity": download_plan.derive_relative_humidity,
+            "download_window": download_window.summary(),
+            "requested_start_time": None if requested_start is None else str(requested_start),
+            "requested_end_time": None if requested_end is None else str(requested_end),
+            "resume_enabled": resume,
+            "resumed_from_time_steps": resumed_from_time_steps,
+            "remaining_time_steps": remaining_time_steps,
+            "already_complete": True,
+        }
+        if verbose:
+            print(f"[download_arco_era5_subset] output already complete at {resolved_output_path}")
+        return summary
+
+    progress_bar = None
+    if show_progress and tqdm is not None:
+        progress_bar = tqdm(
+            total=time_size,
+            initial=start_index,
+            unit="hour",
+            desc="ARCO ERA5 download",
+        )
+    elif show_progress and verbose and tqdm is None:
+        print("[download_arco_era5_subset] tqdm is not installed; continuing without a progress bar.")
+
+    try:
+        for chunk_number, chunk_start_index in enumerate(range(start_index, time_size, chunk_size), start=1):
+            stop_index = min(chunk_start_index + chunk_size, time_size)
+            source_chunk = selected.isel(time=slice(chunk_start_index, stop_index)).load()
+            output_chunk = _build_download_chunk_dataset(
+                source_chunk,
+                download_plan,
+                data_config,
+                include_static_sources=include_static_sources and start_index == 0 and chunk_number == 1,
+            )
+            output_chunk.attrs.update(
+                {
+                    "source_dataset_url": describe_arco_era5_dataset_location(data_config.dataset_url),
+                    "source_gcs_token": data_config.gcs_token,
+                    "pressure_levels": list(download_plan.pressure_levels),
+                    "derived_relative_humidity": bool(download_plan.derive_relative_humidity),
+                    "requested_start_time": None if requested_start is None else str(requested_start),
+                    "requested_end_time": None if requested_end is None else str(requested_end),
+                }
+            )
+
+            is_first_write = chunk_start_index == 0 and chunk_number == 1
+            mode = "w" if is_first_write else "a"
+            append_dim = None if is_first_write else "time"
+            output_chunk.to_zarr(
+                resolved_output_path,
+                mode=mode,
+                append_dim=append_dim,
+                consolidated=False,
+            )
+            if is_first_write:
+                first_chunk_time_size = int(output_chunk.sizes.get("time", 0))
+
+            chunk_time_steps = stop_index - chunk_start_index
+            if progress_bar is not None:
+                chunk_start = pd.Timestamp(source_chunk["time"].values[0])
+                chunk_end = pd.Timestamp(source_chunk["time"].values[-1])
+                progress_bar.update(chunk_time_steps)
+                progress_bar.set_postfix_str(f"{chunk_start} -> {chunk_end}")
+
+            if verbose and progress_bar is None:
+                chunk_start = pd.Timestamp(source_chunk["time"].values[0])
+                chunk_end = pd.Timestamp(source_chunk["time"].values[-1])
+                print(
+                    f"[download_arco_era5_subset] wrote chunk {chunk_number}/{max(total_chunks, 1)} "
+                    f"({chunk_start} -> {chunk_end})"
+                )
+    finally:
+        if progress_bar is not None:
+            progress_bar.close()
+
+    import zarr
+
+    zarr.consolidate_metadata(str(resolved_output_path))
+
+    final_time_values = selected["time"].values
+    summary = {
+        "output_path": str(resolved_output_path),
+        "dataset_url": describe_arco_era5_dataset_location(data_config.dataset_url),
+        "gcs_token": data_config.gcs_token,
+        "time_start": str(pd.Timestamp(final_time_values[0])),
+        "time_end": str(pd.Timestamp(final_time_values[-1])),
+        "time_steps": time_size,
+        "first_chunk_time_steps": first_chunk_time_size,
+        "chunk_size": chunk_size,
+        "chunk_count": total_chunks,
+        "latitude_size": int(selected.sizes["latitude"]),
+        "longitude_size": int(selected.sizes["longitude"]),
+        "pressure_levels": list(download_plan.pressure_levels),
+        "source_variables": list(download_plan.source_variables),
+        "dynamic_variables": list(download_plan.output_dynamic_variables),
+        "static_source_variables": list(download_plan.source_static_variables),
+        "derived_relative_humidity": download_plan.derive_relative_humidity,
+        "download_window": download_window.summary(),
+        "requested_start_time": None if requested_start is None else str(requested_start),
+        "requested_end_time": None if requested_end is None else str(requested_end),
+        "resume_enabled": resume,
+        "resumed_from_time_steps": resumed_from_time_steps,
+        "remaining_time_steps": remaining_time_steps,
+        "already_complete": False,
+    }
+    if verbose:
+        print(f"[download_arco_era5_subset] wrote dataset to {resolved_output_path}")
+    return summary
 
 
 class ArcoEra5FuXiDataset(Dataset[dict[str, Any]]):
@@ -324,16 +1000,15 @@ class ArcoEra5FuXiDataset(Dataset[dict[str, Any]]):
         self._static_features: torch.Tensor | None = None
         self._valid_anchor_indices: np.ndarray | None = None
         self._dataset_step_hours: int | None = None
+        self._dynamic_frame_cache: OrderedDict[int, np.ndarray] = OrderedDict()
+        self._dynamic_frame_cache_size: int | None = None
 
     def _open_dataset(self) -> xr.Dataset:
         if self._dataset is None:
-            fs = gcsfs.GCSFileSystem(token=self.config.gcs_token)
-            store = gcsfs.mapping.GCSMap(
-                _normalize_arco_gs_url(self.config.dataset_url)[len("gs://") :],
-                gcs=fs,
-                check=False,
+            self._dataset = open_arco_era5_dataset(
+                self.config.dataset_url,
+                gcs_token=self.config.gcs_token,
             )
-            self._dataset = xr.open_zarr(store, consolidated=True)
         return self._dataset
 
     def _load_time_values(self) -> np.ndarray:
@@ -358,15 +1033,10 @@ class ArcoEra5FuXiDataset(Dataset[dict[str, Any]]):
         return hours // step_hours
 
     def _prepare_spatial_dataarray(self, data_array: xr.DataArray) -> xr.DataArray:
-        ordered_dims = [dim for dim in ("time", "level", "latitude", "longitude") if dim in data_array.dims]
-        data_array = data_array.transpose(*ordered_dims)
-        if (
-            "latitude" in data_array.coords
-            and self.config.latitude_descending
-            and data_array["latitude"].values[0] < data_array["latitude"].values[-1]
-        ):
-            data_array = data_array.isel(latitude=slice(None, None, -1))
-        return data_array.astype(np.float32)
+        return prepare_arco_spatial_dataarray(
+            data_array,
+            latitude_descending=self.config.latitude_descending,
+        )
 
     def _select_pressure_variable(self, name: str, time_indices: Sequence[int]) -> xr.DataArray:
         ds = self._open_dataset()
@@ -405,7 +1075,7 @@ class ArcoEra5FuXiDataset(Dataset[dict[str, Any]]):
             ds["level"].sel(level=list(self.config.pressure_levels)),
         )
 
-    def _build_dynamic_tensor(self, time_indices: Sequence[int]) -> np.ndarray:
+    def _load_dynamic_tensor_uncached(self, time_indices: Sequence[int]) -> np.ndarray:
         upper_air_groups: list[np.ndarray] = []
         for variable_name in self.config.upper_air_variables:
             if variable_name == "relative_humidity":
@@ -425,30 +1095,66 @@ class ArcoEra5FuXiDataset(Dataset[dict[str, Any]]):
         surface = np.concatenate(surface_groups, axis=1)
         return np.concatenate([upper_air, surface], axis=1).astype(np.float32)
 
+    def _resolved_dynamic_frame_cache_size(self) -> int:
+        if self._dynamic_frame_cache_size is None:
+            dynamic_offsets = [self._step_count(hours) for hours in self.config.input_time_offsets_hours]
+            dynamic_offsets.extend(
+                self._step_count(self.config.lead_time_hours * step)
+                for step in range(1, self.config.forecast_steps + 1)
+            )
+            self._dynamic_frame_cache_size = max(1, max(dynamic_offsets) - min(dynamic_offsets) + 1)
+        return self._dynamic_frame_cache_size
+
+    def _load_dynamic_frame(self, time_index: int) -> np.ndarray:
+        cached = self._dynamic_frame_cache.get(time_index)
+        if cached is not None:
+            self._dynamic_frame_cache.move_to_end(time_index)
+            return cached
+
+        frame = self._load_dynamic_tensor_uncached([time_index])[0]
+        self._dynamic_frame_cache[time_index] = frame
+        while len(self._dynamic_frame_cache) > self._resolved_dynamic_frame_cache_size():
+            self._dynamic_frame_cache.popitem(last=False)
+        return frame
+
+    def _build_dynamic_tensor(self, time_indices: Sequence[int]) -> np.ndarray:
+        frames = [self._load_dynamic_frame(int(time_index)) for time_index in time_indices]
+        return np.stack(frames, axis=0).astype(np.float32, copy=False)
+
     def _build_static_features(self) -> torch.Tensor:
         if self._static_features is not None:
             return self._static_features
 
         ds = self._open_dataset()
-        land_sea_mask = self._prepare_spatial_dataarray(ds["land_sea_mask"]).load().values
-
-        orography = self._prepare_spatial_dataarray(ds[self.config.orography_source]).load().values
+        land_sea_mask = prepare_arco_spatial_dataarray(
+            ds["land_sea_mask"],
+            latitude_descending=self.config.latitude_descending,
+        ).load().values
+        orography = prepare_arco_spatial_dataarray(
+            ds[self.config.orography_source],
+            latitude_descending=self.config.latitude_descending,
+        ).load().values
         if self.config.convert_geopotential_to_height and self.config.orography_source == "geopotential_at_surface":
             orography = orography / _STANDARD_GRAVITY
 
-        latitude = self._prepare_spatial_dataarray(ds["latitude"]).values
-        longitude = self._prepare_spatial_dataarray(ds["longitude"]).values
-        lat_grid, lon_grid = np.meshgrid(latitude, longitude, indexing="ij")
-
+        latitude = prepare_arco_spatial_dataarray(
+            ds["latitude"],
+            latitude_descending=self.config.latitude_descending,
+        ).values
+        longitude = prepare_arco_spatial_dataarray(
+            ds["longitude"],
+            latitude_descending=self.config.latitude_descending,
+        ).values
+        derived_maps = build_fuxi_derived_static_maps(latitude, longitude)
         static_map = {
             "land_sea_mask": land_sea_mask.astype(np.float32),
             "orography": orography.astype(np.float32),
-            "cos_latitude": np.cos(np.deg2rad(lat_grid)).astype(np.float32),
-            "cos_longitude": np.cos(np.deg2rad(lon_grid)).astype(np.float32),
-            "sin_longitude": np.sin(np.deg2rad(lon_grid)).astype(np.float32),
+            **derived_maps,
         }
-
-        stacked = np.stack([static_map[name] for name in self.config.static_variables], axis=0)
+        stacked = np.stack(
+            [static_map[name] for name in self.config.static_variables],
+            axis=0,
+        )
         self._static_features = torch.from_numpy(stacked)
         return self._static_features
 
@@ -473,38 +1179,45 @@ class ArcoEra5FuXiDataset(Dataset[dict[str, Any]]):
         self._valid_anchor_indices = anchor_indices
         return self._valid_anchor_indices
 
-    def __len__(self) -> int:
-        return int(self._build_valid_anchor_indices().shape[0])
+    def _build_sample(self, anchor_index: int) -> dict[str, Any]:
+        from ..models.fuxi_short import build_fuxi_time_embeddings
 
-    def __getitem__(self, index: int) -> dict[str, Any]:
-        anchor_index = int(self._build_valid_anchor_indices()[index])
         time_values = self._load_time_values()
-
         input_indices = [anchor_index + self._step_count(hours) for hours in self.config.input_time_offsets_hours]
         target_indices = [
             anchor_index + self._step_count(self.config.lead_time_hours * step)
             for step in range(1, self.config.forecast_steps + 1)
         ]
 
-        x = torch.from_numpy(self._build_dynamic_tensor(input_indices))
-        target = torch.from_numpy(self._build_dynamic_tensor(target_indices))
-        static_features = self._build_static_features().clone()
         anchor_time = pd.Timestamp(time_values[anchor_index])
-        temb = torch.from_numpy(
-            build_fuxi_time_embeddings(anchor_time, total_steps=1, freq_hours=self.config.lead_time_hours)[0, 0]
-        )
-
-        return {
-            "x": x,
-            "target": target,
-            "static_features": static_features,
-            "temb": temb,
-            "input_times": [str(pd.Timestamp(time_values[i])) for i in input_indices],
-            "anchor_time": str(anchor_time),
-            "target_times": [str(pd.Timestamp(time_values[i])) for i in target_indices],
+        sample = {
+            "x": torch.from_numpy(self._build_dynamic_tensor(input_indices)),
+            "target": torch.from_numpy(self._build_dynamic_tensor(target_indices)),
+            "static_features": self._build_static_features(),
+            "temb": torch.from_numpy(
+                build_fuxi_time_embeddings(anchor_time, total_steps=1, freq_hours=self.config.lead_time_hours)[0, 0]
+            ),
         }
+        if self.config.include_sample_metadata:
+            sample.update(
+                {
+                    "input_times": [str(pd.Timestamp(time_values[i])) for i in input_indices],
+                    "anchor_time": str(anchor_time),
+                    "target_times": [str(pd.Timestamp(time_values[i])) for i in target_indices],
+                }
+            )
+        return sample
+
+    def __len__(self) -> int:
+        return int(self._build_valid_anchor_indices().shape[0])
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        anchor_index = int(self._build_valid_anchor_indices()[index])
+        return self._build_sample(anchor_index)
 
     def source_summary(self) -> dict[str, Any]:
+        from ..models.fuxi_lower_res import FuXiLowerResConfig
+
         report = inspect_arco_era5_dataset(self.config.dataset_url)
         model_config = FuXiLowerResConfig.from_yaml(self.config.config_path)
         return {
@@ -523,12 +1236,63 @@ class ArcoEra5FuXiDataset(Dataset[dict[str, Any]]):
             "static_variables": list(self.config.static_variables),
             "orography_source": self.config.orography_source,
             "latitude_descending": self.config.latitude_descending,
+            "include_sample_metadata": self.config.include_sample_metadata,
             "model_input_size": list(model_config.input_size),
             "model_time_steps": model_config.time_steps,
             "model_dynamic_channels": model_config.in_chans,
             "model_static_channels": model_config.aux_chans,
             "model_forecast_steps": model_config.forecast_steps,
         }
+
+
+class ContiguousDistributedSampler(Sampler[int]):
+    """Distributed sampler that keeps each rank on a contiguous region of the time axis."""
+
+    def __init__(
+        self,
+        dataset: Dataset[Any],
+        *,
+        num_replicas: int,
+        rank: int,
+        drop_last: bool = False,
+    ) -> None:
+        if num_replicas <= 0:
+            raise ValueError(f"num_replicas must be positive, got {num_replicas}")
+        if rank < 0 or rank >= num_replicas:
+            raise ValueError(f"rank must be in [0, {num_replicas}), got {rank}")
+
+        self.dataset = dataset
+        self.num_replicas = int(num_replicas)
+        self.rank = int(rank)
+        self.drop_last = bool(drop_last)
+        dataset_length = len(dataset)
+        if self.drop_last:
+            self.num_samples = dataset_length // self.num_replicas
+        else:
+            self.num_samples = int(math.ceil(dataset_length / self.num_replicas))
+        self.total_size = self.num_samples * self.num_replicas
+        self.epoch = 0
+
+    def __iter__(self):
+        dataset_length = len(self.dataset)
+        if dataset_length == 0 or self.num_samples == 0:
+            return iter(())
+
+        indices = list(range(dataset_length))
+        if self.drop_last:
+            indices = indices[: self.total_size]
+        else:
+            indices.extend([indices[-1]] * (self.total_size - dataset_length))
+
+        start_index = self.rank * self.num_samples
+        end_index = start_index + self.num_samples
+        return iter(indices[start_index:end_index])
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
 
 
 def build_arco_era5_dataloader(
@@ -539,31 +1303,64 @@ def build_arco_era5_dataloader(
     num_workers: int = 0,
     drop_last: bool = False,
     pin_memory: bool = False,
+    sampler: Sampler[Any] | None = None,
+    persistent_workers: bool | None = None,
+    prefetch_factor: int | None = 2,
 ) -> DataLoader[dict[str, Any]]:
+    resolved_num_workers = num_workers
+    # With overlapping sequential windows, multiple workers receive strided index batches and
+    # break temporal locality. One persistent worker per rank preserves overlap reuse.
+    if not shuffle and num_workers > 1:
+        resolved_num_workers = 1
+
+    loader_kwargs: dict[str, Any] = {}
+    if resolved_num_workers > 0:
+        loader_kwargs["persistent_workers"] = (
+            bool(persistent_workers) if persistent_workers is not None else True
+        )
+        if prefetch_factor is not None:
+            loader_kwargs["prefetch_factor"] = int(prefetch_factor)
+
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
+        shuffle=shuffle if sampler is None else False,
+        num_workers=resolved_num_workers,
         drop_last=drop_last,
         pin_memory=pin_memory,
+        sampler=sampler,
+        **loader_kwargs,
     )
 
 
 __all__ = [
     "ArcoEra5CompatibilityReport",
+    "ArcoEra5DownloadPlan",
+    "ArcoEra5DownloadWindow",
+    "ContiguousDistributedSampler",
     "ArcoEra5FuXiDataConfig",
     "ArcoEra5FuXiDataset",
     "DEFAULT_ARCO_ERA5_URL",
     "FUXI_PRESSURE_LEVELS",
+    "FUXI_STATIC_SOURCE_VARIABLES",
     "FUXI_STATIC_VARIABLES",
     "FUXI_SURFACE_VARIABLES",
     "FUXI_UPPER_AIR_VARIABLES",
     "arco_metadata_url",
+    "build_arco_era5_download_plan",
     "build_arco_era5_dataloader",
+    "build_fuxi_derived_static_maps",
+    "build_fuxi_static_maps",
     "build_fuxi_channel_names",
+    "download_arco_era5_subset",
     "fetch_arco_zarr_metadata",
     "inspect_arco_era5_dataset",
+    "inspect_local_zarr_time_axes",
     "list_arco_dataset_variables",
+    "load_arco_static_source_maps",
+    "open_arco_era5_dataset",
+    "prepare_arco_spatial_dataarray",
+    "repair_local_zarr_time_consistency",
+    "resolve_arco_era5_download_window",
     "specific_humidity_to_relative_humidity",
 ]

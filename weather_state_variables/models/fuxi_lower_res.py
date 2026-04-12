@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import inspect
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -15,7 +16,10 @@ from ..config import (
     resolve_repo_path,
     resolve_torch_dtype,
 )
-from .fuxi_short import DEFAULT_MODEL_PATH, summarize_short_onnx_architecture
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_MODEL_PATH = REPO_ROOT / "assets" / "fuxi_teacher" / "short.onnx"
 
 
 def _to_2tuple(value: int | Sequence[int]) -> tuple[int, int]:
@@ -31,6 +35,18 @@ def _resolve_group_count(channels: int, requested_groups: int) -> int:
     while channels % groups != 0:
         groups -= 1
     return max(groups, 1)
+
+
+def _safe_source_recipe(model_path: Path) -> dict[str, Any] | None:
+    try:
+        from .fuxi_short import summarize_short_onnx_architecture
+    except ImportError:
+        return None
+
+    try:
+        return summarize_short_onnx_architecture(model_path)
+    except Exception:
+        return None
 
 
 class GeluGatedMlp(nn.Module):
@@ -71,7 +87,7 @@ class FuXiSwinV2Block(SwinTransformerV2Block):
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
-        super().__init__(
+        super_kwargs = dict(
             dim=dim,
             input_resolution=input_resolution,
             num_heads=num_heads,
@@ -86,9 +102,17 @@ class FuXiSwinV2Block(SwinTransformerV2Block):
             act_layer="gelu",
             norm_layer=nn.LayerNorm,
             pretrained_window_size=0,
-            device=device,
-            dtype=dtype,
         )
+        signature = inspect.signature(SwinTransformerV2Block.__init__)
+        if "device" in signature.parameters:
+            super_kwargs["device"] = device
+        if "dtype" in signature.parameters:
+            super_kwargs["dtype"] = dtype
+        super().__init__(**super_kwargs)
+        if ("device" not in signature.parameters or "dtype" not in signature.parameters) and (
+            device is not None or dtype is not None
+        ):
+            self.to(device=device, dtype=dtype)
         self.mlp = GeluGatedMlp(
             in_features=dim,
             hidden_features=mlp_hidden_dim,
@@ -229,7 +253,7 @@ class FuXiTransformerStage(nn.Module):
 
 @dataclass(frozen=True)
 class FuXiLowerResConfig:
-    """Config-driven lower-resolution forecast model with a midpoint Z_high bottleneck."""
+    """Config-driven lower-resolution forecast model with second-block shared features."""
 
     input_size: tuple[int, int] = (181, 360)
     time_steps: int = 2
@@ -245,7 +269,6 @@ class FuXiLowerResConfig:
     depths: tuple[int, int, int, int] = (12, 12, 12, 12)
     num_groups: int = 32
     mlp_hidden_dim: int = 4096
-    d_high: int = 128
     source_model_path: Path = DEFAULT_MODEL_PATH
     config_path: Path = DEFAULT_MODEL_CONFIG_PATH
     device: str | torch.device | None = "meta"
@@ -254,8 +277,6 @@ class FuXiLowerResConfig:
     def __post_init__(self) -> None:
         if len(self.depths) != 4:
             raise ValueError(f"Expected 4 transformer stages, got {len(self.depths)}")
-        if self.d_high <= 0:
-            raise ValueError(f"d_high must be positive, got {self.d_high}")
         if self.forecast_steps <= 0:
             raise ValueError(f"forecast_steps must be positive, got {self.forecast_steps}")
 
@@ -269,24 +290,33 @@ class FuXiLowerResConfig:
             data.get("source_model_path", str(DEFAULT_MODEL_PATH)),
             config_path=resolved_config_path,
         )
-        recipe = summarize_short_onnx_architecture(source_model_path)
+        recipe = _safe_source_recipe(source_model_path) or {}
 
         return cls(
             input_size=tuple(int(value) for value in data.get("input_size", [181, 360])),
-            time_steps=int(data.get("time_steps", recipe["time_steps"])),
-            in_chans=int(data.get("in_chans", recipe["in_chans"])),
-            aux_chans=int(data.get("aux_chans", recipe["aux_chans"])),
-            out_chans=int(data.get("out_chans", recipe["out_chans"])),
+            time_steps=int(data.get("time_steps", recipe.get("time_steps", cls.time_steps))),
+            in_chans=int(data.get("in_chans", recipe.get("in_chans", cls.in_chans))),
+            aux_chans=int(data.get("aux_chans", recipe.get("aux_chans", cls.aux_chans))),
+            out_chans=int(data.get("out_chans", recipe.get("out_chans", cls.out_chans))),
             forecast_steps=int(data.get("forecast_steps", 2)),
-            temb_dim=int(data.get("temb_dim", recipe["temb_dim"])),
-            patch_size=tuple(int(value) for value in data.get("patch_size", recipe["patch_size"])),
-            embed_dim=int(data.get("embed_dim", recipe["embed_dim"])),
-            num_heads=int(data.get("num_heads", recipe["num_heads"])),
-            window_size=int(data.get("window_size", recipe["window_size"][0])),
-            depths=tuple(int(value) for value in data.get("depths", recipe["depths"])),
+            temb_dim=int(data.get("temb_dim", recipe.get("temb_dim", cls.temb_dim))),
+            patch_size=tuple(
+                int(value)
+                for value in data.get("patch_size", recipe.get("patch_size", cls.patch_size))
+            ),
+            embed_dim=int(data.get("embed_dim", recipe.get("embed_dim", cls.embed_dim))),
+            num_heads=int(data.get("num_heads", recipe.get("num_heads", cls.num_heads))),
+            window_size=int(
+                data.get(
+                    "window_size",
+                    recipe.get("window_size", (cls.window_size, cls.window_size))[0],
+                )
+            ),
+            depths=tuple(int(value) for value in data.get("depths", recipe.get("depths", cls.depths))),
             num_groups=int(data.get("num_groups", 32)),
-            mlp_hidden_dim=int(data.get("mlp_hidden_dim", recipe["mlp_hidden_dim"])),
-            d_high=int(data["d_high"]),
+            mlp_hidden_dim=int(
+                data.get("mlp_hidden_dim", recipe.get("mlp_hidden_dim", cls.mlp_hidden_dim))
+            ),
             source_model_path=source_model_path,
             config_path=resolved_config_path,
             device=data.get("device", "meta"),
@@ -315,7 +345,7 @@ class FuXiLowerResConfig:
 
 @dataclass(frozen=True)
 class FuXiEncoderOutput:
-    z_high: Tensor
+    second_block_features: Tensor
     temb_emb: Tensor
     skip: Tensor
     output_size: tuple[int, int]
@@ -371,8 +401,6 @@ class FuXiLowerResEncoder(nn.Module):
                 for depth in self.config.depths[:2]
             ]
         )
-        self.first_pair_fusion = nn.Linear(self.config.embed_dim * 2, self.config.embed_dim, **dd)
-        self.z_high_proj = nn.Conv2d(self.config.embed_dim, self.config.d_high, kernel_size=1, **dd)
         self.register_buffer(
             "default_static_features",
             torch.zeros(1, self.config.aux_chans, *self.config.input_size, **dd),
@@ -484,24 +512,23 @@ class FuXiLowerResEncoder(nn.Module):
         h = h.permute(0, 2, 3, 1)
         s0 = self.first_pair_layers[0](h)
         s1 = self.first_pair_layers[1](s0)
-        f01 = self.first_pair_fusion(torch.cat([s0, s1], dim=-1))
-        z_high = self.z_high_proj(f01.permute(0, 3, 1, 2))
         return FuXiEncoderOutput(
-            z_high=z_high,
+            second_block_features=s1.permute(0, 3, 1, 2),
             temb_emb=temb_emb,
             skip=skip,
             output_size=original_size,
         )
 
     def summary(self) -> dict[str, Any]:
-        recipe = summarize_short_onnx_architecture(self.config.source_model_path)
+        recipe = _safe_source_recipe(self.config.source_model_path) or {}
         return {
             "role": "encoder",
             "config_path": str(self.config.config_path),
             "source_model_path": str(self.config.source_model_path),
-            "source_window_size": recipe["window_size"],
-            "source_depths": recipe["depths"],
-            "source_num_heads": recipe["num_heads"],
+            "source_recipe_available": bool(recipe),
+            "source_window_size": recipe.get("window_size"),
+            "source_depths": recipe.get("depths"),
+            "source_num_heads": recipe.get("num_heads"),
             "input_size": list(self.config.input_size),
             "resized_input_size": list(self.config.resized_input_size),
             "patch_grid": list(self.config.patch_grid),
@@ -514,9 +541,8 @@ class FuXiLowerResEncoder(nn.Module):
             "window_size": self.config.window_size,
             "depths": list(self.config.depths[:2]),
             "mlp_hidden_dim": self.config.mlp_hidden_dim,
-            "pair_fusion_in_dim": self.config.embed_dim * 2,
-            "d_high": self.config.d_high,
-            "z_high_shape": [self.config.d_high, *self.config.latent_grid],
+            "shared_feature_name": "second_block_features",
+            "second_block_feature_shape": [self.config.embed_dim, *self.config.latent_grid],
             "parameter_device": str(self.patch_embed.proj.weight.device),
             "parameter_dtype": str(self.patch_embed.proj.weight.dtype),
         }
@@ -529,7 +555,6 @@ class FuXiLowerResDecoder(nn.Module):
         super().__init__()
         self.config = config or FuXiLowerResConfig.from_yaml()
         dd = {"device": self.config.device, "dtype": self.config.dtype}
-        self.z_high_expand = nn.Conv2d(self.config.d_high, self.config.embed_dim, kernel_size=1, **dd)
         self.second_pair_layers = nn.ModuleList(
             [
                 FuXiTransformerStage(
@@ -568,7 +593,7 @@ class FuXiLowerResDecoder(nn.Module):
         )
 
     def _model_dtype(self) -> torch.dtype:
-        return self.z_high_expand.weight.dtype
+        return self.head.weight.dtype
 
     def _resize_future_maps(self, x: Tensor, size: tuple[int, int]) -> Tensor:
         batch, steps, channels, height, width = x.shape
@@ -582,7 +607,7 @@ class FuXiLowerResDecoder(nn.Module):
         return x.to(dtype=self._model_dtype())
 
     def forward(self, encoded: FuXiEncoderOutput) -> Tensor:
-        h = self.z_high_expand(encoded.z_high).permute(0, 2, 3, 1)
+        h = encoded.second_block_features.permute(0, 2, 3, 1)
         s2 = self.second_pair_layers[0](h)
         s3 = self.second_pair_layers[1](s2)
         f23 = self.second_pair_fusion(torch.cat([s2, s3], dim=-1))
@@ -616,14 +641,15 @@ class FuXiLowerResDecoder(nn.Module):
         return self._resize_future_maps(h, encoded.output_size)
 
     def summary(self) -> dict[str, Any]:
-        recipe = summarize_short_onnx_architecture(self.config.source_model_path)
+        recipe = _safe_source_recipe(self.config.source_model_path) or {}
         return {
             "role": "decoder",
             "config_path": str(self.config.config_path),
             "source_model_path": str(self.config.source_model_path),
-            "source_window_size": recipe["window_size"],
-            "source_depths": recipe["depths"],
-            "source_num_heads": recipe["num_heads"],
+            "source_recipe_available": bool(recipe),
+            "source_window_size": recipe.get("window_size"),
+            "source_depths": recipe.get("depths"),
+            "source_num_heads": recipe.get("num_heads"),
             "latent_grid": list(self.config.latent_grid),
             "embed_dim": self.config.embed_dim,
             "num_heads": self.config.num_heads,
@@ -631,7 +657,7 @@ class FuXiLowerResDecoder(nn.Module):
             "depths": list(self.config.depths[2:]),
             "mlp_hidden_dim": self.config.mlp_hidden_dim,
             "pair_fusion_in_dim": self.config.embed_dim * 2,
-            "d_high": self.config.d_high,
+            "decoder_input_name": "second_block_features",
             "forecast_steps": self.config.forecast_steps,
             "head_out_dim": (
                 self.config.forecast_steps
@@ -639,8 +665,8 @@ class FuXiLowerResDecoder(nn.Module):
                 * self.config.patch_size[0]
                 * self.config.patch_size[1]
             ),
-            "parameter_device": str(self.z_high_expand.weight.device),
-            "parameter_dtype": str(self.z_high_expand.weight.dtype),
+            "parameter_device": str(self.head.weight.device),
+            "parameter_dtype": str(self.head.weight.dtype),
         }
 
 
@@ -671,19 +697,28 @@ class FuXiLowerRes(nn.Module):
     def predict_next(self, x: Tensor, temb: Tensor, static_features: Tensor | None = None) -> Tensor:
         return self.predict_future(x, temb, static_features=static_features)[:, 0]
 
-    def forward(self, x: Tensor, temb: Tensor, static_features: Tensor | None = None) -> dict[str, Tensor]:
+    def forward(
+        self,
+        x: Tensor,
+        temb: Tensor,
+        static_features: Tensor | None = None,
+    ) -> dict[str, Tensor]:
         encoded = self.encode(x, temb, static_features=static_features)
         forecast = self.decode(encoded)
-        return {"forecast": forecast, "z_high": encoded.z_high}
+        return {
+            "forecast": forecast,
+            "second_block_features": encoded.second_block_features,
+        }
 
     def summary(self) -> dict[str, Any]:
-        recipe = summarize_short_onnx_architecture(self.config.source_model_path)
+        recipe = _safe_source_recipe(self.config.source_model_path) or {}
         return {
             "config_path": str(self.config.config_path),
             "source_model_path": str(self.config.source_model_path),
-            "source_window_size": recipe["window_size"],
-            "source_depths": recipe["depths"],
-            "source_num_heads": recipe["num_heads"],
+            "source_recipe_available": bool(recipe),
+            "source_window_size": recipe.get("window_size"),
+            "source_depths": recipe.get("depths"),
+            "source_num_heads": recipe.get("num_heads"),
             "input_size": list(self.config.input_size),
             "resized_input_size": list(self.config.resized_input_size),
             "patch_grid": list(self.config.patch_grid),
@@ -698,9 +733,8 @@ class FuXiLowerRes(nn.Module):
             "window_size": self.config.window_size,
             "depths": list(self.config.depths),
             "mlp_hidden_dim": self.config.mlp_hidden_dim,
-            "pair_fusion_in_dim": self.config.embed_dim * 2,
-            "d_high": self.config.d_high,
-            "z_high_shape": [self.config.d_high, *self.config.latent_grid],
+            "shared_feature_name": "second_block_features",
+            "second_block_feature_shape": [self.config.embed_dim, *self.config.latent_grid],
             "head_out_dim": (
                 self.config.forecast_steps
                 * self.config.out_chans

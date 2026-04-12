@@ -17,9 +17,9 @@ def _to_int_tuple(values: Sequence[int]) -> tuple[int, ...]:
 
 @dataclass(frozen=True)
 class FuXiIntrinsicConfig:
-    """Config-driven intrinsic latent branch over Z_high."""
+    """Config-driven intrinsic latent branch over second-block shared features."""
 
-    d_high: int = 128
+    feature_channels: int = 128
     spatial_size: tuple[int, int] = (23, 45)
     d_intrinsic: int = 16
     hidden_dims: tuple[int, int] = (2048, 512)
@@ -29,8 +29,8 @@ class FuXiIntrinsicConfig:
     dtype: torch.dtype | None = torch.float16
 
     def __post_init__(self) -> None:
-        if self.d_high <= 0:
-            raise ValueError(f"d_high must be positive, got {self.d_high}")
+        if self.feature_channels <= 0:
+            raise ValueError(f"feature_channels must be positive, got {self.feature_channels}")
         if self.d_intrinsic <= 0:
             raise ValueError(f"d_intrinsic must be positive, got {self.d_intrinsic}")
         if len(self.spatial_size) != 2:
@@ -47,7 +47,12 @@ class FuXiIntrinsicConfig:
         forecast_config = FuXiLowerResConfig.from_yaml(resolved_config_path)
 
         return cls(
-            d_high=int(intrinsic_data.get("d_high", forecast_config.d_high)),
+            feature_channels=int(
+                intrinsic_data.get(
+                    "feature_channels",
+                    intrinsic_data.get("d_high", forecast_config.embed_dim),
+                )
+            ),
             spatial_size=_to_int_tuple(
                 intrinsic_data.get("spatial_size", list(forecast_config.latent_grid))
             ),
@@ -63,7 +68,7 @@ class FuXiIntrinsicConfig:
 
     @property
     def flat_dim(self) -> int:
-        return self.d_high * self.spatial_size[0] * self.spatial_size[1]
+        return self.feature_channels * self.spatial_size[0] * self.spatial_size[1]
 
 
 def _build_mlp(
@@ -86,7 +91,7 @@ def _build_mlp(
 
 
 class FuXiIntrinsic(nn.Module):
-    """Separate intrinsic latent branch that maps Z_high to Z_intrinsic and back."""
+    """Separate intrinsic latent branch that maps second-block features to Z_intrinsic and back."""
 
     def __init__(self, config: FuXiIntrinsicConfig | None = None) -> None:
         super().__init__()
@@ -100,31 +105,34 @@ class FuXiIntrinsic(nn.Module):
         self.encoder = _build_mlp(encoder_dims, final_activation=final_activation, **dd)
         self.decoder = _build_mlp(decoder_dims, **dd)
 
-    def _validate_z_high(self, z_high: Tensor) -> None:
-        expected_shape = (self.config.d_high, *self.config.spatial_size)
-        if z_high.ndim != 4 or tuple(z_high.shape[1:]) != expected_shape:
+    def _validate_second_block_features(self, second_block_features: Tensor) -> None:
+        expected_shape = (self.config.feature_channels, *self.config.spatial_size)
+        if second_block_features.ndim != 4 or tuple(second_block_features.shape[1:]) != expected_shape:
             raise ValueError(
-                "Expected z_high shaped "
-                f"[B, {self.config.d_high}, {self.config.spatial_size[0]}, {self.config.spatial_size[1]}], "
-                f"got {tuple(z_high.shape)}"
+                "Expected second_block_features shaped "
+                f"[B, {self.config.feature_channels}, {self.config.spatial_size[0]}, {self.config.spatial_size[1]}], "
+                f"got {tuple(second_block_features.shape)}"
             )
 
-    def forward(self, z_high: Tensor) -> dict[str, Tensor]:
-        self._validate_z_high(z_high)
-        batch_size = z_high.shape[0]
-        flat = z_high.reshape(batch_size, -1)
+    def forward(self, second_block_features: Tensor) -> dict[str, Tensor]:
+        self._validate_second_block_features(second_block_features)
+        batch_size = second_block_features.shape[0]
+        flat = second_block_features.reshape(batch_size, -1)
         z_intrinsic = self.encoder(flat)
-        z_high_recon = self.decoder(z_intrinsic).reshape(
+        second_block_features_recon = self.decoder(z_intrinsic).reshape(
             batch_size,
-            self.config.d_high,
+            self.config.feature_channels,
             *self.config.spatial_size,
         )
-        return {"z_intrinsic": z_intrinsic, "z_high_recon": z_high_recon}
+        return {
+            "z_intrinsic": z_intrinsic,
+            "second_block_features_recon": second_block_features_recon,
+        }
 
     def summary(self) -> dict[str, Any]:
         return {
             "config_path": str(self.config.config_path),
-            "d_high": self.config.d_high,
+            "feature_channels": self.config.feature_channels,
             "spatial_size": list(self.config.spatial_size),
             "flat_dim": self.config.flat_dim,
             "d_intrinsic": self.config.d_intrinsic,

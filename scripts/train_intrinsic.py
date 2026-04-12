@@ -12,7 +12,9 @@ from weather_state_variables.training import train_intrinsic_model
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train the intrinsic latent model on frozen Z_high features.")
+    parser = argparse.ArgumentParser(
+        description="Train the intrinsic latent model on frozen second-block shared features."
+    )
     parser.add_argument(
         "--config",
         default="configs/model_config.yaml",

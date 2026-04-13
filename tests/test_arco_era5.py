@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -34,6 +35,7 @@ class TestArcoEra5Helpers(unittest.TestCase):
         self.assertEqual(config.pressure_levels[-1], 1000)
         self.assertEqual(config.static_variables[0], "land_sea_mask")
         self.assertFalse(config.include_sample_metadata)
+        self.assertGreaterEqual(config.dynamic_ram_cache_time_steps, 0)
 
     def test_build_fuxi_channel_names_matches_expected_layout(self) -> None:
         channel_names = build_fuxi_channel_names()
@@ -42,6 +44,18 @@ class TestArcoEra5Helpers(unittest.TestCase):
         self.assertEqual(channel_names[:5], ["Z50", "Z100", "Z150", "Z200", "Z250"])
         self.assertEqual(channel_names[13:16], ["T50", "T100", "T150"])
         self.assertEqual(channel_names[-5:], ["T2M", "U10", "V10", "MSL", "TP"])
+
+    def test_large_dynamic_cache_request_is_bounded_to_a_rolling_window(self) -> None:
+        config = ArcoEra5FuXiDataConfig(dynamic_ram_cache_time_steps=1024)
+        dataset = ArcoEra5FuXiDataset(config)
+        dataset._dataset_step_hours = 1
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            resolved_steps = dataset._resolved_dynamic_chunk_time_steps()
+
+        self.assertEqual(resolved_steps, 64)
+        self.assertTrue(any("caps the active RAM window" in str(item.message) for item in caught))
 
     def test_specific_humidity_can_be_converted_to_relative_humidity(self) -> None:
         level = xr.DataArray(np.array([850, 1000], dtype=np.int64), dims=("level",))

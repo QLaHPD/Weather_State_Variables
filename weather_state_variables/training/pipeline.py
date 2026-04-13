@@ -224,11 +224,16 @@ def _build_main_forecast_criterion(
     )
 
 
-def _move_batch_to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
+def _move_batch_to_device(
+    batch: dict[str, Any],
+    device: torch.device,
+    *,
+    non_blocking: bool = False,
+) -> dict[str, Any]:
     moved: dict[str, Any] = {}
     for key, value in batch.items():
         if isinstance(value, Tensor):
-            moved[key] = value.to(device)
+            moved[key] = value.to(device, non_blocking=non_blocking)
         else:
             moved[key] = value
     return moved
@@ -824,6 +829,54 @@ def _iter_limited(loader: Iterable[dict[str, Any]], max_batches: int | None) -> 
         yield batch_index, batch
 
 
+def _record_batch_stream(batch: dict[str, Any], stream: torch.cuda.Stream) -> None:
+    for value in batch.values():
+        if isinstance(value, Tensor):
+            value.record_stream(stream)
+
+
+def _iter_prefetched_batches(
+    loader: DataLoader[dict[str, Any]],
+    *,
+    runtime: DistributedRuntime,
+    max_batches: int | None,
+) -> Iterable[tuple[int, dict[str, Any]]]:
+    if runtime.device.type != "cuda":
+        yield from _iter_limited(
+            (_move_batch_to_device(batch, runtime.device) for batch in loader),
+            max_batches,
+        )
+        return
+
+    iterator = iter(loader)
+    transfer_stream = torch.cuda.Stream(device=runtime.device)
+    next_batch: dict[str, Any] | None = None
+
+    def preload_next() -> None:
+        nonlocal next_batch
+        try:
+            cpu_batch = next(iterator)
+        except StopIteration:
+            next_batch = None
+            return
+
+        with torch.cuda.stream(transfer_stream):
+            next_batch = _move_batch_to_device(cpu_batch, runtime.device, non_blocking=True)
+
+    preload_next()
+    batch_index = 0
+    while next_batch is not None:
+        if max_batches is not None and batch_index >= max_batches:
+            break
+        current_stream = torch.cuda.current_stream(device=runtime.device)
+        current_stream.wait_stream(transfer_stream)
+        batch = next_batch
+        _record_batch_stream(batch, current_stream)
+        preload_next()
+        yield batch_index, batch
+        batch_index += 1
+
+
 def _accumulation_divisor(total_batches: int, batch_index: int, accumulation_steps: int) -> int:
     if total_batches <= 0:
         return accumulation_steps
@@ -924,8 +977,11 @@ def train_main_model(
             running_loss = 0.0
             train_steps = 0
 
-            for batch_index, batch in _iter_limited(train_loader, train_config.max_train_batches):
-                batch = _move_batch_to_device(batch, runtime.device)
+            for batch_index, batch in _iter_prefetched_batches(
+                train_loader,
+                runtime=runtime,
+                max_batches=train_config.max_train_batches,
+            ):
                 should_step = _should_optimizer_step(
                     total_train_batches,
                     batch_index,
@@ -991,8 +1047,11 @@ def train_main_model(
                 val_running_loss = 0.0
                 val_steps = 0
                 with torch.no_grad():
-                    for _batch_index, batch in _iter_limited(val_loader, train_config.max_val_batches):
-                        batch = _move_batch_to_device(batch, runtime.device)
+                    for _batch_index, batch in _iter_prefetched_batches(
+                        val_loader,
+                        runtime=runtime,
+                        max_batches=train_config.max_val_batches,
+                    ):
                         with _amp_autocast_context(train_config.use_amp, runtime.device, amp_dtype):
                             outputs = model(
                                 batch["x"],
@@ -1179,8 +1238,11 @@ def train_intrinsic_model(
             running_loss = 0.0
             train_steps = 0
 
-            for batch_index, batch in _iter_limited(train_loader, train_config.max_train_batches):
-                batch = _move_batch_to_device(batch, runtime.device)
+            for batch_index, batch in _iter_prefetched_batches(
+                train_loader,
+                runtime=runtime,
+                max_batches=train_config.max_train_batches,
+            ):
                 should_step = _should_optimizer_step(
                     total_train_batches,
                     batch_index,
@@ -1253,8 +1315,11 @@ def train_intrinsic_model(
                 val_running_loss = 0.0
                 val_steps = 0
                 with torch.no_grad():
-                    for _batch_index, batch in _iter_limited(val_loader, train_config.max_val_batches):
-                        batch = _move_batch_to_device(batch, runtime.device)
+                    for _batch_index, batch in _iter_prefetched_batches(
+                        val_loader,
+                        runtime=runtime,
+                        max_batches=train_config.max_val_batches,
+                    ):
                         encoded = encoder(batch["x"], batch["temb"], static_features=batch["static_features"])
                         second_block_features = (
                             encoded.second_block_features.detach()

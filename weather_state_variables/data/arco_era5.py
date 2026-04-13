@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import OrderedDict
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 import math
 from pathlib import Path
@@ -8,6 +8,7 @@ import json
 import shutil
 from typing import Any, Sequence
 from urllib.parse import urlparse
+import warnings
 
 import gcsfs
 import numpy as np
@@ -55,6 +56,7 @@ FUXI_STATIC_SOURCE_VARIABLES = ("land_sea_mask", "geopotential_at_surface")
 
 _STANDARD_GRAVITY = 9.80665
 _EPSILON = 0.622
+_MAX_DYNAMIC_RAM_CACHE_TIME_STEPS = 64
 
 
 def _to_int_tuple(values: Sequence[int]) -> tuple[int, ...]:
@@ -118,7 +120,7 @@ def open_arco_era5_dataset(
 ) -> xr.Dataset:
     local_path = _maybe_local_zarr_path(dataset_url)
     if local_path is not None:
-        return xr.open_zarr(local_path, consolidated=None)
+        return xr.open_zarr(local_path, consolidated=None, chunks=None)
 
     fs = gcsfs.GCSFileSystem(token=gcs_token)
     store = gcsfs.mapping.GCSMap(
@@ -126,7 +128,7 @@ def open_arco_era5_dataset(
         gcs=fs,
         check=False,
     )
-    return xr.open_zarr(store, consolidated=True)
+    return xr.open_zarr(store, consolidated=True, chunks=None)
 
 
 def describe_arco_era5_dataset_location(dataset_url: str | Path) -> str:
@@ -490,6 +492,7 @@ class ArcoEra5FuXiDataConfig:
     convert_geopotential_to_height: bool = True
     latitude_descending: bool = True
     include_sample_metadata: bool = False
+    dynamic_ram_cache_time_steps: int = 32
     gcs_token: str = "anon"
     start_time: pd.Timestamp | None = None
     end_time: pd.Timestamp | None = None
@@ -510,6 +513,11 @@ class ArcoEra5FuXiDataConfig:
             raise ValueError(f"forecast_steps must be positive, got {self.forecast_steps}")
         if self.sample_stride_hours <= 0:
             raise ValueError(f"sample_stride_hours must be positive, got {self.sample_stride_hours}")
+        if self.dynamic_ram_cache_time_steps < 0:
+            raise ValueError(
+                "dynamic_ram_cache_time_steps must be non-negative, "
+                f"got {self.dynamic_ram_cache_time_steps}"
+            )
 
     @classmethod
     def from_yaml(
@@ -534,6 +542,7 @@ class ArcoEra5FuXiDataConfig:
             convert_geopotential_to_height=bool(data.get("convert_geopotential_to_height", True)),
             latitude_descending=bool(data.get("latitude_descending", True)),
             include_sample_metadata=bool(data.get("include_sample_metadata", False)),
+            dynamic_ram_cache_time_steps=int(data.get("dynamic_ram_cache_time_steps", 32)),
             gcs_token=str(data.get("gcs_token", "anon")),
             start_time=_as_timestamp(data.get("start_time")),
             end_time=_as_timestamp(data.get("end_time")),
@@ -1000,8 +1009,20 @@ class ArcoEra5FuXiDataset(Dataset[dict[str, Any]]):
         self._static_features: torch.Tensor | None = None
         self._valid_anchor_indices: np.ndarray | None = None
         self._dataset_step_hours: int | None = None
-        self._dynamic_frame_cache: OrderedDict[int, np.ndarray] = OrderedDict()
-        self._dynamic_frame_cache_size: int | None = None
+        self._dynamic_chunk_array: np.ndarray | None = None
+        self._dynamic_chunk_start: int | None = None
+        self._dynamic_chunk_stop: int | None = None
+        self._dynamic_chunk_time_steps: int | None = None
+        self._dynamic_download_plan: ArcoEra5DownloadPlan | None = None
+        self._dynamic_chunk_prefetch_executor: ThreadPoolExecutor | None = None
+        self._next_dynamic_chunk_future: Future[tuple[int, int, np.ndarray]] | None = None
+        self._next_dynamic_chunk_bounds: tuple[int, int] | None = None
+        self._dynamic_chunk_size_warning_emitted = False
+
+    def __del__(self) -> None:
+        executor = self._dynamic_chunk_prefetch_executor
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     def _open_dataset(self) -> xr.Dataset:
         if self._dataset is None:
@@ -1075,51 +1096,218 @@ class ArcoEra5FuXiDataset(Dataset[dict[str, Any]]):
             ds["level"].sel(level=list(self.config.pressure_levels)),
         )
 
-    def _load_dynamic_tensor_uncached(self, time_indices: Sequence[int]) -> np.ndarray:
+    def _dynamic_time_span_steps(self) -> int:
+        dynamic_offsets = [self._step_count(hours) for hours in self.config.input_time_offsets_hours]
+        dynamic_offsets.extend(
+            self._step_count(self.config.lead_time_hours * step)
+            for step in range(1, self.config.forecast_steps + 1)
+        )
+        return max(1, max(dynamic_offsets) - min(dynamic_offsets) + 1)
+
+    def _resolved_dynamic_chunk_time_steps(self) -> int:
+        if self._dynamic_chunk_time_steps is None:
+            requested = max(
+                self._dynamic_time_span_steps(),
+                int(self.config.dynamic_ram_cache_time_steps),
+            )
+            self._dynamic_chunk_time_steps = min(requested, _MAX_DYNAMIC_RAM_CACHE_TIME_STEPS)
+            if requested > self._dynamic_chunk_time_steps and not self._dynamic_chunk_size_warning_emitted:
+                warnings.warn(
+                    "Requested dynamic_ram_cache_time_steps="
+                    f"{requested}, but the loader caps the active RAM window at "
+                    f"{self._dynamic_chunk_time_steps} time steps to avoid multi-GB stalls. "
+                    "Use the rolling cache rather than a huge monolithic window.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                self._dynamic_chunk_size_warning_emitted = True
+        return self._dynamic_chunk_time_steps
+
+    def _build_dynamic_download_plan(self) -> ArcoEra5DownloadPlan:
+        if self._dynamic_download_plan is None:
+            dataset = self._open_dataset()
+            self._dynamic_download_plan = build_arco_era5_download_plan(
+                tuple(dataset.data_vars),
+                self.config,
+                include_static_sources=False,
+            )
+        return self._dynamic_download_plan
+
+    def _materialize_dynamic_chunk(
+        self,
+        dataset: xr.Dataset,
+        plan: ArcoEra5DownloadPlan,
+        start_index: int,
+        stop_index: int,
+    ) -> np.ndarray:
+        level_selection = list(self.config.pressure_levels)
+
+        source_arrays: dict[str, xr.DataArray] = {}
+        for variable_name in plan.source_pressure_variables:
+            source_arrays[variable_name] = dataset[variable_name].isel(time=slice(start_index, stop_index)).sel(
+                level=level_selection
+            )
+        for variable_name in plan.source_surface_variables:
+            source_arrays[variable_name] = dataset[variable_name].isel(time=slice(start_index, stop_index))
+
+        source_chunk = xr.Dataset(source_arrays).load()
+
+        relative_humidity: xr.DataArray | None = None
+        if plan.derive_relative_humidity:
+            relative_humidity = specific_humidity_to_relative_humidity(
+                prepare_arco_spatial_dataarray(
+                    source_chunk["specific_humidity"],
+                    latitude_descending=self.config.latitude_descending,
+                ),
+                prepare_arco_spatial_dataarray(
+                    source_chunk["temperature"],
+                    latitude_descending=self.config.latitude_descending,
+                ),
+                source_chunk["temperature"]["level"],
+            )
+
         upper_air_groups: list[np.ndarray] = []
         for variable_name in self.config.upper_air_variables:
             if variable_name == "relative_humidity":
-                array = self._resolve_relative_humidity(time_indices)
+                if relative_humidity is not None:
+                    array = relative_humidity
+                else:
+                    array = prepare_arco_spatial_dataarray(
+                        source_chunk["relative_humidity"],
+                        latitude_descending=self.config.latitude_descending,
+                    )
             else:
-                array = self._select_pressure_variable(variable_name, time_indices)
-            values = array.load().values
-            upper_air_groups.append(values)
+                array = prepare_arco_spatial_dataarray(
+                    source_chunk[variable_name],
+                    latitude_descending=self.config.latitude_descending,
+                )
+            upper_air_groups.append(array.values)
 
         upper_air = np.concatenate(upper_air_groups, axis=1)
 
         surface_groups: list[np.ndarray] = []
         for variable_name in self.config.surface_variables:
-            array = self._select_surface_variable(variable_name, time_indices)
-            surface_groups.append(array.load().values[:, None, :, :])
+            array = prepare_arco_spatial_dataarray(
+                source_chunk[variable_name],
+                latitude_descending=self.config.latitude_descending,
+            )
+            surface_groups.append(array.values[:, None, :, :])
 
         surface = np.concatenate(surface_groups, axis=1)
-        return np.concatenate([upper_air, surface], axis=1).astype(np.float32)
+        return np.concatenate([upper_air, surface], axis=1).astype(np.float32, copy=False)
 
-    def _resolved_dynamic_frame_cache_size(self) -> int:
-        if self._dynamic_frame_cache_size is None:
-            dynamic_offsets = [self._step_count(hours) for hours in self.config.input_time_offsets_hours]
-            dynamic_offsets.extend(
-                self._step_count(self.config.lead_time_hours * step)
-                for step in range(1, self.config.forecast_steps + 1)
+    def _load_dynamic_chunk(self, start_index: int, stop_index: int) -> np.ndarray:
+        dataset = self._open_dataset()
+        plan = self._build_dynamic_download_plan()
+        return self._materialize_dynamic_chunk(dataset, plan, start_index, stop_index)
+
+    def _prefetch_dynamic_chunk(
+        self,
+        start_index: int,
+        stop_index: int,
+        plan: ArcoEra5DownloadPlan,
+    ) -> tuple[int, int, np.ndarray]:
+        dataset = open_arco_era5_dataset(
+            self.config.dataset_url,
+            gcs_token=self.config.gcs_token,
+        )
+        chunk = self._materialize_dynamic_chunk(dataset, plan, start_index, stop_index)
+        return start_index, stop_index, chunk
+
+    def _next_dynamic_chunk_start_stop(self) -> tuple[int, int] | None:
+        if self._dynamic_chunk_start is None or self._dynamic_chunk_stop is None:
+            return None
+
+        overlap_steps = self._dynamic_time_span_steps() - 1
+        total_time_steps = len(self._load_time_values())
+        next_start = max(0, self._dynamic_chunk_stop - overlap_steps)
+        if next_start >= total_time_steps or next_start <= self._dynamic_chunk_start:
+            return None
+
+        next_stop = min(
+            total_time_steps,
+            max(next_start + 1, next_start + self._resolved_dynamic_chunk_time_steps()),
+        )
+        if next_stop <= next_start:
+            return None
+        return next_start, next_stop
+
+    def _maybe_schedule_next_dynamic_chunk(self) -> None:
+        next_bounds = self._next_dynamic_chunk_start_stop()
+        if next_bounds is None:
+            return
+        if self._next_dynamic_chunk_bounds == next_bounds and self._next_dynamic_chunk_future is not None:
+            return
+        if self._next_dynamic_chunk_future is not None:
+            self._next_dynamic_chunk_future.cancel()
+
+        if self._dynamic_chunk_prefetch_executor is None:
+            self._dynamic_chunk_prefetch_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="era5-prefetch",
             )
-            self._dynamic_frame_cache_size = max(1, max(dynamic_offsets) - min(dynamic_offsets) + 1)
-        return self._dynamic_frame_cache_size
+        plan = self._build_dynamic_download_plan()
+        self._next_dynamic_chunk_bounds = next_bounds
+        self._next_dynamic_chunk_future = self._dynamic_chunk_prefetch_executor.submit(
+            self._prefetch_dynamic_chunk,
+            next_bounds[0],
+            next_bounds[1],
+            plan,
+        )
 
-    def _load_dynamic_frame(self, time_index: int) -> np.ndarray:
-        cached = self._dynamic_frame_cache.get(time_index)
-        if cached is not None:
-            self._dynamic_frame_cache.move_to_end(time_index)
-            return cached
+    def _try_swap_in_prefetched_dynamic_chunk(
+        self,
+        min_index: int,
+        max_index: int,
+    ) -> bool:
+        if self._next_dynamic_chunk_future is None or self._next_dynamic_chunk_bounds is None:
+            return False
 
-        frame = self._load_dynamic_tensor_uncached([time_index])[0]
-        self._dynamic_frame_cache[time_index] = frame
-        while len(self._dynamic_frame_cache) > self._resolved_dynamic_frame_cache_size():
-            self._dynamic_frame_cache.popitem(last=False)
-        return frame
+        next_start, next_stop = self._next_dynamic_chunk_bounds
+        if min_index < next_start or max_index >= next_stop:
+            return False
+
+        start_index, stop_index, chunk = self._next_dynamic_chunk_future.result()
+        self._dynamic_chunk_array = chunk
+        self._dynamic_chunk_start = start_index
+        self._dynamic_chunk_stop = stop_index
+        self._next_dynamic_chunk_future = None
+        self._next_dynamic_chunk_bounds = None
+        self._maybe_schedule_next_dynamic_chunk()
+        return True
+
+    def _ensure_dynamic_chunk(self, time_indices: Sequence[int]) -> None:
+        min_index = min(int(time_index) for time_index in time_indices)
+        max_index = max(int(time_index) for time_index in time_indices)
+        if (
+            self._dynamic_chunk_array is not None
+            and self._dynamic_chunk_start is not None
+            and self._dynamic_chunk_stop is not None
+            and min_index >= self._dynamic_chunk_start
+            and max_index < self._dynamic_chunk_stop
+        ):
+            self._maybe_schedule_next_dynamic_chunk()
+            return
+
+        if self._try_swap_in_prefetched_dynamic_chunk(min_index, max_index):
+            return
+
+        chunk_time_steps = self._resolved_dynamic_chunk_time_steps()
+        total_time_steps = len(self._load_time_values())
+        chunk_start = min_index
+        chunk_stop = min(total_time_steps, max(max_index + 1, chunk_start + chunk_time_steps))
+        self._dynamic_chunk_array = self._load_dynamic_chunk(chunk_start, chunk_stop)
+        self._dynamic_chunk_start = chunk_start
+        self._dynamic_chunk_stop = chunk_stop
+        self._maybe_schedule_next_dynamic_chunk()
 
     def _build_dynamic_tensor(self, time_indices: Sequence[int]) -> np.ndarray:
-        frames = [self._load_dynamic_frame(int(time_index)) for time_index in time_indices]
-        return np.stack(frames, axis=0).astype(np.float32, copy=False)
+        self._ensure_dynamic_chunk(time_indices)
+        if self._dynamic_chunk_array is None or self._dynamic_chunk_start is None:
+            raise RuntimeError("Dynamic RAM cache was not initialized before sample assembly.")
+
+        relative_indices = [int(time_index) - self._dynamic_chunk_start for time_index in time_indices]
+        return self._dynamic_chunk_array[relative_indices].astype(np.float32, copy=False)
 
     def _build_static_features(self) -> torch.Tensor:
         if self._static_features is not None:
@@ -1237,6 +1425,7 @@ class ArcoEra5FuXiDataset(Dataset[dict[str, Any]]):
             "orography_source": self.config.orography_source,
             "latitude_descending": self.config.latitude_descending,
             "include_sample_metadata": self.config.include_sample_metadata,
+            "dynamic_ram_cache_time_steps": self.config.dynamic_ram_cache_time_steps,
             "model_input_size": list(model_config.input_size),
             "model_time_steps": model_config.time_steps,
             "model_dynamic_channels": model_config.in_chans,
@@ -1308,9 +1497,17 @@ def build_arco_era5_dataloader(
     prefetch_factor: int | None = 2,
 ) -> DataLoader[dict[str, Any]]:
     resolved_num_workers = num_workers
-    # With overlapping sequential windows, multiple workers receive strided index batches and
-    # break temporal locality. One persistent worker per rank preserves overlap reuse.
-    if not shuffle and num_workers > 1:
+    ram_cached_sequential = (
+        not shuffle
+        and getattr(getattr(dataset, "config", None), "dynamic_ram_cache_time_steps", 0) > 0
+    )
+    # When sequential loading is backed by a large RAM cache, in-process fetches avoid copying
+    # very large batches from worker subprocesses back to the training rank.
+    if ram_cached_sequential:
+        resolved_num_workers = 0
+    # Without the RAM cache, overlapping sequential windows still should not be split across many
+    # workers because that breaks temporal locality and defeats overlap reuse.
+    elif not shuffle and num_workers > 1:
         resolved_num_workers = 1
 
     loader_kwargs: dict[str, Any] = {}

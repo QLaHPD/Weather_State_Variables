@@ -214,6 +214,41 @@ class ScaleShiftResBlock(nn.Module):
         return h + residual
 
 
+class ResBlock(nn.Module):
+    """Residual block without external conditioning."""
+
+    def __init__(
+        self,
+        *,
+        in_channels: int,
+        out_channels: int,
+        num_groups: int,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        dd = {"device": device, "dtype": dtype}
+        super().__init__()
+        in_groups = _resolve_group_count(in_channels, num_groups)
+        out_groups = _resolve_group_count(out_channels, num_groups)
+        self.norm1 = nn.GroupNorm(in_groups, in_channels, **dd)
+        self.act1 = nn.SiLU()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, **dd)
+        self.norm2 = nn.GroupNorm(out_groups, out_channels, **dd)
+        self.act2 = nn.SiLU()
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, **dd)
+
+        if in_channels == out_channels:
+            self.skip = nn.Identity()
+        else:
+            self.skip = nn.Conv2d(in_channels, out_channels, kernel_size=1, **dd)
+
+    def forward(self, x: Tensor) -> Tensor:
+        residual = self.skip(x)
+        h = self.conv1(self.act1(self.norm1(x)))
+        h = self.conv2(self.act2(self.norm2(h)))
+        return h + residual
+
+
 class FuXiTransformerStage(nn.Module):
     def __init__(
         self,
@@ -346,8 +381,6 @@ class FuXiLowerResConfig:
 @dataclass(frozen=True)
 class FuXiEncoderOutput:
     second_block_features: Tensor
-    temb_emb: Tensor
-    skip: Tensor
     output_size: tuple[int, int]
 
 
@@ -507,15 +540,12 @@ class FuXiLowerResEncoder(nn.Module):
         h = h.permute(0, 3, 1, 2)
         h = self.downsample(h)
         h = self.down_resblock(h, temb_emb)
-        skip = h
 
         h = h.permute(0, 2, 3, 1)
         s0 = self.first_pair_layers[0](h)
         s1 = self.first_pair_layers[1](s0)
         return FuXiEncoderOutput(
             second_block_features=s1.permute(0, 3, 1, 2),
-            temb_emb=temb_emb,
-            skip=skip,
             output_size=original_size,
         )
 
@@ -542,6 +572,8 @@ class FuXiLowerResEncoder(nn.Module):
             "depths": list(self.config.depths[:2]),
             "mlp_hidden_dim": self.config.mlp_hidden_dim,
             "shared_feature_name": "second_block_features",
+            "cross_boundary_skip": False,
+            "cross_boundary_time_conditioning": False,
             "second_block_feature_shape": [self.config.embed_dim, *self.config.latent_grid],
             "parameter_device": str(self.patch_embed.proj.weight.device),
             "parameter_dtype": str(self.patch_embed.proj.weight.dtype),
@@ -570,10 +602,9 @@ class FuXiLowerResDecoder(nn.Module):
             ]
         )
         self.second_pair_fusion = nn.Linear(self.config.embed_dim * 2, self.config.embed_dim, **dd)
-        self.up_resblock = ScaleShiftResBlock(
-            in_channels=self.config.embed_dim * 2,
+        self.up_resblock = ResBlock(
+            in_channels=self.config.embed_dim,
             out_channels=self.config.embed_dim,
-            temb_channels=self.config.embed_dim,
             num_groups=self.config.num_groups,
             **dd,
         )
@@ -613,8 +644,7 @@ class FuXiLowerResDecoder(nn.Module):
         f23 = self.second_pair_fusion(torch.cat([s2, s3], dim=-1))
 
         h = f23.permute(0, 3, 1, 2)
-        h = torch.cat([h, encoded.skip], dim=1)
-        h = self.up_resblock(h, encoded.temb_emb)
+        h = self.up_resblock(h)
         h = self.upsample(h)
 
         h = h.permute(0, 2, 3, 1)
@@ -658,6 +688,8 @@ class FuXiLowerResDecoder(nn.Module):
             "mlp_hidden_dim": self.config.mlp_hidden_dim,
             "pair_fusion_in_dim": self.config.embed_dim * 2,
             "decoder_input_name": "second_block_features",
+            "uses_encoder_skip": False,
+            "uses_encoder_time_embedding": False,
             "forecast_steps": self.config.forecast_steps,
             "head_out_dim": (
                 self.config.forecast_steps
@@ -734,6 +766,8 @@ class FuXiLowerRes(nn.Module):
             "depths": list(self.config.depths),
             "mlp_hidden_dim": self.config.mlp_hidden_dim,
             "shared_feature_name": "second_block_features",
+            "cross_boundary_skip": False,
+            "cross_boundary_time_conditioning": False,
             "second_block_feature_shape": [self.config.embed_dim, *self.config.latent_grid],
             "head_out_dim": (
                 self.config.forecast_steps

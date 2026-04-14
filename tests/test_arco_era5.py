@@ -1,11 +1,13 @@
 import json
 from pathlib import Path
 import tempfile
+import time
 import unittest
 import warnings
 
 import numpy as np
 import pandas as pd
+import torch
 import xarray as xr
 
 from weather_state_variables.data import (
@@ -36,6 +38,10 @@ class TestArcoEra5Helpers(unittest.TestCase):
         self.assertEqual(config.static_variables[0], "land_sea_mask")
         self.assertFalse(config.include_sample_metadata)
         self.assertGreaterEqual(config.dynamic_ram_cache_time_steps, 0)
+        self.assertGreater(config.dynamic_prefetch_block_time_steps, 0)
+        self.assertTrue(config.apply_normalization)
+        self.assertIsNotNone(config.normalization_stats_path)
+        self.assertGreater(config.normalization_fit_sample_count, 0)
 
     def test_build_fuxi_channel_names_matches_expected_layout(self) -> None:
         channel_names = build_fuxi_channel_names()
@@ -56,6 +62,17 @@ class TestArcoEra5Helpers(unittest.TestCase):
 
         self.assertEqual(resolved_steps, 64)
         self.assertTrue(any("caps the active RAM window" in str(item.message) for item in caught))
+
+    def test_prefetch_block_size_is_clamped_to_the_active_cache_window(self) -> None:
+        config = ArcoEra5FuXiDataConfig(
+            dynamic_ram_cache_time_steps=10,
+            dynamic_prefetch_block_time_steps=128,
+        )
+        dataset = ArcoEra5FuXiDataset(config)
+        dataset._dataset_step_hours = 1
+
+        self.assertEqual(dataset._resolved_dynamic_chunk_time_steps(), 10)
+        self.assertEqual(dataset._resolved_dynamic_prefetch_block_time_steps(), 10)
 
     def test_specific_humidity_can_be_converted_to_relative_humidity(self) -> None:
         level = xr.DataArray(np.array([850, 1000], dtype=np.int64), dims=("level",))
@@ -198,6 +215,199 @@ class TestArcoEra5Helpers(unittest.TestCase):
         self.assertEqual(sample["anchor_time"], "2018-01-01 01:00:00")
         self.assertEqual(sample["input_times"], ["2018-01-01 00:00:00", "2018-01-01 01:00:00"])
         self.assertEqual(sample["target_times"], ["2018-01-01 02:00:00", "2018-01-01 03:00:00"])
+
+    def test_dynamic_prefetch_ring_refills_and_advances_with_sequential_access(self) -> None:
+        times = pd.date_range("2018-01-01 00:00:00", periods=10, freq="h")
+        levels = np.array([50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000], dtype=np.int64)
+        latitude = np.array([-90.0, 90.0], dtype=np.float32)
+        longitude = np.array([0.0, 1.0], dtype=np.float32)
+
+        def pressure_field(offset: float) -> np.ndarray:
+            data = np.arange(times.size * levels.size * latitude.size * longitude.size, dtype=np.float32)
+            data = data.reshape(times.size, levels.size, latitude.size, longitude.size)
+            return data + offset
+
+        def surface_field(offset: float) -> np.ndarray:
+            data = np.arange(times.size * latitude.size * longitude.size, dtype=np.float32)
+            data = data.reshape(times.size, latitude.size, longitude.size)
+            return data + offset
+
+        source_ds = xr.Dataset(
+            data_vars={
+                "geopotential": (("time", "level", "latitude", "longitude"), pressure_field(0.0)),
+                "temperature": (("time", "level", "latitude", "longitude"), pressure_field(1000.0) + 273.15),
+                "u_component_of_wind": (("time", "level", "latitude", "longitude"), pressure_field(2000.0)),
+                "v_component_of_wind": (("time", "level", "latitude", "longitude"), pressure_field(3000.0)),
+                "relative_humidity": (
+                    ("time", "level", "latitude", "longitude"),
+                    np.full((times.size, levels.size, latitude.size, longitude.size), 50.0, dtype=np.float32),
+                ),
+                "2m_temperature": (("time", "latitude", "longitude"), surface_field(4000.0) + 273.15),
+                "10m_u_component_of_wind": (("time", "latitude", "longitude"), surface_field(5000.0)),
+                "10m_v_component_of_wind": (("time", "latitude", "longitude"), surface_field(6000.0)),
+                "mean_sea_level_pressure": (("time", "latitude", "longitude"), surface_field(7000.0)),
+                "total_precipitation": (("time", "latitude", "longitude"), surface_field(8000.0)),
+                "land_sea_mask": (("latitude", "longitude"), np.ones((latitude.size, longitude.size), dtype=np.float32)),
+                "geopotential_at_surface": (
+                    ("latitude", "longitude"),
+                    np.ones((latitude.size, longitude.size), dtype=np.float32) * 100.0,
+                ),
+            },
+            coords={
+                "time": times,
+                "level": levels,
+                "latitude": latitude,
+                "longitude": longitude,
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_path = Path(tmpdir) / "source.zarr"
+            source_ds.to_zarr(source_path, mode="w")
+
+            config = ArcoEra5FuXiDataConfig(
+                dataset_url=str(source_path),
+                dynamic_ram_cache_time_steps=6,
+                dynamic_prefetch_block_time_steps=2,
+                config_path=Path("configs/model_config.yaml"),
+            )
+            dataset = ArcoEra5FuXiDataset(config)
+            dataset._build_dynamic_tensor([0, 1, 2, 3])
+
+            with dataset._dynamic_prefetch_condition:
+                deadline = time.time() + 5.0
+                while (
+                    (dataset._dynamic_ring_stop is None or dataset._dynamic_ring_stop < 6)
+                    and time.time() < deadline
+                ):
+                    dataset._dynamic_prefetch_condition.wait(timeout=0.05)
+
+                self.assertEqual(dataset._dynamic_ring_start, 0)
+                self.assertIsNotNone(dataset._dynamic_ring_stop)
+                self.assertGreaterEqual(dataset._dynamic_ring_stop, 6)
+
+            dataset._build_dynamic_tensor([1, 2, 3, 4])
+
+            with dataset._dynamic_prefetch_condition:
+                deadline = time.time() + 5.0
+                while (
+                    (
+                        dataset._dynamic_ring_start is None
+                        or dataset._dynamic_ring_start > 1
+                        or dataset._dynamic_ring_stop is None
+                        or dataset._dynamic_ring_stop < 7
+                    )
+                    and time.time() < deadline
+                ):
+                    dataset._dynamic_prefetch_condition.wait(timeout=0.05)
+
+                self.assertEqual(dataset._dynamic_ring_start, 1)
+                self.assertIsNotNone(dataset._dynamic_ring_stop)
+                self.assertGreaterEqual(dataset._dynamic_ring_stop, 7)
+
+    def test_normalization_uses_log_precipitation_and_preserves_identity_static_channels(self) -> None:
+        times = pd.date_range("2018-01-01 00:00:00", periods=6, freq="h")
+        levels = np.array([50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000], dtype=np.int64)
+        latitude = np.array([-90.0, 90.0], dtype=np.float32)
+        longitude = np.array([0.0, 1.0], dtype=np.float32)
+
+        def pressure_field(offset: float) -> np.ndarray:
+            data = np.arange(times.size * levels.size * latitude.size * longitude.size, dtype=np.float32)
+            data = data.reshape(times.size, levels.size, latitude.size, longitude.size)
+            return data + offset
+
+        tp = np.array(
+            [
+                0.0,
+                0.001,
+                0.002,
+                0.005,
+                0.010,
+                0.020,
+            ],
+            dtype=np.float32,
+        )[:, None, None]
+        tp = np.broadcast_to(tp, (times.size, latitude.size, longitude.size)).copy()
+
+        source_ds = xr.Dataset(
+            data_vars={
+                "geopotential": (("time", "level", "latitude", "longitude"), pressure_field(0.0)),
+                "temperature": (("time", "level", "latitude", "longitude"), pressure_field(250.0) + 273.15),
+                "u_component_of_wind": (("time", "level", "latitude", "longitude"), pressure_field(-10.0)),
+                "v_component_of_wind": (("time", "level", "latitude", "longitude"), pressure_field(10.0)),
+                "relative_humidity": (
+                    ("time", "level", "latitude", "longitude"),
+                    np.full((times.size, levels.size, latitude.size, longitude.size), 55.0, dtype=np.float32),
+                ),
+                "2m_temperature": (
+                    ("time", "latitude", "longitude"),
+                    np.broadcast_to((np.arange(times.size, dtype=np.float32) + 280.0)[:, None, None], (times.size, latitude.size, longitude.size)).copy(),
+                ),
+                "10m_u_component_of_wind": (
+                    ("time", "latitude", "longitude"),
+                    np.broadcast_to((np.arange(times.size, dtype=np.float32) - 3.0)[:, None, None], (times.size, latitude.size, longitude.size)).copy(),
+                ),
+                "10m_v_component_of_wind": (
+                    ("time", "latitude", "longitude"),
+                    np.broadcast_to((np.arange(times.size, dtype=np.float32) + 3.0)[:, None, None], (times.size, latitude.size, longitude.size)).copy(),
+                ),
+                "mean_sea_level_pressure": (
+                    ("time", "latitude", "longitude"),
+                    np.broadcast_to((np.arange(times.size, dtype=np.float32) * 10.0 + 101325.0)[:, None, None], (times.size, latitude.size, longitude.size)).copy(),
+                ),
+                "total_precipitation": (("time", "latitude", "longitude"), tp),
+                "land_sea_mask": (
+                    ("latitude", "longitude"),
+                    np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float32),
+                ),
+                "geopotential_at_surface": (
+                    ("latitude", "longitude"),
+                    np.array([[100.0, 200.0], [300.0, 400.0]], dtype=np.float32),
+                ),
+            },
+            coords={
+                "time": times,
+                "level": levels,
+                "latitude": latitude,
+                "longitude": longitude,
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            source_path = tmp_path / "source.zarr"
+            stats_path = tmp_path / "normalization.json"
+            source_ds.to_zarr(source_path, mode="w")
+
+            config = ArcoEra5FuXiDataConfig(
+                dataset_url=str(source_path),
+                normalization_stats_path=stats_path,
+                normalization_fit_sample_count=2,
+                config_path=Path("configs/model_config.yaml"),
+            )
+            dataset = ArcoEra5FuXiDataset(config)
+            stats = dataset.ensure_normalization_stats()
+
+            self.assertTrue(stats_path.is_file())
+            self.assertEqual(stats.dynamic_transform_kinds[-1], "log1p_mm_zscore")
+            self.assertEqual(stats.static_transform_kinds[0], "identity")
+
+            raw_chunk = dataset._materialize_dynamic_chunk(
+                dataset._open_dataset(),
+                dataset._build_dynamic_download_plan(),
+                0,
+                1,
+            )
+            normalized_chunk = dataset._normalize_dynamic_chunk(raw_chunk.copy())
+            raw_tp = float(raw_chunk[0, -1, 0, 0])
+            expected_tp = (np.log1p(max(raw_tp, 0.0) * 1000.0) - stats.dynamic_mean[-1]) / stats.dynamic_std[-1]
+            self.assertAlmostEqual(float(normalized_chunk[0, -1, 0, 0]), expected_tp, places=5)
+            denormalized_chunk = dataset.denormalize_dynamic_tensor(torch.from_numpy(normalized_chunk)).numpy()
+            self.assertTrue(np.allclose(denormalized_chunk, raw_chunk, atol=1.0e-5))
+
+            raw_static = dataset._build_raw_static_stack()
+            normalized_static = dataset._normalize_static_stack(raw_static.copy())
+            self.assertTrue(np.allclose(normalized_static[0], raw_static[0]))
 
     def test_download_subset_can_resume_local_zarr(self) -> None:
         times = pd.date_range("2018-01-01 00:00:00", periods=4, freq="h")

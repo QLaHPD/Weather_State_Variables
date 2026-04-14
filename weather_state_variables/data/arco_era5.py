@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 import math
+import threading
 from pathlib import Path
 import json
 import shutil
@@ -23,7 +23,7 @@ try:
 except ImportError:  # pragma: no cover
     tqdm = None
 
-from ..config import DEFAULT_MODEL_CONFIG_PATH, load_config_section, load_yaml_config
+from ..config import DEFAULT_MODEL_CONFIG_PATH, load_config_section, load_yaml_config, resolve_repo_path
 
 
 DEFAULT_ARCO_ERA5_URL = (
@@ -57,6 +57,14 @@ FUXI_STATIC_SOURCE_VARIABLES = ("land_sea_mask", "geopotential_at_surface")
 _STANDARD_GRAVITY = 9.80665
 _EPSILON = 0.622
 _MAX_DYNAMIC_RAM_CACHE_TIME_STEPS = 64
+_DEFAULT_DYNAMIC_PREFETCH_BLOCK_TIME_STEPS = 8
+_DEFAULT_NORMALIZATION_STATS_PATH = Path("runs/cache/era5_fuxi_normalization.json")
+_DEFAULT_NORMALIZATION_FIT_SAMPLE_COUNT = 128
+_NORMALIZATION_STATS_VERSION = 1
+_MIN_NORMALIZATION_STD = 1.0e-6
+_DYNAMIC_ZSCORE_KIND = "zscore"
+_DYNAMIC_LOG1P_MM_ZSCORE_KIND = "log1p_mm_zscore"
+_IDENTITY_KIND = "identity"
 
 
 def _to_int_tuple(values: Sequence[int]) -> tuple[int, ...]:
@@ -71,6 +79,16 @@ def _as_timestamp(value: str | np.datetime64 | pd.Timestamp | None) -> pd.Timest
     if value is None:
         return None
     return pd.Timestamp(value)
+
+
+def _to_optional_resolved_path(
+    value: str | Path | None,
+    *,
+    config_path: str | Path,
+) -> Path | None:
+    if value in {None, ""}:
+        return None
+    return resolve_repo_path(value, config_path=config_path)
 
 
 def _maybe_local_zarr_path(dataset_url: str | Path) -> Path | None:
@@ -143,7 +161,10 @@ def _read_json_file(path: Path) -> dict[str, Any]:
 
 
 def _write_json_file(path: Path, payload: dict[str, Any]) -> None:
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(path.name + ".tmp")
+    temp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temp_path.replace(path)
 
 
 def inspect_local_zarr_time_axes(zarr_path: str | Path) -> list[dict[str, Any]]:
@@ -493,6 +514,11 @@ class ArcoEra5FuXiDataConfig:
     latitude_descending: bool = True
     include_sample_metadata: bool = False
     dynamic_ram_cache_time_steps: int = 32
+    dynamic_prefetch_block_time_steps: int = _DEFAULT_DYNAMIC_PREFETCH_BLOCK_TIME_STEPS
+    apply_normalization: bool = True
+    normalization_stats_path: Path | None = _DEFAULT_NORMALIZATION_STATS_PATH
+    normalization_force_recompute: bool = False
+    normalization_fit_sample_count: int = _DEFAULT_NORMALIZATION_FIT_SAMPLE_COUNT
     gcs_token: str = "anon"
     start_time: pd.Timestamp | None = None
     end_time: pd.Timestamp | None = None
@@ -517,6 +543,16 @@ class ArcoEra5FuXiDataConfig:
             raise ValueError(
                 "dynamic_ram_cache_time_steps must be non-negative, "
                 f"got {self.dynamic_ram_cache_time_steps}"
+            )
+        if self.dynamic_prefetch_block_time_steps <= 0:
+            raise ValueError(
+                "dynamic_prefetch_block_time_steps must be positive, "
+                f"got {self.dynamic_prefetch_block_time_steps}"
+            )
+        if self.apply_normalization and self.normalization_fit_sample_count <= 0:
+            raise ValueError(
+                "normalization_fit_sample_count must be positive when apply_normalization is true, "
+                f"got {self.normalization_fit_sample_count}"
             )
 
     @classmethod
@@ -543,6 +579,21 @@ class ArcoEra5FuXiDataConfig:
             latitude_descending=bool(data.get("latitude_descending", True)),
             include_sample_metadata=bool(data.get("include_sample_metadata", False)),
             dynamic_ram_cache_time_steps=int(data.get("dynamic_ram_cache_time_steps", 32)),
+            dynamic_prefetch_block_time_steps=int(
+                data.get(
+                    "dynamic_prefetch_block_time_steps",
+                    _DEFAULT_DYNAMIC_PREFETCH_BLOCK_TIME_STEPS,
+                )
+            ),
+            apply_normalization=bool(data.get("apply_normalization", True)),
+            normalization_stats_path=_to_optional_resolved_path(
+                data.get("normalization_stats_path", str(_DEFAULT_NORMALIZATION_STATS_PATH)),
+                config_path=resolved_config_path,
+            ),
+            normalization_force_recompute=bool(data.get("normalization_force_recompute", False)),
+            normalization_fit_sample_count=int(
+                data.get("normalization_fit_sample_count", _DEFAULT_NORMALIZATION_FIT_SAMPLE_COUNT)
+            ),
             gcs_token=str(data.get("gcs_token", "anon")),
             start_time=_as_timestamp(data.get("start_time")),
             end_time=_as_timestamp(data.get("end_time")),
@@ -590,6 +641,52 @@ class ArcoEra5DownloadWindow:
             "raw_start": None if self.raw_start is None else str(self.raw_start),
             "raw_end": None if self.raw_end is None else str(self.raw_end),
         }
+
+
+@dataclass(frozen=True)
+class ArcoEra5NormalizationStats:
+    version: int
+    dataset_url: str
+    dynamic_channel_names: tuple[str, ...]
+    dynamic_transform_kinds: tuple[str, ...]
+    dynamic_mean: tuple[float, ...]
+    dynamic_std: tuple[float, ...]
+    static_channel_names: tuple[str, ...]
+    static_transform_kinds: tuple[str, ...]
+    static_mean: tuple[float, ...]
+    static_std: tuple[float, ...]
+    fit_sample_count: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "version": int(self.version),
+            "dataset_url": self.dataset_url,
+            "dynamic_channel_names": list(self.dynamic_channel_names),
+            "dynamic_transform_kinds": list(self.dynamic_transform_kinds),
+            "dynamic_mean": list(self.dynamic_mean),
+            "dynamic_std": list(self.dynamic_std),
+            "static_channel_names": list(self.static_channel_names),
+            "static_transform_kinds": list(self.static_transform_kinds),
+            "static_mean": list(self.static_mean),
+            "static_std": list(self.static_std),
+            "fit_sample_count": int(self.fit_sample_count),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "ArcoEra5NormalizationStats":
+        return cls(
+            version=int(payload["version"]),
+            dataset_url=str(payload["dataset_url"]),
+            dynamic_channel_names=_to_str_tuple(payload["dynamic_channel_names"]),
+            dynamic_transform_kinds=_to_str_tuple(payload["dynamic_transform_kinds"]),
+            dynamic_mean=tuple(float(value) for value in payload["dynamic_mean"]),
+            dynamic_std=tuple(float(value) for value in payload["dynamic_std"]),
+            static_channel_names=_to_str_tuple(payload["static_channel_names"]),
+            static_transform_kinds=_to_str_tuple(payload["static_transform_kinds"]),
+            static_mean=tuple(float(value) for value in payload["static_mean"]),
+            static_std=tuple(float(value) for value in payload["static_std"]),
+            fit_sample_count=int(payload["fit_sample_count"]),
+        )
 
 
 def build_arco_era5_download_plan(
@@ -1009,20 +1106,30 @@ class ArcoEra5FuXiDataset(Dataset[dict[str, Any]]):
         self._static_features: torch.Tensor | None = None
         self._valid_anchor_indices: np.ndarray | None = None
         self._dataset_step_hours: int | None = None
-        self._dynamic_chunk_array: np.ndarray | None = None
-        self._dynamic_chunk_start: int | None = None
-        self._dynamic_chunk_stop: int | None = None
+        self._dynamic_ring_array: np.ndarray | None = None
+        self._dynamic_ring_start: int | None = None
+        self._dynamic_ring_stop: int | None = None
         self._dynamic_chunk_time_steps: int | None = None
         self._dynamic_download_plan: ArcoEra5DownloadPlan | None = None
-        self._dynamic_chunk_prefetch_executor: ThreadPoolExecutor | None = None
-        self._next_dynamic_chunk_future: Future[tuple[int, int, np.ndarray]] | None = None
-        self._next_dynamic_chunk_bounds: tuple[int, int] | None = None
         self._dynamic_chunk_size_warning_emitted = False
+        self._dynamic_prefetch_condition = threading.Condition()
+        self._dynamic_prefetch_thread: threading.Thread | None = None
+        self._dynamic_prefetch_target_stop: int | None = None
+        self._dynamic_prefetch_generation = 0
+        self._dynamic_prefetch_error: BaseException | None = None
+        self._dynamic_prefetch_shutdown = False
+        self._normalization_stats: ArcoEra5NormalizationStats | None = None
 
     def __del__(self) -> None:
-        executor = self._dynamic_chunk_prefetch_executor
-        if executor is not None:
-            executor.shutdown(wait=False, cancel_futures=True)
+        try:
+            with self._dynamic_prefetch_condition:
+                self._dynamic_prefetch_shutdown = True
+                self._dynamic_prefetch_condition.notify_all()
+            thread = self._dynamic_prefetch_thread
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=0.1)
+        except Exception:
+            pass
 
     def _open_dataset(self) -> xr.Dataset:
         if self._dataset is None:
@@ -1123,6 +1230,292 @@ class ArcoEra5FuXiDataset(Dataset[dict[str, Any]]):
                 self._dynamic_chunk_size_warning_emitted = True
         return self._dynamic_chunk_time_steps
 
+    def _resolved_dynamic_prefetch_block_time_steps(self) -> int:
+        return min(
+            self._resolved_dynamic_chunk_time_steps(),
+            max(
+                self._dynamic_time_span_steps(),
+                int(self.config.dynamic_prefetch_block_time_steps),
+            ),
+        )
+
+    def _dynamic_channel_transform_kinds(self) -> tuple[str, ...]:
+        kinds: list[str] = []
+        for variable_name in self.config.upper_air_variables:
+            kind = _DYNAMIC_ZSCORE_KIND
+            kinds.extend([kind] * len(self.config.pressure_levels))
+        for variable_name in self.config.surface_variables:
+            kind = _DYNAMIC_LOG1P_MM_ZSCORE_KIND if variable_name == "total_precipitation" else _DYNAMIC_ZSCORE_KIND
+            kinds.append(kind)
+        return tuple(kinds)
+
+    def _static_channel_transform_kinds(self) -> tuple[str, ...]:
+        kinds: list[str] = []
+        for variable_name in self.config.static_variables:
+            if variable_name in {"land_sea_mask", "cos_latitude", "cos_longitude", "sin_longitude"}:
+                kinds.append(_IDENTITY_KIND)
+            else:
+                kinds.append(_DYNAMIC_ZSCORE_KIND)
+        return tuple(kinds)
+
+    def _normalization_dataset_signature(self) -> str:
+        return describe_arco_era5_dataset_location(self.config.dataset_url)
+
+    def _normalization_stats_match_config(self, stats: ArcoEra5NormalizationStats) -> bool:
+        return (
+            stats.version == _NORMALIZATION_STATS_VERSION
+            and stats.dataset_url == self._normalization_dataset_signature()
+            and stats.dynamic_channel_names == tuple(self.config.channel_names)
+            and stats.dynamic_transform_kinds == self._dynamic_channel_transform_kinds()
+            and stats.static_channel_names == tuple(self.config.static_variables)
+            and stats.static_transform_kinds == self._static_channel_transform_kinds()
+        )
+
+    def _ensure_valid_normalization_stats(self, stats: ArcoEra5NormalizationStats) -> ArcoEra5NormalizationStats:
+        if not self._normalization_stats_match_config(stats):
+            raise ValueError("Normalization stats do not match the current dataset configuration.")
+
+        if any(value <= 0.0 for value in (*stats.dynamic_std, *stats.static_std)):
+            raise ValueError("Normalization stats must contain strictly positive standard deviations.")
+        return stats
+
+    @staticmethod
+    def _apply_pre_standardization_transform(values: np.ndarray, kind: str) -> np.ndarray:
+        if kind in {_DYNAMIC_ZSCORE_KIND, _IDENTITY_KIND}:
+            return values
+        if kind == _DYNAMIC_LOG1P_MM_ZSCORE_KIND:
+            np.maximum(values, 0.0, out=values)
+            values *= 1000.0
+            np.log1p(values, out=values)
+            return values
+        raise ValueError(f"Unsupported normalization transform kind: {kind}")
+
+    @staticmethod
+    def _invert_pre_standardization_transform(values: np.ndarray, kind: str) -> np.ndarray:
+        if kind in {_DYNAMIC_ZSCORE_KIND, _IDENTITY_KIND}:
+            return values
+        if kind == _DYNAMIC_LOG1P_MM_ZSCORE_KIND:
+            np.expm1(values, out=values)
+            values /= 1000.0
+            return values
+        raise ValueError(f"Unsupported normalization transform kind: {kind}")
+
+    def _apply_dynamic_pre_standardization_transforms(self, dynamic: np.ndarray) -> np.ndarray:
+        transformed = dynamic.astype(np.float32, copy=True)
+        for channel_index, kind in enumerate(self._dynamic_channel_transform_kinds()):
+            transformed[:, channel_index] = self._apply_pre_standardization_transform(
+                transformed[:, channel_index],
+                kind,
+            )
+        return transformed
+
+    def _apply_static_pre_standardization_transforms(self, static_stack: np.ndarray) -> np.ndarray:
+        transformed = static_stack.astype(np.float32, copy=True)
+        for channel_index, kind in enumerate(self._static_channel_transform_kinds()):
+            transformed[channel_index] = self._apply_pre_standardization_transform(
+                transformed[channel_index],
+                kind,
+            )
+        return transformed
+
+    def _build_raw_static_stack(self) -> np.ndarray:
+        ds = self._open_dataset()
+        land_sea_mask = prepare_arco_spatial_dataarray(
+            ds["land_sea_mask"],
+            latitude_descending=self.config.latitude_descending,
+        ).load().values
+        orography = prepare_arco_spatial_dataarray(
+            ds[self.config.orography_source],
+            latitude_descending=self.config.latitude_descending,
+        ).load().values
+        if self.config.convert_geopotential_to_height and self.config.orography_source == "geopotential_at_surface":
+            orography = orography / _STANDARD_GRAVITY
+
+        latitude = prepare_arco_spatial_dataarray(
+            ds["latitude"],
+            latitude_descending=self.config.latitude_descending,
+        ).values
+        longitude = prepare_arco_spatial_dataarray(
+            ds["longitude"],
+            latitude_descending=self.config.latitude_descending,
+        ).values
+        derived_maps = build_fuxi_derived_static_maps(latitude, longitude)
+        static_map = {
+            "land_sea_mask": land_sea_mask.astype(np.float32),
+            "orography": orography.astype(np.float32),
+            **derived_maps,
+        }
+        return np.stack(
+            [static_map[name] for name in self.config.static_variables],
+            axis=0,
+        ).astype(np.float32, copy=False)
+
+    def _fit_normalization_stats(self) -> ArcoEra5NormalizationStats:
+        anchor_indices = self._build_valid_anchor_indices()
+        if anchor_indices.size == 0:
+            raise ValueError("Cannot fit normalization stats on an empty dataset split.")
+
+        sample_count = min(int(self.config.normalization_fit_sample_count), int(anchor_indices.shape[0]))
+        sample_positions = np.linspace(0, int(anchor_indices.shape[0]) - 1, num=sample_count, dtype=np.int64)
+        sampled_anchor_indices = anchor_indices[np.unique(sample_positions)]
+
+        dataset = self._open_dataset()
+        plan = self._build_dynamic_download_plan()
+        dynamic_sum = np.zeros(len(self.config.channel_names), dtype=np.float64)
+        dynamic_sumsq = np.zeros(len(self.config.channel_names), dtype=np.float64)
+        dynamic_count = 0
+
+        for anchor_index in sampled_anchor_indices.tolist():
+            input_indices = [anchor_index + self._step_count(hours) for hours in self.config.input_time_offsets_hours]
+            target_indices = [
+                anchor_index + self._step_count(self.config.lead_time_hours * step)
+                for step in range(1, self.config.forecast_steps + 1)
+            ]
+            requested_indices = sorted({*input_indices, *target_indices})
+            chunk_start = min(requested_indices)
+            chunk_stop = max(requested_indices) + 1
+            raw_chunk = self._materialize_dynamic_chunk(dataset, plan, chunk_start, chunk_stop)
+            selected_chunk = raw_chunk[[index - chunk_start for index in requested_indices]]
+            transformed_chunk = self._apply_dynamic_pre_standardization_transforms(selected_chunk)
+            transformed_chunk64 = transformed_chunk.astype(np.float64, copy=False)
+            dynamic_sum += transformed_chunk64.sum(axis=(0, 2, 3))
+            dynamic_sumsq += np.square(transformed_chunk64).sum(axis=(0, 2, 3))
+            dynamic_count += (
+                int(transformed_chunk.shape[0]) * int(transformed_chunk.shape[2]) * int(transformed_chunk.shape[3])
+            )
+
+        if dynamic_count <= 0:
+            raise ValueError("Cannot fit normalization stats without any sampled dynamic values.")
+
+        dynamic_mean = dynamic_sum / float(dynamic_count)
+        dynamic_var = np.maximum(dynamic_sumsq / float(dynamic_count) - np.square(dynamic_mean), 0.0)
+        dynamic_std = np.sqrt(dynamic_var)
+        dynamic_std = np.maximum(dynamic_std, _MIN_NORMALIZATION_STD)
+
+        static_stack = self._build_raw_static_stack()
+        transformed_static = self._apply_static_pre_standardization_transforms(static_stack)
+        static_mean = transformed_static.reshape(transformed_static.shape[0], -1).mean(axis=1, dtype=np.float64)
+        static_var = transformed_static.reshape(transformed_static.shape[0], -1).var(axis=1, dtype=np.float64)
+        static_std = np.sqrt(np.maximum(static_var, 0.0))
+        static_std = np.maximum(static_std, _MIN_NORMALIZATION_STD)
+
+        for channel_index, kind in enumerate(self._static_channel_transform_kinds()):
+            if kind == _IDENTITY_KIND:
+                static_mean[channel_index] = 0.0
+                static_std[channel_index] = 1.0
+
+        return self._ensure_valid_normalization_stats(
+            ArcoEra5NormalizationStats(
+                version=_NORMALIZATION_STATS_VERSION,
+                dataset_url=self._normalization_dataset_signature(),
+                dynamic_channel_names=tuple(self.config.channel_names),
+                dynamic_transform_kinds=self._dynamic_channel_transform_kinds(),
+                dynamic_mean=tuple(float(value) for value in dynamic_mean.tolist()),
+                dynamic_std=tuple(float(value) for value in dynamic_std.tolist()),
+                static_channel_names=tuple(self.config.static_variables),
+                static_transform_kinds=self._static_channel_transform_kinds(),
+                static_mean=tuple(float(value) for value in static_mean.tolist()),
+                static_std=tuple(float(value) for value in static_std.tolist()),
+                fit_sample_count=int(sampled_anchor_indices.shape[0]),
+            )
+        )
+
+    def _load_or_fit_normalization_stats(self) -> ArcoEra5NormalizationStats:
+        if self._normalization_stats is not None:
+            return self._normalization_stats
+
+        if not self.config.apply_normalization:
+            raise RuntimeError("Normalization stats were requested while apply_normalization is false.")
+
+        stats_path = self.config.normalization_stats_path
+        if (
+            stats_path is not None
+            and stats_path.is_file()
+            and not self.config.normalization_force_recompute
+        ):
+            try:
+                loaded = ArcoEra5NormalizationStats.from_dict(_read_json_file(stats_path))
+                self._normalization_stats = self._ensure_valid_normalization_stats(loaded)
+                return self._normalization_stats
+            except Exception:
+                pass
+
+        fitted = self._fit_normalization_stats()
+        if stats_path is not None:
+            _write_json_file(stats_path, fitted.to_dict())
+        self._normalization_stats = fitted
+        return self._normalization_stats
+
+    def ensure_normalization_stats(self) -> ArcoEra5NormalizationStats | None:
+        if not self.config.apply_normalization:
+            return None
+        return self._load_or_fit_normalization_stats()
+
+    def _normalize_dynamic_chunk(self, dynamic: np.ndarray) -> np.ndarray:
+        if not self.config.apply_normalization:
+            return dynamic.astype(np.float32, copy=False)
+
+        stats = self._load_or_fit_normalization_stats()
+        transformed = self._apply_dynamic_pre_standardization_transforms(dynamic)
+        standardize_mask = np.asarray(
+            [kind != _IDENTITY_KIND for kind in stats.dynamic_transform_kinds],
+            dtype=bool,
+        )
+        if standardize_mask.any():
+            mean = np.asarray(stats.dynamic_mean, dtype=np.float32)[standardize_mask]
+            std = np.asarray(stats.dynamic_std, dtype=np.float32)[standardize_mask]
+            transformed[:, standardize_mask] = (
+                transformed[:, standardize_mask] - mean[None, :, None, None]
+            ) / std[None, :, None, None]
+        return transformed.astype(np.float32, copy=False)
+
+    def _normalize_static_stack(self, static_stack: np.ndarray) -> np.ndarray:
+        if not self.config.apply_normalization:
+            return static_stack.astype(np.float32, copy=False)
+
+        stats = self._load_or_fit_normalization_stats()
+        transformed = self._apply_static_pre_standardization_transforms(static_stack)
+        standardize_mask = np.asarray(
+            [kind != _IDENTITY_KIND for kind in stats.static_transform_kinds],
+            dtype=bool,
+        )
+        if standardize_mask.any():
+            mean = np.asarray(stats.static_mean, dtype=np.float32)[standardize_mask]
+            std = np.asarray(stats.static_std, dtype=np.float32)[standardize_mask]
+            transformed[standardize_mask] = (
+                transformed[standardize_mask] - mean[:, None, None]
+            ) / std[:, None, None]
+        return transformed.astype(np.float32, copy=False)
+
+    def denormalize_dynamic_tensor(self, dynamic: Tensor) -> Tensor:
+        if not self.config.apply_normalization:
+            return dynamic
+
+        stats = self._load_or_fit_normalization_stats()
+        restored = dynamic.float().clone()
+        if restored.ndim == 4:
+            restored = restored.unsqueeze(0)
+            squeeze_batch = True
+        elif restored.ndim == 5:
+            squeeze_batch = False
+        else:
+            raise ValueError(
+                f"Expected normalized dynamic tensor shaped [T, C, H, W] or [B, T, C, H, W], got {tuple(dynamic.shape)}"
+            )
+
+        for channel_index, kind in enumerate(stats.dynamic_transform_kinds):
+            if kind != _IDENTITY_KIND:
+                restored[:, :, channel_index] = (
+                    restored[:, :, channel_index] * float(stats.dynamic_std[channel_index])
+                    + float(stats.dynamic_mean[channel_index])
+                )
+            if kind == _DYNAMIC_LOG1P_MM_ZSCORE_KIND:
+                restored[:, :, channel_index] = torch.expm1(restored[:, :, channel_index]) / 1000.0
+
+        if squeeze_batch:
+            restored = restored.squeeze(0)
+        return restored
+
     def _build_dynamic_download_plan(self) -> ArcoEra5DownloadPlan:
         if self._dynamic_download_plan is None:
             dataset = self._open_dataset()
@@ -1196,153 +1589,168 @@ class ArcoEra5FuXiDataset(Dataset[dict[str, Any]]):
         surface = np.concatenate(surface_groups, axis=1)
         return np.concatenate([upper_air, surface], axis=1).astype(np.float32, copy=False)
 
-    def _load_dynamic_chunk(self, start_index: int, stop_index: int) -> np.ndarray:
-        dataset = self._open_dataset()
-        plan = self._build_dynamic_download_plan()
-        return self._materialize_dynamic_chunk(dataset, plan, start_index, stop_index)
+    def _raise_dynamic_prefetch_error_locked(self) -> None:
+        if self._dynamic_prefetch_error is not None:
+            raise RuntimeError("Dynamic RAM prefetch thread failed.") from self._dynamic_prefetch_error
 
-    def _prefetch_dynamic_chunk(
+    def _ensure_dynamic_prefetch_thread_locked(self) -> None:
+        if self._dynamic_prefetch_thread is not None:
+            return
+        self._dynamic_prefetch_thread = threading.Thread(
+            target=self._dynamic_prefetch_loop,
+            name="era5-dynamic-prefetch",
+            daemon=True,
+        )
+        self._dynamic_prefetch_thread.start()
+
+    def _ensure_dynamic_ring_storage_locked(self, block: np.ndarray) -> None:
+        capacity = self._resolved_dynamic_chunk_time_steps()
+        expected_shape = (capacity, *block.shape[1:])
+        if self._dynamic_ring_array is None or self._dynamic_ring_array.shape != expected_shape:
+            self._dynamic_ring_array = np.empty(expected_shape, dtype=np.float32)
+
+    def _write_dynamic_block_to_ring_locked(
         self,
         start_index: int,
-        stop_index: int,
-        plan: ArcoEra5DownloadPlan,
-    ) -> tuple[int, int, np.ndarray]:
-        dataset = open_arco_era5_dataset(
-            self.config.dataset_url,
-            gcs_token=self.config.gcs_token,
-        )
-        chunk = self._materialize_dynamic_chunk(dataset, plan, start_index, stop_index)
-        return start_index, stop_index, chunk
+        block: np.ndarray,
+    ) -> None:
+        if self._dynamic_ring_array is None:
+            raise RuntimeError("Dynamic ring buffer was not allocated before writing.")
 
-    def _next_dynamic_chunk_start_stop(self) -> tuple[int, int] | None:
-        if self._dynamic_chunk_start is None or self._dynamic_chunk_stop is None:
-            return None
+        capacity = self._resolved_dynamic_chunk_time_steps()
+        block_size = int(block.shape[0])
+        slot = start_index % capacity
+        first_span = min(capacity - slot, block_size)
+        self._dynamic_ring_array[slot : slot + first_span] = block[:first_span]
+        if first_span < block_size:
+            self._dynamic_ring_array[: block_size - first_span] = block[first_span:]
 
-        overlap_steps = self._dynamic_time_span_steps() - 1
-        total_time_steps = len(self._load_time_values())
-        next_start = max(0, self._dynamic_chunk_stop - overlap_steps)
-        if next_start >= total_time_steps or next_start <= self._dynamic_chunk_start:
-            return None
+        if self._dynamic_ring_start is None:
+            self._dynamic_ring_start = start_index
+        self._dynamic_ring_stop = start_index + block_size
 
-        next_stop = min(
-            total_time_steps,
-            max(next_start + 1, next_start + self._resolved_dynamic_chunk_time_steps()),
-        )
-        if next_stop <= next_start:
-            return None
-        return next_start, next_stop
-
-    def _maybe_schedule_next_dynamic_chunk(self) -> None:
-        next_bounds = self._next_dynamic_chunk_start_stop()
-        if next_bounds is None:
-            return
-        if self._next_dynamic_chunk_bounds == next_bounds and self._next_dynamic_chunk_future is not None:
-            return
-        if self._next_dynamic_chunk_future is not None:
-            self._next_dynamic_chunk_future.cancel()
-
-        if self._dynamic_chunk_prefetch_executor is None:
-            self._dynamic_chunk_prefetch_executor = ThreadPoolExecutor(
-                max_workers=1,
-                thread_name_prefix="era5-prefetch",
+    def _dynamic_prefetch_loop(self) -> None:
+        try:
+            dataset = open_arco_era5_dataset(
+                self.config.dataset_url,
+                gcs_token=self.config.gcs_token,
             )
-        plan = self._build_dynamic_download_plan()
-        self._next_dynamic_chunk_bounds = next_bounds
-        self._next_dynamic_chunk_future = self._dynamic_chunk_prefetch_executor.submit(
-            self._prefetch_dynamic_chunk,
-            next_bounds[0],
-            next_bounds[1],
-            plan,
-        )
+            plan = build_arco_era5_download_plan(
+                tuple(dataset.data_vars),
+                self.config,
+                include_static_sources=False,
+            )
+            while True:
+                with self._dynamic_prefetch_condition:
+                    while True:
+                        if self._dynamic_prefetch_shutdown:
+                            return
 
-    def _try_swap_in_prefetched_dynamic_chunk(
-        self,
-        min_index: int,
-        max_index: int,
-    ) -> bool:
-        if self._next_dynamic_chunk_future is None or self._next_dynamic_chunk_bounds is None:
-            return False
+                        self._raise_dynamic_prefetch_error_locked()
 
-        next_start, next_stop = self._next_dynamic_chunk_bounds
-        if min_index < next_start or max_index >= next_stop:
-            return False
+                        start_index = self._dynamic_ring_start
+                        stop_index = self._dynamic_ring_stop
+                        target_stop = self._dynamic_prefetch_target_stop
+                        if start_index is None or stop_index is None or target_stop is None:
+                            self._dynamic_prefetch_condition.wait()
+                            continue
 
-        start_index, stop_index, chunk = self._next_dynamic_chunk_future.result()
-        self._dynamic_chunk_array = chunk
-        self._dynamic_chunk_start = start_index
-        self._dynamic_chunk_stop = stop_index
-        self._next_dynamic_chunk_future = None
-        self._next_dynamic_chunk_bounds = None
-        self._maybe_schedule_next_dynamic_chunk()
-        return True
+                        capacity = self._resolved_dynamic_chunk_time_steps()
+                        loaded_time_steps = stop_index - start_index
+                        free_time_steps = capacity - loaded_time_steps
+                        remaining_time_steps = target_stop - stop_index
+                        if free_time_steps <= 0 or remaining_time_steps <= 0:
+                            self._dynamic_prefetch_condition.wait()
+                            continue
+
+                        load_start = stop_index
+                        load_stop = load_start + min(
+                            free_time_steps,
+                            remaining_time_steps,
+                            self._resolved_dynamic_prefetch_block_time_steps(),
+                        )
+                        generation = self._dynamic_prefetch_generation
+                        break
+
+                block = self._normalize_dynamic_chunk(
+                    self._materialize_dynamic_chunk(dataset, plan, load_start, load_stop)
+                )
+
+                with self._dynamic_prefetch_condition:
+                    if self._dynamic_prefetch_shutdown:
+                        return
+                    if generation != self._dynamic_prefetch_generation:
+                        continue
+                    if self._dynamic_ring_stop != load_start:
+                        continue
+
+                    self._ensure_dynamic_ring_storage_locked(block)
+                    self._write_dynamic_block_to_ring_locked(load_start, block)
+                    self._dynamic_prefetch_condition.notify_all()
+        except BaseException as exc:  # pragma: no cover - exercised through waiting consumers
+            with self._dynamic_prefetch_condition:
+                self._dynamic_prefetch_error = exc
+                self._dynamic_prefetch_condition.notify_all()
 
     def _ensure_dynamic_chunk(self, time_indices: Sequence[int]) -> None:
         min_index = min(int(time_index) for time_index in time_indices)
         max_index = max(int(time_index) for time_index in time_indices)
-        if (
-            self._dynamic_chunk_array is not None
-            and self._dynamic_chunk_start is not None
-            and self._dynamic_chunk_stop is not None
-            and min_index >= self._dynamic_chunk_start
-            and max_index < self._dynamic_chunk_stop
-        ):
-            self._maybe_schedule_next_dynamic_chunk()
-            return
-
-        if self._try_swap_in_prefetched_dynamic_chunk(min_index, max_index):
-            return
-
-        chunk_time_steps = self._resolved_dynamic_chunk_time_steps()
+        request_stop = max_index + 1
+        capacity = self._resolved_dynamic_chunk_time_steps()
         total_time_steps = len(self._load_time_values())
-        chunk_start = min_index
-        chunk_stop = min(total_time_steps, max(max_index + 1, chunk_start + chunk_time_steps))
-        self._dynamic_chunk_array = self._load_dynamic_chunk(chunk_start, chunk_stop)
-        self._dynamic_chunk_start = chunk_start
-        self._dynamic_chunk_stop = chunk_stop
-        self._maybe_schedule_next_dynamic_chunk()
+        target_stop = min(
+            total_time_steps,
+            max(request_stop, min_index + capacity),
+        )
+
+        with self._dynamic_prefetch_condition:
+            self._raise_dynamic_prefetch_error_locked()
+
+            needs_reset = (
+                self._dynamic_ring_start is None
+                or self._dynamic_ring_stop is None
+                or min_index < self._dynamic_ring_start
+                or request_stop > self._dynamic_ring_start + capacity
+            )
+            if needs_reset:
+                self._dynamic_ring_start = min_index
+                self._dynamic_ring_stop = min_index
+                self._dynamic_prefetch_generation += 1
+            elif min_index > self._dynamic_ring_start:
+                self._dynamic_ring_start = min_index
+
+            self._dynamic_prefetch_target_stop = target_stop
+            self._ensure_dynamic_prefetch_thread_locked()
+            self._dynamic_prefetch_condition.notify_all()
+
+            while True:
+                self._raise_dynamic_prefetch_error_locked()
+                if (
+                    self._dynamic_ring_start is not None
+                    and self._dynamic_ring_stop is not None
+                    and min_index >= self._dynamic_ring_start
+                    and request_stop <= self._dynamic_ring_stop
+                ):
+                    return
+                self._dynamic_prefetch_condition.wait()
+
+    def _read_dynamic_tensor_from_ring(self, time_indices: Sequence[int]) -> np.ndarray:
+        with self._dynamic_prefetch_condition:
+            if self._dynamic_ring_array is None or self._dynamic_ring_start is None:
+                raise RuntimeError("Dynamic RAM cache was not initialized before sample assembly.")
+
+            positions = np.asarray(time_indices, dtype=np.int64) % self._resolved_dynamic_chunk_time_steps()
+            return self._dynamic_ring_array[positions].astype(np.float32, copy=False)
 
     def _build_dynamic_tensor(self, time_indices: Sequence[int]) -> np.ndarray:
         self._ensure_dynamic_chunk(time_indices)
-        if self._dynamic_chunk_array is None or self._dynamic_chunk_start is None:
-            raise RuntimeError("Dynamic RAM cache was not initialized before sample assembly.")
-
-        relative_indices = [int(time_index) - self._dynamic_chunk_start for time_index in time_indices]
-        return self._dynamic_chunk_array[relative_indices].astype(np.float32, copy=False)
+        return self._read_dynamic_tensor_from_ring(time_indices)
 
     def _build_static_features(self) -> torch.Tensor:
         if self._static_features is not None:
             return self._static_features
 
-        ds = self._open_dataset()
-        land_sea_mask = prepare_arco_spatial_dataarray(
-            ds["land_sea_mask"],
-            latitude_descending=self.config.latitude_descending,
-        ).load().values
-        orography = prepare_arco_spatial_dataarray(
-            ds[self.config.orography_source],
-            latitude_descending=self.config.latitude_descending,
-        ).load().values
-        if self.config.convert_geopotential_to_height and self.config.orography_source == "geopotential_at_surface":
-            orography = orography / _STANDARD_GRAVITY
-
-        latitude = prepare_arco_spatial_dataarray(
-            ds["latitude"],
-            latitude_descending=self.config.latitude_descending,
-        ).values
-        longitude = prepare_arco_spatial_dataarray(
-            ds["longitude"],
-            latitude_descending=self.config.latitude_descending,
-        ).values
-        derived_maps = build_fuxi_derived_static_maps(latitude, longitude)
-        static_map = {
-            "land_sea_mask": land_sea_mask.astype(np.float32),
-            "orography": orography.astype(np.float32),
-            **derived_maps,
-        }
-        stacked = np.stack(
-            [static_map[name] for name in self.config.static_variables],
-            axis=0,
-        )
+        stacked = self._normalize_static_stack(self._build_raw_static_stack())
         self._static_features = torch.from_numpy(stacked)
         return self._static_features
 
@@ -1378,9 +1786,10 @@ class ArcoEra5FuXiDataset(Dataset[dict[str, Any]]):
         ]
 
         anchor_time = pd.Timestamp(time_values[anchor_index])
+        self._ensure_dynamic_chunk((*input_indices, *target_indices))
         sample = {
-            "x": torch.from_numpy(self._build_dynamic_tensor(input_indices)),
-            "target": torch.from_numpy(self._build_dynamic_tensor(target_indices)),
+            "x": torch.from_numpy(self._read_dynamic_tensor_from_ring(input_indices)),
+            "target": torch.from_numpy(self._read_dynamic_tensor_from_ring(target_indices)),
             "static_features": self._build_static_features(),
             "temb": torch.from_numpy(
                 build_fuxi_time_embeddings(anchor_time, total_steps=1, freq_hours=self.config.lead_time_hours)[0, 0]
@@ -1426,6 +1835,13 @@ class ArcoEra5FuXiDataset(Dataset[dict[str, Any]]):
             "latitude_descending": self.config.latitude_descending,
             "include_sample_metadata": self.config.include_sample_metadata,
             "dynamic_ram_cache_time_steps": self.config.dynamic_ram_cache_time_steps,
+            "dynamic_prefetch_block_time_steps": self.config.dynamic_prefetch_block_time_steps,
+            "apply_normalization": self.config.apply_normalization,
+            "normalization_stats_path": (
+                None if self.config.normalization_stats_path is None else str(self.config.normalization_stats_path)
+            ),
+            "normalization_force_recompute": self.config.normalization_force_recompute,
+            "normalization_fit_sample_count": self.config.normalization_fit_sample_count,
             "model_input_size": list(model_config.input_size),
             "model_time_steps": model_config.time_steps,
             "model_dynamic_channels": model_config.in_chans,
@@ -1537,6 +1953,7 @@ __all__ = [
     "ContiguousDistributedSampler",
     "ArcoEra5FuXiDataConfig",
     "ArcoEra5FuXiDataset",
+    "ArcoEra5NormalizationStats",
     "DEFAULT_ARCO_ERA5_URL",
     "FUXI_PRESSURE_LEVELS",
     "FUXI_STATIC_SOURCE_VARIABLES",

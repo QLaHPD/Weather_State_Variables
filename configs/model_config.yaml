@@ -8,10 +8,10 @@ forecast_model:
   forecast_steps: 2
   temb_dim: 12
   patch_size: [4, 4]
-  embed_dim: 768
+  embed_dim: 1024
   num_heads: 16
   window_size: 9
-  depths: [4, 4, 4, 4]
+  depths: [8, 8, 8, 8]
   num_groups: 32
   mlp_hidden_dim: 2048
   device: meta
@@ -27,8 +27,8 @@ intrinsic_model:
 
 data:
   dataset_url: /home/lemm2/ERA5_ZARR/arco_era5_fuxi_train.zarr
-  input_time_offsets_hours: [-1, 0]
-  lead_time_hours: 1
+  input_time_offsets_hours: [-3, 0]
+  lead_time_hours: 3
   forecast_steps: 2
   sample_stride_hours: 1
   pressure_levels: [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
@@ -41,15 +41,20 @@ data:
   latitude_descending: true
   include_sample_metadata: false
   dynamic_ram_cache_time_steps: 64
+  dynamic_prefetch_block_time_steps: 8
+  apply_normalization: true
+  normalization_stats_path: runs/cache/era5_fuxi_normalization.json
+  normalization_force_recompute: false
+  normalization_fit_sample_count: 256
   gcs_token: anon
 
 train_main:
-  batch_size: 8
-  num_workers: 0
-  gradient_accumulation_steps: 8
+  batch_size: 2
+  num_workers: 16
+  gradient_accumulation_steps: 32
   learning_rate: 1.0e-4
   weight_decay: 0.05
-  max_epochs: 1
+  max_epochs: 100
   device: auto
   model_dtype: float32
   use_amp: true
@@ -62,12 +67,17 @@ train_main:
   output_dir: runs/main
   checkpoint_name: main_last.pt
   best_checkpoint_name: main_best.pt
+  resume_checkpoint_path: null
+  save_epoch_checkpoint: true
+  save_best_checkpoint: true
+  save_every_train_batches: 30000
+  save_every_optimizer_steps: null
   train_start_time: 2000-01-01 00:00:00
-  train_end_time: 2010-12-31 23:00:00
-  val_start_time: 2011-01-01 00:00:00
+  train_end_time: 2011-12-31 23:00:00
+  val_start_time: 2012-01-01 00:00:00
   val_end_time: 2012-12-31 23:00:00
-  max_train_batches: 100000
-  max_val_batches: 10
+  max_train_batches: 300000
+  max_val_batches: 100
   log_every: 1
   print_model_summary: true
   summary_depth: 3
@@ -88,11 +98,16 @@ train_intrinsic:
   output_dir: runs/intrinsic
   checkpoint_name: intrinsic_last.pt
   best_checkpoint_name: intrinsic_best.pt
+  resume_checkpoint_path: null
+  save_epoch_checkpoint: true
+  save_best_checkpoint: false
+  save_every_train_batches: 10000
+  save_every_optimizer_steps: null
   main_checkpoint_path: runs/main/main_last.pt
   detach_second_block_features: true
   train_start_time: 2000-01-01 00:00:00
-  train_end_time: 2010-12-31 23:00:00
-  val_start_time: 2011-01-01 00:00:00
+  train_end_time: 2011-12-31 23:00:00
+  val_start_time: 2012-01-01 00:00:00
   val_end_time: 2012-12-31 23:00:00
   max_train_batches: 100000
   max_val_batches: 2

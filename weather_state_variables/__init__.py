@@ -19,6 +19,7 @@ _LAZY_IMPORTS = {
     "ArcoEra5DownloadWindow": (_DATA_MODULE, "ArcoEra5DownloadWindow"),
     "ArcoEra5FuXiDataConfig": (_DATA_MODULE, "ArcoEra5FuXiDataConfig"),
     "ArcoEra5FuXiDataset": (_DATA_MODULE, "ArcoEra5FuXiDataset"),
+    "ArcoEra5NormalizationStats": (_DATA_MODULE, "ArcoEra5NormalizationStats"),
     "FUXI_STATIC_SOURCE_VARIABLES": (_DATA_MODULE, "FUXI_STATIC_SOURCE_VARIABLES"),
     "FuXiEncoderOutput": (_MODELS_MODULE, "FuXiEncoderOutput"),
     "FuXiIntrinsic": (_MODELS_MODULE, "FuXiIntrinsic"),
@@ -51,6 +52,7 @@ _LAZY_IMPORTS = {
     "run_main_model_smoke_test": (_TRAINING_MODULE, "run_main_model_smoke_test"),
     "train_intrinsic_model": (_TRAINING_MODULE, "train_intrinsic_model"),
     "train_main_model": (_TRAINING_MODULE, "train_main_model"),
+    "validate_main_model": (_TRAINING_MODULE, "validate_main_model"),
 }
 
 __all__ = list(_LAZY_IMPORTS)

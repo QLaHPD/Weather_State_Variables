@@ -8,6 +8,7 @@ from .pipeline import (
     run_main_model_smoke_test,
     train_intrinsic_model,
     train_main_model,
+    validate_main_model,
 )
 
 __all__ = [
@@ -18,4 +19,5 @@ __all__ = [
     "run_main_model_smoke_test",
     "train_intrinsic_model",
     "train_main_model",
+    "validate_main_model",
 ]

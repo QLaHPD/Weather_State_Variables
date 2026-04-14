@@ -5,8 +5,9 @@ from dataclasses import asdict, dataclass, replace
 import json
 import os
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
+import numpy as np
 import pandas as pd
 import torch
 import torch.distributed as dist
@@ -152,6 +153,15 @@ def _to_positive_int(value: Any, *, default: int = 1, field_name: str) -> int:
     parsed = int(value)
     if parsed <= 0:
         raise ValueError(f"{field_name} must be positive, got {parsed}")
+    return parsed
+
+
+def _to_optional_positive_int(value: Any, *, field_name: str) -> int | None:
+    if value in {None, ""}:
+        return None
+    parsed = int(value)
+    if parsed <= 0:
+        raise ValueError(f"{field_name} must be positive when set, got {parsed}")
     return parsed
 
 
@@ -509,6 +519,531 @@ class LatitudeWeightedCharbonnierLoss(nn.Module):
         return (channel_weights * charbonnier).mean()
 
 
+def _forecast_variable_channel_groups(
+    data_config: ArcoEra5FuXiDataConfig,
+) -> list[tuple[str, list[int]]]:
+    groups: list[tuple[str, list[int]]] = []
+    channel_index = 0
+    level_count = len(data_config.pressure_levels)
+    for variable_name in data_config.upper_air_variables:
+        groups.append((variable_name, list(range(channel_index, channel_index + level_count))))
+        channel_index += level_count
+    for variable_name in data_config.surface_variables:
+        groups.append((variable_name, [channel_index]))
+        channel_index += 1
+    return groups
+
+
+def _reduce_tensor_in_place(tensor: Tensor, runtime: DistributedRuntime) -> Tensor:
+    if runtime.enabled:
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    return tensor
+
+
+def _main_validation_denormalized_mae(
+    prediction: Tensor,
+    target: Tensor,
+    *,
+    dataset: ArcoEra5FuXiDataset,
+    data_config: ArcoEra5FuXiDataConfig,
+) -> tuple[Tensor, Tensor]:
+    prediction_denorm = dataset.denormalize_dynamic_tensor(prediction)
+    target_denorm = dataset.denormalize_dynamic_tensor(target)
+    absolute_error = (prediction_denorm - target_denorm).abs()
+    latitude_weights = _latitude_weight_vector(
+        int(absolute_error.shape[-2]),
+        latitude_descending=data_config.latitude_descending,
+        device=absolute_error.device,
+        dtype=absolute_error.dtype,
+    ).view(1, 1, 1, -1, 1)
+    weighted_error = absolute_error * latitude_weights
+
+    groups = _forecast_variable_channel_groups(data_config)
+    metric_sums = torch.zeros(len(groups) + 1, device=absolute_error.device, dtype=torch.float64)
+    metric_counts = torch.zeros(len(groups) + 1, device=absolute_error.device, dtype=torch.float64)
+
+    metric_sums[0] = weighted_error.sum(dtype=torch.float64)
+    metric_counts[0] = float(weighted_error.numel())
+
+    for group_index, (_, channel_indices) in enumerate(groups, start=1):
+        group_error = weighted_error[:, :, channel_indices]
+        metric_sums[group_index] = group_error.sum(dtype=torch.float64)
+        metric_counts[group_index] = float(group_error.numel())
+
+    return metric_sums, metric_counts
+
+
+def _main_validation_loss_terms(
+    prediction: Tensor,
+    target: Tensor,
+    *,
+    criterion: nn.Module,
+    data_config: ArcoEra5FuXiDataConfig,
+) -> tuple[Tensor, Tensor]:
+    prediction = prediction.float()
+    target = target.float()
+    if prediction.shape != target.shape:
+        raise ValueError(
+            f"Expected prediction and target to have the same shape, got "
+            f"{tuple(prediction.shape)} and {tuple(target.shape)}"
+        )
+
+    if isinstance(criterion, LatitudeWeightedCharbonnierLoss):
+        latitude_weights = _latitude_weight_vector(
+            int(prediction.shape[-2]),
+            latitude_descending=criterion.latitude_descending,
+            device=prediction.device,
+            dtype=prediction.dtype,
+        ).view(1, 1, 1, -1, 1)
+        channel_weights = criterion.channel_weights.to(device=prediction.device, dtype=prediction.dtype).view(
+            1,
+            1,
+            -1,
+            1,
+            1,
+        )
+        weighted_diff = latitude_weights * (prediction - target)
+        per_element_loss = channel_weights * torch.sqrt(weighted_diff.square() + criterion.epsilon**2)
+    elif isinstance(criterion, nn.MSELoss):
+        per_element_loss = (prediction - target).square()
+    else:
+        raise TypeError(
+            f"Unsupported main-validation criterion type {type(criterion).__name__}; "
+            "expected LatitudeWeightedCharbonnierLoss or nn.MSELoss."
+        )
+
+    groups = _forecast_variable_channel_groups(data_config)
+    metric_sums = torch.zeros(len(groups) + 1, device=prediction.device, dtype=torch.float64)
+    metric_counts = torch.zeros(len(groups) + 1, device=prediction.device, dtype=torch.float64)
+
+    metric_sums[0] = per_element_loss.sum(dtype=torch.float64)
+    metric_counts[0] = float(per_element_loss.numel())
+
+    for group_index, (_, channel_indices) in enumerate(groups, start=1):
+        group_loss = per_element_loss[:, :, channel_indices]
+        metric_sums[group_index] = group_loss.sum(dtype=torch.float64)
+        metric_counts[group_index] = float(group_loss.numel())
+
+    return metric_sums, metric_counts
+
+
+@dataclass(frozen=True)
+class ForecastRolloutPlotGroup:
+    variable_name: str
+    display_name: str
+    channel_indices: tuple[int, ...]
+    row_labels: tuple[str, ...]
+    is_upper_air: bool
+
+
+def _forecast_variable_display_name(variable_name: str) -> str:
+    display_names = {
+        "geopotential": "Geopotential",
+        "temperature": "Temperature",
+        "u_component_of_wind": "U Wind",
+        "v_component_of_wind": "V Wind",
+        "relative_humidity": "Relative Humidity",
+        "2m_temperature": "2m Temperature",
+        "10m_u_component_of_wind": "10m U Wind",
+        "10m_v_component_of_wind": "10m V Wind",
+        "mean_sea_level_pressure": "Mean Sea Level Pressure",
+        "total_precipitation": "Total Precipitation",
+    }
+    return display_names.get(variable_name, variable_name.replace("_", " ").title())
+
+
+def _forecast_rollout_plot_groups(
+    data_config: ArcoEra5FuXiDataConfig,
+) -> list[ForecastRolloutPlotGroup]:
+    groups: list[ForecastRolloutPlotGroup] = []
+    channel_index = 0
+    for variable_name in data_config.upper_air_variables:
+        channel_indices = tuple(channel_index + offset for offset in range(len(data_config.pressure_levels)))
+        groups.append(
+            ForecastRolloutPlotGroup(
+                variable_name=variable_name,
+                display_name=_forecast_variable_display_name(variable_name),
+                channel_indices=channel_indices,
+                row_labels=tuple(f"{int(level)} hPa" for level in data_config.pressure_levels),
+                is_upper_air=True,
+            )
+        )
+        channel_index += len(data_config.pressure_levels)
+    for variable_name in data_config.surface_variables:
+        groups.append(
+            ForecastRolloutPlotGroup(
+                variable_name=variable_name,
+                display_name=_forecast_variable_display_name(variable_name),
+                channel_indices=(channel_index,),
+                row_labels=("surface",),
+                is_upper_air=False,
+            )
+        )
+        channel_index += 1
+    return groups
+
+
+def _rollout_filename_slug(value: str) -> str:
+    slug = "".join(char.lower() if char.isalnum() else "_" for char in value)
+    while "__" in slug:
+        slug = slug.replace("__", "_")
+    return slug.strip("_")
+
+
+def _format_rollout_hour_label(hours: int) -> str:
+    return f"{hours:+d}h"
+
+
+def _import_pyplot():
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg", force=True)
+        from matplotlib import pyplot as plt
+    except ImportError as exc:  # pragma: no cover - depends on optional plotting dependency
+        raise ImportError(
+            "Rollout plotting requires matplotlib. Install it in the active environment "
+            "or run validation without the rollout plot options."
+        ) from exc
+    return plt
+
+
+def _default_rollout_anchor_stride_hours(data_config: ArcoEra5FuXiDataConfig) -> int:
+    lead = int(data_config.lead_time_hours)
+    input_offsets = tuple(int(offset) for offset in data_config.input_time_offsets_hours)
+    expected_offsets = tuple(range(-lead * (len(input_offsets) - 1), lead, lead))
+    if input_offsets == expected_offsets and data_config.forecast_steps >= len(input_offsets):
+        return lead * len(input_offsets)
+    return lead
+
+
+def _resolve_rollout_anchor_stride_hours(
+    data_config: ArcoEra5FuXiDataConfig,
+    rollout_anchor_stride_hours: int | None,
+) -> int:
+    resolved = (
+        _default_rollout_anchor_stride_hours(data_config)
+        if rollout_anchor_stride_hours is None
+        else int(rollout_anchor_stride_hours)
+    )
+    if resolved <= 0:
+        raise ValueError(f"rollout_anchor_stride_hours must be positive, got {resolved}")
+    return resolved
+
+
+def _rollout_channel_mae(
+    absolute_error: Tensor,
+    *,
+    data_config: ArcoEra5FuXiDataConfig,
+) -> Tensor:
+    latitude_weights = _latitude_weight_vector(
+        int(absolute_error.shape[-2]),
+        latitude_descending=data_config.latitude_descending,
+        device=absolute_error.device,
+        dtype=absolute_error.dtype,
+    ).view(1, 1, -1, 1)
+    return (absolute_error * latitude_weights).mean(dim=(-2, -1))
+
+
+def _save_rollout_step_map_figures(
+    *,
+    output_dir: Path,
+    plot_groups: Sequence[ForecastRolloutPlotGroup],
+    sample_index: int,
+    pass_index: int,
+    target_step_index: int,
+    target_hour_from_initial_anchor: int,
+    target_timestamp: pd.Timestamp,
+    input_hours_from_initial_anchor: Sequence[int],
+    input_sources: Sequence[str],
+    truth_inputs: Tensor,
+    model_inputs: Tensor,
+    truth_target: Tensor,
+    prediction: Tensor,
+    absolute_error: Tensor,
+) -> list[str]:
+    plt = _import_pyplot()
+    saved_paths: list[str] = []
+    show_model_inputs = any(source != "real" for source in input_sources)
+    input_column_count = len(input_hours_from_initial_anchor)
+    total_columns = input_column_count + (input_column_count if show_model_inputs else 0) + 3
+
+    for plot_group in plot_groups:
+        row_count = len(plot_group.channel_indices)
+        figure, axes = plt.subplots(
+            row_count,
+            total_columns,
+            figsize=(2.6 * total_columns, 2.0 * row_count + 0.8),
+            squeeze=False,
+        )
+        figure.suptitle(
+            f"Sample {sample_index:05d} | {plot_group.display_name} | rollout pass {pass_index + 1} | "
+            f"target {_format_rollout_hour_label(target_hour_from_initial_anchor)} | "
+            f"{target_timestamp.strftime('%Y-%m-%d %H:%M')}",
+            fontsize=12,
+        )
+
+        title_columns: list[str] = [
+            f"real in {_format_rollout_hour_label(hours)}"
+            for hours in input_hours_from_initial_anchor
+        ]
+        if show_model_inputs:
+            title_columns.extend(
+                f"model in {_format_rollout_hour_label(hours)} ({source})"
+                for hours, source in zip(input_hours_from_initial_anchor, input_sources, strict=False)
+            )
+        title_columns.extend(
+            [
+                f"real out {_format_rollout_hour_label(target_hour_from_initial_anchor)}",
+                f"pred {_format_rollout_hour_label(target_hour_from_initial_anchor)}",
+                f"|err| {_format_rollout_hour_label(target_hour_from_initial_anchor)}",
+            ]
+        )
+
+        for row_index, channel_index in enumerate(plot_group.channel_indices):
+            value_panels = [truth_inputs[input_index, channel_index] for input_index in range(input_column_count)]
+            if show_model_inputs:
+                value_panels.extend(model_inputs[input_index, channel_index] for input_index in range(input_column_count))
+            value_panels.extend([truth_target[channel_index], prediction[channel_index]])
+            value_min = min(float(panel.min().item()) for panel in value_panels)
+            value_max = max(float(panel.max().item()) for panel in value_panels)
+            if np.isclose(value_min, value_max):
+                value_max = value_min + 1.0
+            error_max = float(absolute_error[channel_index].max().item())
+            if error_max <= 0.0:
+                error_max = 1.0
+
+            display_panels = [panel.detach().cpu().numpy() for panel in value_panels]
+            error_panel = absolute_error[channel_index].detach().cpu().numpy()
+            all_panels = display_panels + [error_panel]
+
+            for column_index, panel in enumerate(all_panels):
+                axis = axes[row_index, column_index]
+                if column_index < len(display_panels):
+                    axis.imshow(panel, cmap="viridis", vmin=value_min, vmax=value_max)
+                else:
+                    axis.imshow(panel, cmap="magma", vmin=0.0, vmax=error_max)
+                axis.set_xticks([])
+                axis.set_yticks([])
+                if row_index == 0:
+                    axis.set_title(title_columns[column_index], fontsize=9)
+                if column_index == 0:
+                    axis.set_ylabel(plot_group.row_labels[row_index], fontsize=9)
+
+        figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
+        figure_path = (
+            output_dir
+            / (
+                f"sample_{sample_index:05d}_pass_{pass_index + 1:03d}_"
+                f"target_{_format_rollout_hour_label(target_hour_from_initial_anchor).replace('+', 'p').replace('-', 'm')}_"
+                f"{_rollout_filename_slug(plot_group.variable_name)}.png"
+            )
+        )
+        figure.savefig(figure_path, dpi=120)
+        plt.close(figure)
+        saved_paths.append(str(figure_path))
+
+    return saved_paths
+
+
+def _save_rollout_error_graphs(
+    *,
+    output_dir: Path,
+    plot_groups: Sequence[ForecastRolloutPlotGroup],
+    horizon_labels: Sequence[str],
+    channel_mae_history: Tensor,
+) -> list[str]:
+    plt = _import_pyplot()
+    x_positions = np.arange(len(horizon_labels), dtype=np.int64)
+    saved_paths: list[str] = []
+
+    for plot_group in plot_groups:
+        figure, axis = plt.subplots(figsize=(max(9.0, 0.75 * len(horizon_labels) + 5.0), 5.2))
+        for row_label, channel_index in zip(plot_group.row_labels, plot_group.channel_indices, strict=False):
+            axis.plot(
+                x_positions,
+                channel_mae_history[:, channel_index].detach().cpu().numpy(),
+                marker="o",
+                linewidth=1.5,
+                label=row_label,
+            )
+        axis.set_title(f"Rollout Denormalized Absolute Error | {plot_group.display_name}")
+        axis.set_ylabel("Latitude-weighted MAE")
+        axis.set_xlabel("Predicted rollout time")
+        axis.set_xticks(x_positions)
+        axis.set_xticklabels(horizon_labels, rotation=45, ha="right")
+        axis.grid(True, alpha=0.3)
+        if len(plot_group.channel_indices) > 1:
+            axis.legend(ncol=2, fontsize=8)
+        figure.tight_layout()
+        figure_path = output_dir / f"rollout_error_{_rollout_filename_slug(plot_group.variable_name)}.png"
+        figure.savefig(figure_path, dpi=120)
+        plt.close(figure)
+        saved_paths.append(str(figure_path))
+
+    return saved_paths
+
+
+def _save_main_rollout_plots(
+    model: nn.Module,
+    dataset: ArcoEra5FuXiDataset,
+    *,
+    data_config: ArcoEra5FuXiDataConfig,
+    runtime: DistributedRuntime,
+    use_amp: bool,
+    amp_dtype: torch.dtype | None,
+    output_dir: Path,
+    rollout_samples: int,
+    rollout_passes: int,
+    rollout_anchor_stride_hours: int | None,
+) -> dict[str, Any]:
+    if rollout_samples <= 0:
+        raise ValueError(f"rollout_samples must be positive, got {rollout_samples}")
+    if rollout_passes <= 0:
+        raise ValueError(f"rollout_passes must be positive, got {rollout_passes}")
+
+    from ..models.fuxi_short import build_fuxi_time_embeddings
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    plot_groups = _forecast_rollout_plot_groups(data_config)
+    resolved_stride_hours = _resolve_rollout_anchor_stride_hours(data_config, rollout_anchor_stride_hours)
+    anchor_stride_steps = dataset._step_count(resolved_stride_hours)
+    input_offset_steps = [dataset._step_count(hours) for hours in data_config.input_time_offsets_hours]
+    target_offset_steps = [
+        dataset._step_count(data_config.lead_time_hours * step)
+        for step in range(1, data_config.forecast_steps + 1)
+    ]
+    dataset_step_hours = dataset._dataset_frequency_hours()
+    time_values = dataset._load_time_values()
+    valid_anchor_indices = dataset._build_valid_anchor_indices()
+    static_features = dataset._build_static_features().to(runtime.device)
+
+    sample_reports: list[dict[str, Any]] = []
+    total_time_steps = len(time_values)
+
+    for sample_index in range(min(int(rollout_samples), len(valid_anchor_indices))):
+        sample_output_dir = output_dir / f"sample_{sample_index:05d}"
+        sample_output_dir.mkdir(parents=True, exist_ok=True)
+        initial_anchor_index = int(valid_anchor_indices[sample_index])
+        seed_input_indices = [initial_anchor_index + offset for offset in input_offset_steps]
+        dataset._ensure_dynamic_chunk(seed_input_indices)
+        seed_inputs = torch.from_numpy(dataset._read_dynamic_tensor_from_ring(seed_input_indices)).float()
+        frame_store = {
+            int(time_index): seed_inputs[position].clone()
+            for position, time_index in enumerate(seed_input_indices)
+        }
+        frame_sources = {int(time_index): "real" for time_index in seed_input_indices}
+
+        horizon_labels: list[str] = []
+        channel_mae_history: list[Tensor] = []
+        saved_figure_paths: list[str] = []
+
+        for pass_index in range(int(rollout_passes)):
+            current_anchor_index = initial_anchor_index + pass_index * anchor_stride_steps
+            model_input_indices = [current_anchor_index + offset for offset in input_offset_steps]
+            target_indices = [current_anchor_index + offset for offset in target_offset_steps]
+            if any(index < 0 or index >= total_time_steps for index in (*model_input_indices, *target_indices)):
+                break
+
+            missing_indices = [index for index in model_input_indices if index not in frame_store]
+            if missing_indices:
+                raise ValueError(
+                    "Autoregressive rollout is missing model-input frames at dataset indices "
+                    f"{missing_indices}. Try a smaller rollout_anchor_stride_hours value."
+                )
+
+            model_inputs_norm = torch.stack([frame_store[index] for index in model_input_indices], dim=0)
+            input_sources = [frame_sources[index] for index in model_input_indices]
+
+            dataset._ensure_dynamic_chunk((*model_input_indices, *target_indices))
+            truth_inputs_norm = torch.from_numpy(dataset._read_dynamic_tensor_from_ring(model_input_indices)).float()
+            truth_targets_norm = torch.from_numpy(dataset._read_dynamic_tensor_from_ring(target_indices)).float()
+
+            anchor_time = pd.Timestamp(time_values[current_anchor_index])
+            temb = torch.from_numpy(
+                build_fuxi_time_embeddings(anchor_time, total_steps=1, freq_hours=data_config.lead_time_hours)[0, 0]
+            ).to(runtime.device)
+
+            with torch.no_grad():
+                with _amp_autocast_context(use_amp, runtime.device, amp_dtype):
+                    outputs = model(
+                        model_inputs_norm.unsqueeze(0).to(runtime.device),
+                        temb.unsqueeze(0),
+                        static_features=static_features,
+                    )
+            prediction_norm = outputs["forecast"][0].detach().cpu().float()
+            for target_index, predicted_frame in zip(target_indices, prediction_norm, strict=False):
+                frame_store[int(target_index)] = predicted_frame.clone()
+                frame_sources[int(target_index)] = "pred"
+
+            truth_inputs_denorm = dataset.denormalize_dynamic_tensor(truth_inputs_norm)
+            model_inputs_denorm = dataset.denormalize_dynamic_tensor(model_inputs_norm)
+            truth_targets_denorm = dataset.denormalize_dynamic_tensor(truth_targets_norm)
+            prediction_denorm = dataset.denormalize_dynamic_tensor(prediction_norm)
+            absolute_error = (prediction_denorm - truth_targets_denorm).abs()
+            channel_mae = _rollout_channel_mae(absolute_error, data_config=data_config)
+
+            input_hours_from_initial_anchor = [
+                int((time_index - initial_anchor_index) * dataset_step_hours)
+                for time_index in model_input_indices
+            ]
+
+            for target_step_index, target_index in enumerate(target_indices):
+                target_hour_from_initial_anchor = int((target_index - initial_anchor_index) * dataset_step_hours)
+                target_timestamp = pd.Timestamp(time_values[target_index])
+                horizon_labels.append(
+                    f"{_format_rollout_hour_label(target_hour_from_initial_anchor)}\n"
+                    f"{target_timestamp.strftime('%m-%d %H:%M')}"
+                )
+                channel_mae_history.append(channel_mae[target_step_index].clone())
+                saved_figure_paths.extend(
+                    _save_rollout_step_map_figures(
+                        output_dir=sample_output_dir,
+                        plot_groups=plot_groups,
+                        sample_index=sample_index,
+                        pass_index=pass_index,
+                        target_step_index=target_step_index,
+                        target_hour_from_initial_anchor=target_hour_from_initial_anchor,
+                        target_timestamp=target_timestamp,
+                        input_hours_from_initial_anchor=input_hours_from_initial_anchor,
+                        input_sources=input_sources,
+                        truth_inputs=truth_inputs_denorm,
+                        model_inputs=model_inputs_denorm,
+                        truth_target=truth_targets_denorm[target_step_index],
+                        prediction=prediction_denorm[target_step_index],
+                        absolute_error=absolute_error[target_step_index],
+                    )
+                )
+
+        graph_paths: list[str] = []
+        if channel_mae_history:
+            graph_paths = _save_rollout_error_graphs(
+                output_dir=sample_output_dir,
+                plot_groups=plot_groups,
+                horizon_labels=horizon_labels,
+                channel_mae_history=torch.stack(channel_mae_history, dim=0),
+            )
+
+        sample_reports.append(
+            {
+                "sample_index": sample_index,
+                "sample_output_dir": str(sample_output_dir),
+                "initial_anchor_time": str(pd.Timestamp(time_values[initial_anchor_index])),
+                "rollout_predictions": len(horizon_labels),
+                "saved_map_figures": len(saved_figure_paths),
+                "saved_error_graphs": len(graph_paths),
+            }
+        )
+
+    return {
+        "output_dir": str(output_dir),
+        "rollout_samples": len(sample_reports),
+        "rollout_passes": int(rollout_passes),
+        "rollout_anchor_stride_hours": int(resolved_stride_hours),
+        "samples": sample_reports,
+    }
+
+
 @dataclass(frozen=True)
 class MainTrainingConfig:
     batch_size: int = 1
@@ -529,6 +1064,11 @@ class MainTrainingConfig:
     output_dir: Path = Path("runs/main")
     checkpoint_name: str = "main_last.pt"
     best_checkpoint_name: str = "main_best.pt"
+    resume_checkpoint_path: Path | None = None
+    save_epoch_checkpoint: bool = True
+    save_best_checkpoint: bool = True
+    save_every_train_batches: int | None = None
+    save_every_optimizer_steps: int | None = None
     train_start_time: pd.Timestamp | None = None
     train_end_time: pd.Timestamp | None = None
     val_start_time: pd.Timestamp | None = None
@@ -567,6 +1107,21 @@ class MainTrainingConfig:
             output_dir=resolve_repo_path(data.get("output_dir", "runs/main"), config_path=resolved_config_path),
             checkpoint_name=str(data.get("checkpoint_name", "main_last.pt")),
             best_checkpoint_name=str(data.get("best_checkpoint_name", "main_best.pt")),
+            resume_checkpoint_path=(
+                None
+                if data.get("resume_checkpoint_path") in {None, ""}
+                else resolve_repo_path(data.get("resume_checkpoint_path"), config_path=resolved_config_path)
+            ),
+            save_epoch_checkpoint=bool(data.get("save_epoch_checkpoint", True)),
+            save_best_checkpoint=bool(data.get("save_best_checkpoint", True)),
+            save_every_train_batches=_to_optional_positive_int(
+                data.get("save_every_train_batches"),
+                field_name="train_main.save_every_train_batches",
+            ),
+            save_every_optimizer_steps=_to_optional_positive_int(
+                data.get("save_every_optimizer_steps"),
+                field_name="train_main.save_every_optimizer_steps",
+            ),
             train_start_time=_to_optional_timestamp(data.get("train_start_time")),
             train_end_time=_to_optional_timestamp(data.get("train_end_time")),
             val_start_time=_to_optional_timestamp(data.get("val_start_time")),
@@ -597,6 +1152,11 @@ class IntrinsicTrainingConfig:
     output_dir: Path = Path("runs/intrinsic")
     checkpoint_name: str = "intrinsic_last.pt"
     best_checkpoint_name: str = "intrinsic_best.pt"
+    resume_checkpoint_path: Path | None = None
+    save_epoch_checkpoint: bool = True
+    save_best_checkpoint: bool = True
+    save_every_train_batches: int | None = None
+    save_every_optimizer_steps: int | None = None
     main_checkpoint_path: Path | None = None
     detach_second_block_features: bool = True
     train_start_time: pd.Timestamp | None = None
@@ -637,6 +1197,21 @@ class IntrinsicTrainingConfig:
             output_dir=resolve_repo_path(data.get("output_dir", "runs/intrinsic"), config_path=resolved_config_path),
             checkpoint_name=str(data.get("checkpoint_name", "intrinsic_last.pt")),
             best_checkpoint_name=str(data.get("best_checkpoint_name", "intrinsic_best.pt")),
+            resume_checkpoint_path=(
+                None
+                if data.get("resume_checkpoint_path") in {None, ""}
+                else resolve_repo_path(data.get("resume_checkpoint_path"), config_path=resolved_config_path)
+            ),
+            save_epoch_checkpoint=bool(data.get("save_epoch_checkpoint", True)),
+            save_best_checkpoint=bool(data.get("save_best_checkpoint", True)),
+            save_every_train_batches=_to_optional_positive_int(
+                data.get("save_every_train_batches"),
+                field_name="train_intrinsic.save_every_train_batches",
+            ),
+            save_every_optimizer_steps=_to_optional_positive_int(
+                data.get("save_every_optimizer_steps"),
+                field_name="train_intrinsic.save_every_optimizer_steps",
+            ),
             main_checkpoint_path=checkpoint_path,
             detach_second_block_features=bool(
                 data.get(
@@ -749,60 +1324,80 @@ def _build_split_dataloaders(
     Sampler[Any] | None,
     Sampler[Any] | None,
 ]:
-    train_dataset = ArcoEra5FuXiDataset(
-        replace(
-            data_config,
-            start_time=train_start_time,
-            end_time=train_end_time,
-        )
-    )
-    train_sampler: Sampler[Any] | None = None
-    if runtime.enabled:
-        train_sampler = ContiguousDistributedSampler(
-            train_dataset,
-            num_replicas=runtime.world_size,
-            rank=runtime.rank,
-        )
-    train_loader = build_arco_era5_dataloader(
-        train_dataset,
+    train_loader, train_sampler = _build_eval_dataloader(
+        data_config,
         batch_size=batch_size,
-        shuffle=False,
         num_workers=num_workers,
+        runtime=runtime,
+        start_time=train_start_time,
+        end_time=train_end_time,
         pin_memory=pin_memory,
-        sampler=train_sampler,
     )
 
     if val_start_time is None and val_end_time is None:
         return train_loader, None, train_sampler, None
 
-    val_dataset = ArcoEra5FuXiDataset(
+    val_loader, val_sampler = _build_eval_dataloader(
+        data_config,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        runtime=runtime,
+        start_time=val_start_time,
+        end_time=val_end_time,
+        pin_memory=pin_memory,
+    )
+    return train_loader, val_loader, train_sampler, val_sampler
+
+
+def _build_eval_dataloader(
+    data_config: ArcoEra5FuXiDataConfig,
+    *,
+    batch_size: int,
+    num_workers: int,
+    runtime: DistributedRuntime,
+    start_time: pd.Timestamp | None,
+    end_time: pd.Timestamp | None,
+    pin_memory: bool,
+) -> tuple[DataLoader[dict[str, Any]], Sampler[Any] | None]:
+    dataset = ArcoEra5FuXiDataset(
         replace(
             data_config,
-            start_time=val_start_time,
-            end_time=val_end_time,
+            start_time=start_time,
+            end_time=end_time,
         )
     )
-    val_sampler: Sampler[Any] | None = None
+    if data_config.apply_normalization:
+        if runtime.is_primary:
+            dataset.ensure_normalization_stats()
+        if runtime.enabled:
+            dist.barrier()
+    sampler: Sampler[Any] | None = None
     if runtime.enabled:
-        val_sampler = ContiguousDistributedSampler(
-            val_dataset,
+        sampler = ContiguousDistributedSampler(
+            dataset,
             num_replicas=runtime.world_size,
             rank=runtime.rank,
         )
-    val_loader = build_arco_era5_dataloader(
-        val_dataset,
+    loader = build_arco_era5_dataloader(
+        dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        sampler=val_sampler,
+        sampler=sampler,
     )
-    return train_loader, val_loader, train_sampler, val_sampler
+    return loader, sampler
 
 
 def _save_checkpoint(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, path)
+
+
+def _step_checkpoint_path(output_dir: Path, checkpoint_name: str, optimizer_step: int) -> Path:
+    template = Path(checkpoint_name)
+    suffix = template.suffix or ".pt"
+    return output_dir / f"{template.stem}_step_{optimizer_step:08d}{suffix}"
 
 
 def _load_encoder_checkpoint(encoder: FuXiLowerResEncoder, checkpoint_path: Path) -> None:
@@ -820,6 +1415,42 @@ def _load_encoder_checkpoint(encoder: FuXiLowerResEncoder, checkpoint_path: Path
     else:
         raise ValueError(f"Unsupported checkpoint format at {checkpoint_path}")
     encoder.load_state_dict(state_dict, strict=True)
+
+
+def _load_main_forecast_checkpoint(model: FuXiLowerRes, checkpoint_path: Path) -> dict[str, Any] | None:
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    state_dict: dict[str, Tensor]
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+    elif isinstance(checkpoint, dict) and {
+        "encoder_state_dict",
+        "decoder_state_dict",
+    }.issubset(checkpoint):
+        state_dict = {
+            **{f"encoder.{key}": value for key, value in checkpoint["encoder_state_dict"].items()},
+            **{f"decoder.{key}": value for key, value in checkpoint["decoder_state_dict"].items()},
+        }
+    elif isinstance(checkpoint, dict) and all(isinstance(value, Tensor) for value in checkpoint.values()):
+        state_dict = checkpoint
+    else:
+        raise ValueError(f"Unsupported checkpoint format at {checkpoint_path}")
+    model.load_state_dict(state_dict, strict=True)
+    return checkpoint if isinstance(checkpoint, dict) else None
+
+
+def _load_intrinsic_checkpoint(model: FuXiIntrinsic, checkpoint_path: Path) -> dict[str, Any] | None:
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    state_dict: dict[str, Tensor]
+    if isinstance(checkpoint, dict) and "intrinsic_state_dict" in checkpoint:
+        state_dict = checkpoint["intrinsic_state_dict"]
+    elif isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+    elif isinstance(checkpoint, dict) and all(isinstance(value, Tensor) for value in checkpoint.values()):
+        state_dict = checkpoint
+    else:
+        raise ValueError(f"Unsupported intrinsic checkpoint format at {checkpoint_path}")
+    model.load_state_dict(state_dict, strict=True)
+    return checkpoint if isinstance(checkpoint, dict) else None
 
 
 def _iter_limited(loader: Iterable[dict[str, Any]], max_batches: int | None) -> Iterable[tuple[int, dict[str, Any]]]:
@@ -877,6 +1508,276 @@ def _iter_prefetched_batches(
         batch_index += 1
 
 
+@dataclass(frozen=True)
+class TrainingResumeState:
+    checkpoint_path: Path
+    checkpoint_epoch: int
+    start_epoch: int
+    resume_epoch: int | None
+    resume_batch_index: int
+    replay_start_batch_index: int
+    optimizer_steps: int
+    global_batch_steps: int
+    best_val_loss: float
+    history: list[dict[str, float]]
+
+
+def _checkpoint_history(checkpoint: dict[str, Any] | None) -> list[dict[str, float]]:
+    if checkpoint is None:
+        return []
+    history = checkpoint.get("history")
+    if not isinstance(history, list):
+        return []
+    return [entry for entry in history if isinstance(entry, dict)]
+
+
+def _best_val_loss_from_history(history: list[dict[str, float]]) -> float:
+    best = float("inf")
+    for entry in history:
+        value = entry.get("val_loss")
+        if value is not None:
+            best = min(best, float(value))
+    return best
+
+
+def _last_completed_optimizer_batch_count(
+    total_train_batches: int,
+    processed_batch_count: int,
+    accumulation_steps: int,
+) -> int:
+    last_completed = 0
+    for batch_index in range(processed_batch_count):
+        if _should_optimizer_step(total_train_batches, batch_index, accumulation_steps):
+            last_completed = batch_index + 1
+    return last_completed
+
+
+def _checkpoint_global_batch_steps(
+    checkpoint: dict[str, Any] | None,
+    *,
+    history: list[dict[str, float]],
+    checkpoint_epoch: int,
+    processed_batch_count: int | None,
+) -> int:
+    if checkpoint is not None and checkpoint.get("global_batch_step") is not None:
+        return int(checkpoint["global_batch_step"])
+
+    history_global = 0
+    if history:
+        history_global = int(history[-1].get("global_batch_steps", 0.0))
+    if processed_batch_count is not None and checkpoint_epoch > len(history):
+        return history_global + int(processed_batch_count)
+    return history_global
+
+
+def _build_resume_state(
+    checkpoint: dict[str, Any],
+    *,
+    checkpoint_path: Path,
+    total_train_batches: int,
+    accumulation_steps: int,
+) -> TrainingResumeState:
+    history = _checkpoint_history(checkpoint)
+    checkpoint_epoch = int(checkpoint.get("epoch", 0))
+    processed_batch_count_raw = checkpoint.get("batch_index_within_epoch")
+    processed_batch_count = None if processed_batch_count_raw in {None, ""} else int(processed_batch_count_raw)
+    if processed_batch_count is not None and processed_batch_count < 0:
+        raise ValueError(
+            f"Checkpoint {checkpoint_path} has invalid batch_index_within_epoch={processed_batch_count}"
+        )
+    if processed_batch_count is not None and total_train_batches > 0 and processed_batch_count > total_train_batches:
+        raise ValueError(
+            f"Checkpoint {checkpoint_path} was saved after batch {processed_batch_count}, "
+            f"but the current training run only has {total_train_batches} batches per epoch. "
+            "Keep batch_size/max_train_batches consistent when resuming."
+        )
+
+    optimizer_steps = int(
+        checkpoint.get(
+            "optimizer_step",
+            history[-1].get("optimizer_steps", 0.0) if history else 0.0,
+        )
+    )
+    global_batch_steps = _checkpoint_global_batch_steps(
+        checkpoint,
+        history=history,
+        checkpoint_epoch=checkpoint_epoch,
+        processed_batch_count=processed_batch_count,
+    )
+    history_best_val_loss = _best_val_loss_from_history(history)
+    stored_best_val_loss_raw = checkpoint.get("best_val_loss")
+    if stored_best_val_loss_raw is None:
+        best_val_loss = float(history_best_val_loss)
+    else:
+        best_val_loss = float(stored_best_val_loss_raw)
+        if history_best_val_loss < float("inf"):
+            best_val_loss = min(best_val_loss, float(history_best_val_loss))
+
+    if processed_batch_count is None or total_train_batches <= 0:
+        start_epoch = max(checkpoint_epoch + 1, 1)
+        return TrainingResumeState(
+            checkpoint_path=checkpoint_path,
+            checkpoint_epoch=checkpoint_epoch,
+            start_epoch=start_epoch,
+            resume_epoch=None,
+            resume_batch_index=0,
+            replay_start_batch_index=0,
+            optimizer_steps=optimizer_steps,
+            global_batch_steps=global_batch_steps,
+            best_val_loss=best_val_loss,
+            history=history,
+        )
+
+    if processed_batch_count >= total_train_batches:
+        start_epoch = max(checkpoint_epoch + 1, 1)
+        return TrainingResumeState(
+            checkpoint_path=checkpoint_path,
+            checkpoint_epoch=checkpoint_epoch,
+            start_epoch=start_epoch,
+            resume_epoch=None,
+            resume_batch_index=0,
+            replay_start_batch_index=0,
+            optimizer_steps=optimizer_steps,
+            global_batch_steps=global_batch_steps,
+            best_val_loss=best_val_loss,
+            history=history,
+        )
+
+    replay_start_batch_index = _last_completed_optimizer_batch_count(
+        total_train_batches,
+        processed_batch_count,
+        accumulation_steps,
+    )
+    return TrainingResumeState(
+        checkpoint_path=checkpoint_path,
+        checkpoint_epoch=max(checkpoint_epoch, 1),
+        start_epoch=max(checkpoint_epoch, 1),
+        resume_epoch=max(checkpoint_epoch, 1),
+        resume_batch_index=processed_batch_count,
+        replay_start_batch_index=replay_start_batch_index,
+        optimizer_steps=optimizer_steps,
+        global_batch_steps=global_batch_steps,
+        best_val_loss=best_val_loss,
+        history=history,
+    )
+
+
+def _validate_resume_compatibility(
+    checkpoint: dict[str, Any] | None,
+    *,
+    checkpoint_path: Path,
+    section_name: str,
+    current_batch_size: int,
+    current_accumulation_steps: int,
+) -> None:
+    if checkpoint is None:
+        return
+    saved_train_config = checkpoint.get("train_config")
+    if not isinstance(saved_train_config, dict):
+        return
+    saved_batch_size = saved_train_config.get("batch_size")
+    if saved_batch_size is not None and int(saved_batch_size) != int(current_batch_size):
+        raise ValueError(
+            f"{section_name} resume checkpoint {checkpoint_path} was created with batch_size={saved_batch_size}, "
+            f"but the current config uses batch_size={current_batch_size}. "
+            "Keep batch_size consistent when resuming."
+        )
+    saved_accumulation = saved_train_config.get("gradient_accumulation_steps")
+    if saved_accumulation is not None and int(saved_accumulation) != int(current_accumulation_steps):
+        raise ValueError(
+            f"{section_name} resume checkpoint {checkpoint_path} was created with "
+            f"gradient_accumulation_steps={saved_accumulation}, but the current config uses "
+            f"gradient_accumulation_steps={current_accumulation_steps}. "
+            "Keep gradient accumulation consistent when resuming."
+        )
+
+
+def _evaluate_main_forecast_model(
+    model: nn.Module,
+    loader: DataLoader[dict[str, Any]],
+    *,
+    criterion: nn.Module,
+    data_config: ArcoEra5FuXiDataConfig,
+    runtime: DistributedRuntime,
+    use_amp: bool,
+    amp_dtype: torch.dtype | None,
+    max_batches: int | None,
+) -> dict[str, Any]:
+    model.eval()
+    val_running_loss = 0.0
+    val_steps = 0
+    variable_group_names = [name for name, _ in _forecast_variable_channel_groups(data_config)]
+    loss_metric_sums = torch.zeros(
+        len(variable_group_names) + 1,
+        device=runtime.device,
+        dtype=torch.float64,
+    )
+    loss_metric_counts = torch.zeros_like(loss_metric_sums)
+    denorm_metric_sums = torch.zeros_like(loss_metric_sums)
+    denorm_metric_counts = torch.zeros_like(loss_metric_sums)
+    dataset_for_metrics = loader.dataset
+    if not hasattr(dataset_for_metrics, "denormalize_dynamic_tensor"):
+        raise TypeError(
+            "Expected the evaluation loader dataset to expose denormalize_dynamic_tensor(...) "
+            "for denormalized forecast metrics."
+        )
+
+    with torch.no_grad():
+        for _batch_index, batch in _iter_prefetched_batches(
+            loader,
+            runtime=runtime,
+            max_batches=max_batches,
+        ):
+            with _amp_autocast_context(use_amp, runtime.device, amp_dtype):
+                outputs = model(
+                    batch["x"],
+                    batch["temb"],
+                    static_features=batch["static_features"],
+                )
+                loss = criterion(outputs["forecast"], batch["target"])
+            val_running_loss += float(loss.item())
+            val_steps += 1
+
+            batch_loss_sums, batch_loss_counts = _main_validation_loss_terms(
+                outputs["forecast"],
+                batch["target"],
+                criterion=criterion,
+                data_config=data_config,
+            )
+            batch_denorm_sums, batch_denorm_counts = _main_validation_denormalized_mae(
+                outputs["forecast"],
+                batch["target"],
+                dataset=dataset_for_metrics,
+                data_config=data_config,
+            )
+            loss_metric_sums += batch_loss_sums
+            loss_metric_counts += batch_loss_counts
+            denorm_metric_sums += batch_denorm_sums
+            denorm_metric_counts += batch_denorm_counts
+
+    val_loss_sum, global_val_steps = _reduced_sum_and_count(val_running_loss, val_steps, runtime)
+    _reduce_tensor_in_place(loss_metric_sums, runtime)
+    _reduce_tensor_in_place(loss_metric_counts, runtime)
+    _reduce_tensor_in_place(denorm_metric_sums, runtime)
+    _reduce_tensor_in_place(denorm_metric_counts, runtime)
+
+    loss_means = loss_metric_sums / loss_metric_counts.clamp_min(1.0)
+    denorm_means = denorm_metric_sums / denorm_metric_counts.clamp_min(1.0)
+    return {
+        "loss": val_loss_sum / max(global_val_steps, 1),
+        "variable_losses": {
+            variable_name: float(loss_means[group_index].item())
+            for group_index, variable_name in enumerate(variable_group_names, start=1)
+        },
+        "denorm_mae": float(denorm_means[0].item()),
+        "variable_denorm_mae": {
+            variable_name: float(denorm_means[group_index].item())
+            for group_index, variable_name in enumerate(variable_group_names, start=1)
+        },
+        "batches": global_val_steps,
+    }
+
+
 def _accumulation_divisor(total_batches: int, batch_index: int, accumulation_steps: int) -> int:
     if total_batches <= 0:
         return accumulation_steps
@@ -900,10 +1801,17 @@ def train_main_model(
     config_path: str | Path = DEFAULT_MODEL_CONFIG_PATH,
     *,
     smoke_only: bool = False,
+    resume_checkpoint_path: str | Path | None = None,
 ) -> dict[str, Any]:
     train_config, model_config, data_config, runtime, _model_dtype, amp_dtype = _build_main_training_objects(config_path)
     try:
         model = FuXiLowerRes(model_config).to(runtime.device)
+        resolved_resume_checkpoint_path = (
+            train_config.resume_checkpoint_path
+            if resume_checkpoint_path is None
+            else resolve_repo_path(resume_checkpoint_path, config_path=train_config.config_path)
+        )
+        resume_checkpoint: dict[str, Any] | None = None
         smoke_report: dict[str, Any] | None = None
 
         if runtime.is_primary:
@@ -926,6 +1834,10 @@ def train_main_model(
             )
         if smoke_only:
             return {"smoke_only": True, "smoke_report": smoke_report}
+        if resolved_resume_checkpoint_path is not None:
+            if not resolved_resume_checkpoint_path.exists():
+                raise FileNotFoundError(f"Resume checkpoint not found at {resolved_resume_checkpoint_path}")
+            resume_checkpoint = _load_main_forecast_checkpoint(model, resolved_resume_checkpoint_path)
 
         model = _wrap_for_distributed_training(model, runtime)
         pin_memory = runtime.device.type == "cuda"
@@ -945,8 +1857,22 @@ def train_main_model(
         scaler = _build_grad_scaler(train_config.use_amp, runtime.device)
         criterion = _build_main_forecast_criterion(train_config, data_config).to(runtime.device)
 
-        best_val_loss = float("inf")
-        history: list[dict[str, float]] = []
+        if resume_checkpoint is not None:
+            _validate_resume_compatibility(
+                resume_checkpoint,
+                checkpoint_path=resolved_resume_checkpoint_path,
+                section_name="train_main",
+                current_batch_size=train_config.batch_size,
+                current_accumulation_steps=train_config.gradient_accumulation_steps,
+            )
+            if "optimizer_state_dict" not in resume_checkpoint:
+                raise ValueError(
+                    f"Resume checkpoint {resolved_resume_checkpoint_path} does not contain optimizer_state_dict."
+                )
+            optimizer.load_state_dict(resume_checkpoint["optimizer_state_dict"])
+            if "scaler_state_dict" in resume_checkpoint and scaler.is_enabled():
+                scaler.load_state_dict(resume_checkpoint["scaler_state_dict"])
+
         output_dir = train_config.output_dir
         if runtime.is_primary:
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -965,8 +1891,36 @@ def train_main_model(
 
         total_train_batches = _limited_length(train_loader, train_config.max_train_batches)
         total_val_batches = 0 if val_loader is None else _limited_length(val_loader, train_config.max_val_batches)
+        resume_state = (
+            None
+            if resume_checkpoint is None
+            else _build_resume_state(
+                resume_checkpoint,
+                checkpoint_path=resolved_resume_checkpoint_path,
+                total_train_batches=total_train_batches,
+                accumulation_steps=train_config.gradient_accumulation_steps,
+            )
+        )
+        history: list[dict[str, float]] = [] if resume_state is None else list(resume_state.history)
+        best_val_loss = float("inf") if resume_state is None else resume_state.best_val_loss
+        optimizer_steps = 0 if resume_state is None else resume_state.optimizer_steps
+        global_batch_steps = 0 if resume_state is None else resume_state.global_batch_steps
+        start_epoch = 1 if resume_state is None else resume_state.start_epoch
+        if resume_state is not None:
+            _print_if_primary(
+                runtime,
+                f"[main] resuming from {resume_state.checkpoint_path} "
+                f"checkpoint_epoch={resume_state.checkpoint_epoch} start_epoch={resume_state.start_epoch} "
+                f"resume_batch={resume_state.resume_batch_index} optimizer_steps={resume_state.optimizer_steps} "
+                f"global_batch_steps={resume_state.global_batch_steps}",
+            )
+            if start_epoch > train_config.max_epochs:
+                raise ValueError(
+                    f"Resume checkpoint {resume_state.checkpoint_path} would continue at epoch {start_epoch}, "
+                    f"but train_main.max_epochs={train_config.max_epochs}. Increase max_epochs to continue training."
+                )
 
-        for epoch in range(1, train_config.max_epochs + 1):
+        for epoch in range(start_epoch, train_config.max_epochs + 1):
             if train_sampler is not None:
                 train_sampler.set_epoch(epoch)
             if val_sampler is not None:
@@ -976,17 +1930,79 @@ def train_main_model(
             optimizer.zero_grad(set_to_none=True)
             running_loss = 0.0
             train_steps = 0
+            resume_batch_index = (
+                0
+                if resume_state is None or resume_state.resume_epoch != epoch
+                else resume_state.resume_batch_index
+            )
+            replay_start_batch_index = (
+                0
+                if resume_state is None or resume_state.resume_epoch != epoch
+                else resume_state.replay_start_batch_index
+            )
+            if resume_batch_index > 0:
+                replay_from = replay_start_batch_index + 1
+                replay_to = resume_batch_index
+                if replay_start_batch_index < resume_batch_index:
+                    _print_if_primary(
+                        runtime,
+                        f"[main][epoch {epoch}] rebuilding accumulated gradients from batches "
+                        f"{replay_from}-{replay_to} before resuming at batch {resume_batch_index + 1}",
+                    )
+                else:
+                    _print_if_primary(
+                        runtime,
+                        f"[main][epoch {epoch}] skipping directly to batch {resume_batch_index + 1}",
+                    )
 
             for batch_index, batch in _iter_prefetched_batches(
                 train_loader,
                 runtime=runtime,
                 max_batches=train_config.max_train_batches,
             ):
+                if batch_index < resume_batch_index:
+                    if batch_index < replay_start_batch_index:
+                        continue
+                    should_step = _should_optimizer_step(
+                        total_train_batches,
+                        batch_index,
+                        train_config.gradient_accumulation_steps,
+                    )
+                    if should_step:
+                        raise RuntimeError(
+                            "Resume replay encountered an optimizer-step batch. "
+                            "This indicates the checkpoint resume window was computed incorrectly."
+                        )
+                    loss_divisor = float(
+                        _accumulation_divisor(
+                            total_train_batches,
+                            batch_index,
+                            train_config.gradient_accumulation_steps,
+                        )
+                    )
+                    sync_context = nullcontext()
+                    if runtime.enabled and isinstance(model, DistributedDataParallel):
+                        sync_context = model.no_sync()
+                    with sync_context:
+                        with _amp_autocast_context(train_config.use_amp, runtime.device, amp_dtype):
+                            outputs = model(
+                                batch["x"],
+                                batch["temb"],
+                                static_features=batch["static_features"],
+                            )
+                            scaled_loss = criterion(outputs["forecast"], batch["target"]) / loss_divisor
+                        if scaler.is_enabled():
+                            scaler.scale(scaled_loss).backward()
+                        else:
+                            scaled_loss.backward()
+                    continue
+
                 should_step = _should_optimizer_step(
                     total_train_batches,
                     batch_index,
                     train_config.gradient_accumulation_steps,
                 )
+                global_batch_steps += 1
                 loss_divisor = float(
                     _accumulation_divisor(
                         total_train_batches,
@@ -1028,6 +2044,74 @@ def train_main_model(
                     else:
                         optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
+                    optimizer_steps += 1
+
+                    if (
+                        runtime.is_primary
+                        and train_config.save_every_optimizer_steps is not None
+                        and int(optimizer_steps) % train_config.save_every_optimizer_steps == 0
+                    ):
+                        base_model = _unwrap_model(model)
+                        step_checkpoint_payload = {
+                            "epoch": epoch,
+                            "optimizer_step": int(optimizer_steps),
+                            "batch_index_within_epoch": batch_index + 1,
+                            "model_state_dict": base_model.state_dict(),
+                            "encoder_state_dict": base_model.encoder.state_dict(),
+                            "decoder_state_dict": base_model.decoder.state_dict(),
+                            "optimizer_state_dict": optimizer.state_dict(),
+                            "scaler_state_dict": scaler.state_dict(),
+                            "history": history,
+                            "best_val_loss": best_val_loss,
+                            "train_config": _to_plain_data(asdict(train_config)),
+                            "model_config": _to_plain_data(asdict(model_config)),
+                            "data_config": _to_plain_data(asdict(data_config)),
+                            "distributed_runtime": {
+                                "enabled": runtime.enabled,
+                                "backend": runtime.backend,
+                                "world_size": runtime.world_size,
+                            },
+                            "effective_batch_size": effective_batch_size,
+                            "gradient_accumulation_steps": train_config.gradient_accumulation_steps,
+                        }
+                        _save_checkpoint(
+                            _step_checkpoint_path(output_dir, train_config.checkpoint_name, int(optimizer_steps)),
+                            step_checkpoint_payload,
+                        )
+
+                if (
+                    runtime.is_primary
+                    and train_config.save_every_train_batches is not None
+                    and int(global_batch_steps) % train_config.save_every_train_batches == 0
+                ):
+                    base_model = _unwrap_model(model)
+                    batch_checkpoint_payload = {
+                        "epoch": epoch,
+                        "global_batch_step": int(global_batch_steps),
+                        "optimizer_step": int(optimizer_steps),
+                        "batch_index_within_epoch": batch_index + 1,
+                        "model_state_dict": base_model.state_dict(),
+                        "encoder_state_dict": base_model.encoder.state_dict(),
+                        "decoder_state_dict": base_model.decoder.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "scaler_state_dict": scaler.state_dict(),
+                        "history": history,
+                        "best_val_loss": best_val_loss,
+                        "train_config": _to_plain_data(asdict(train_config)),
+                        "model_config": _to_plain_data(asdict(model_config)),
+                        "data_config": _to_plain_data(asdict(data_config)),
+                        "distributed_runtime": {
+                            "enabled": runtime.enabled,
+                            "backend": runtime.backend,
+                            "world_size": runtime.world_size,
+                        },
+                        "effective_batch_size": effective_batch_size,
+                        "gradient_accumulation_steps": train_config.gradient_accumulation_steps,
+                    }
+                    _save_checkpoint(
+                        _step_checkpoint_path(output_dir, train_config.checkpoint_name, int(global_batch_steps)),
+                        batch_checkpoint_payload,
+                    )
 
                 running_loss += float(loss.item())
                 train_steps += 1
@@ -1041,49 +2125,75 @@ def train_main_model(
             train_loss_sum, global_train_steps = _reduced_sum_and_count(running_loss, train_steps, runtime)
             train_loss = train_loss_sum / max(global_train_steps, 1)
             val_loss: float | None = None
+            val_denorm_mae: float | None = None
+            val_variable_losses: dict[str, float] | None = None
+            val_variable_mae: dict[str, float] | None = None
 
             if val_loader is not None:
-                model.eval()
-                val_running_loss = 0.0
-                val_steps = 0
-                with torch.no_grad():
-                    for _batch_index, batch in _iter_prefetched_batches(
-                        val_loader,
-                        runtime=runtime,
-                        max_batches=train_config.max_val_batches,
-                    ):
-                        with _amp_autocast_context(train_config.use_amp, runtime.device, amp_dtype):
-                            outputs = model(
-                                batch["x"],
-                                batch["temb"],
-                                static_features=batch["static_features"],
-                            )
-                            loss = criterion(outputs["forecast"], batch["target"])
-                        val_running_loss += float(loss.item())
-                        val_steps += 1
+                validation_result = _evaluate_main_forecast_model(
+                    model,
+                    val_loader,
+                    criterion=criterion,
+                    data_config=data_config,
+                    runtime=runtime,
+                    use_amp=train_config.use_amp,
+                    amp_dtype=amp_dtype,
+                    max_batches=train_config.max_val_batches,
+                )
+                val_loss = validation_result["loss"]
+                val_denorm_mae = validation_result["denorm_mae"]
+                val_variable_losses = validation_result["variable_losses"]
+                val_variable_mae = validation_result["variable_denorm_mae"]
 
-                val_loss_sum, global_val_steps = _reduced_sum_and_count(val_running_loss, val_steps, runtime)
-                val_loss = val_loss_sum / max(global_val_steps, 1)
-
-            epoch_record = {"epoch": float(epoch), "train_loss": train_loss}
+            epoch_record = {
+                "epoch": float(epoch),
+                "train_loss": train_loss,
+                "optimizer_steps": float(optimizer_steps),
+                "global_batch_steps": float(global_batch_steps),
+            }
             if val_loss is not None:
                 epoch_record["val_loss"] = val_loss
+            if val_denorm_mae is not None:
+                epoch_record["val_denorm_mae"] = val_denorm_mae
             history.append(epoch_record)
             _print_if_primary(
                 runtime,
                 f"[main][epoch {epoch}] train_loss={train_loss:.6f}"
                 + (f" val_loss={val_loss:.6f}" if val_loss is not None else ""),
             )
+            if runtime.is_primary and val_denorm_mae is not None and val_variable_mae is not None:
+                if val_variable_losses is not None:
+                    _print_json_block(
+                        f"main_validation_loss_epoch_{epoch}",
+                        {
+                            "overall": val_loss,
+                            **val_variable_losses,
+                        },
+                    )
+                _print_json_block(
+                    f"main_validation_denorm_mae_epoch_{epoch}",
+                    {
+                        "overall": val_denorm_mae,
+                        **val_variable_mae,
+                    },
+                )
 
-            if runtime.is_primary:
+            if runtime.is_primary and train_config.save_epoch_checkpoint:
                 base_model = _unwrap_model(model)
+                checkpoint_best_val_loss = (
+                    min(best_val_loss, float(val_loss)) if val_loss is not None else best_val_loss
+                )
                 checkpoint_payload = {
                     "epoch": epoch,
+                    "global_batch_step": int(global_batch_steps),
+                    "optimizer_step": int(optimizer_steps),
                     "model_state_dict": base_model.state_dict(),
                     "encoder_state_dict": base_model.encoder.state_dict(),
                     "decoder_state_dict": base_model.decoder.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
+                    "scaler_state_dict": scaler.state_dict(),
                     "history": history,
+                    "best_val_loss": checkpoint_best_val_loss,
                     "train_config": _to_plain_data(asdict(train_config)),
                     "model_config": _to_plain_data(asdict(model_config)),
                     "data_config": _to_plain_data(asdict(data_config)),
@@ -1097,8 +2207,8 @@ def train_main_model(
                 }
                 _save_checkpoint(output_dir / train_config.checkpoint_name, checkpoint_payload)
 
-                if val_loss is not None and val_loss < best_val_loss:
-                    best_val_loss = val_loss
+                if train_config.save_best_checkpoint and val_loss is not None and val_loss < best_val_loss:
+                    best_val_loss = checkpoint_best_val_loss
                     _save_checkpoint(output_dir / train_config.best_checkpoint_name, checkpoint_payload)
 
         result = {
@@ -1106,10 +2216,13 @@ def train_main_model(
             "history": history,
             "checkpoint_path": str(output_dir / train_config.checkpoint_name),
             "best_checkpoint_path": str(output_dir / train_config.best_checkpoint_name),
+            "resumed_from_checkpoint": None if resume_state is None else str(resume_state.checkpoint_path),
             "distributed": runtime.enabled,
             "world_size": runtime.world_size,
             "effective_batch_size": effective_batch_size,
             "gradient_accumulation_steps": train_config.gradient_accumulation_steps,
+            "optimizer_steps": int(history[-1]["optimizer_steps"]) if history else 0,
+            "global_batch_steps": int(history[-1]["global_batch_steps"]) if history else 0,
             "train_batches": total_train_batches,
             "val_batches": total_val_batches,
         }
@@ -1120,10 +2233,193 @@ def train_main_model(
         _cleanup_distributed_runtime(runtime)
 
 
+def validate_main_model(
+    config_path: str | Path = DEFAULT_MODEL_CONFIG_PATH,
+    *,
+    checkpoint_path: str | Path | None = None,
+    split: str = "val",
+    batch_size: int | None = None,
+    num_workers: int | None = None,
+    max_batches: int | None = None,
+    start_time: str | pd.Timestamp | None = None,
+    end_time: str | pd.Timestamp | None = None,
+    print_model_summary: bool = False,
+    save_rollout_plots: bool = False,
+    rollout_output_dir: str | Path | None = None,
+    rollout_samples: int = 1,
+    rollout_passes: int = 3,
+    rollout_anchor_stride_hours: int | None = None,
+) -> dict[str, Any]:
+    train_config, model_config, data_config, runtime, _model_dtype, amp_dtype = _build_main_training_objects(config_path)
+    try:
+        normalized_split = split.strip().lower()
+        if normalized_split not in {"train", "val"}:
+            raise ValueError(f"split must be 'train' or 'val', got {split!r}")
+
+        if checkpoint_path is None:
+            resolved_checkpoint_path = train_config.output_dir / train_config.checkpoint_name
+        else:
+            resolved_checkpoint_path = resolve_repo_path(checkpoint_path, config_path=train_config.config_path)
+        if not resolved_checkpoint_path.exists():
+            raise FileNotFoundError(f"Main-model checkpoint not found at {resolved_checkpoint_path}")
+
+        resolved_batch_size = int(train_config.batch_size if batch_size is None else batch_size)
+        resolved_num_workers = int(train_config.num_workers if num_workers is None else num_workers)
+        resolved_max_batches = (
+            (train_config.max_val_batches if normalized_split == "val" else train_config.max_train_batches)
+            if max_batches is None
+            else int(max_batches)
+        )
+        resolved_start_time = _to_optional_timestamp(
+            start_time
+            if start_time is not None
+            else (train_config.val_start_time if normalized_split == "val" else train_config.train_start_time)
+        )
+        resolved_end_time = _to_optional_timestamp(
+            end_time
+            if end_time is not None
+            else (train_config.val_end_time if normalized_split == "val" else train_config.train_end_time)
+        )
+        if resolved_start_time is None and resolved_end_time is None:
+            raise ValueError(
+                f"No {normalized_split} evaluation window is configured. "
+                "Set train_main/train_start_time and train_end_time or pass --start-time/--end-time."
+            )
+
+        model = FuXiLowerRes(model_config).to(runtime.device)
+        if print_model_summary and runtime.is_primary:
+            summary_inputs = _make_main_random_inputs(
+                model_config,
+                batch_size=train_config.random_smoke_batch_size,
+                device=runtime.device,
+            )
+            _print_model_and_summary(
+                "Forecast Model",
+                model,
+                input_data=summary_inputs,
+                depth=train_config.summary_depth,
+                print_summary=True,
+            )
+        checkpoint_metadata = _load_main_forecast_checkpoint(model, resolved_checkpoint_path)
+
+        pin_memory = runtime.device.type == "cuda"
+        eval_loader, eval_sampler = _build_eval_dataloader(
+            data_config,
+            batch_size=resolved_batch_size,
+            num_workers=resolved_num_workers,
+            runtime=runtime,
+            start_time=resolved_start_time,
+            end_time=resolved_end_time,
+            pin_memory=pin_memory,
+        )
+        if eval_sampler is not None:
+            eval_sampler.set_epoch(0)
+
+        criterion = _build_main_forecast_criterion(train_config, data_config).to(runtime.device)
+        evaluation = _evaluate_main_forecast_model(
+            model,
+            eval_loader,
+            criterion=criterion,
+            data_config=data_config,
+            runtime=runtime,
+            use_amp=train_config.use_amp,
+            amp_dtype=amp_dtype,
+            max_batches=resolved_max_batches,
+        )
+        rollout_report: dict[str, Any] | None = None
+        if save_rollout_plots:
+            if not runtime.is_primary:
+                rollout_report = {
+                    "output_dir": None,
+                    "rollout_samples": 0,
+                    "rollout_passes": int(rollout_passes),
+                    "rollout_anchor_stride_hours": _resolve_rollout_anchor_stride_hours(
+                        data_config,
+                        rollout_anchor_stride_hours,
+                    ),
+                    "samples": [],
+                }
+            else:
+                resolved_rollout_output_dir = resolve_repo_path(
+                    rollout_output_dir or (train_config.output_dir / "validation_rollouts"),
+                    config_path=train_config.config_path,
+                )
+                dataset_for_rollout = eval_loader.dataset
+                if not isinstance(dataset_for_rollout, ArcoEra5FuXiDataset):
+                    raise TypeError(
+                        "Expected the validation loader to wrap ArcoEra5FuXiDataset for rollout plotting."
+                    )
+                rollout_report = _save_main_rollout_plots(
+                    model,
+                    dataset_for_rollout,
+                    data_config=data_config,
+                    runtime=runtime,
+                    use_amp=train_config.use_amp,
+                    amp_dtype=amp_dtype,
+                    output_dir=resolved_rollout_output_dir,
+                    rollout_samples=rollout_samples,
+                    rollout_passes=rollout_passes,
+                    rollout_anchor_stride_hours=rollout_anchor_stride_hours,
+                )
+
+        result = {
+            "checkpoint_path": str(resolved_checkpoint_path),
+            "checkpoint_epoch": None if checkpoint_metadata is None else checkpoint_metadata.get("epoch"),
+            "checkpoint_optimizer_step": (
+                None if checkpoint_metadata is None else checkpoint_metadata.get("optimizer_step")
+            ),
+            "checkpoint_global_batch_step": (
+                None if checkpoint_metadata is None else checkpoint_metadata.get("global_batch_step")
+            ),
+            "split": normalized_split,
+            "start_time": resolved_start_time,
+            "end_time": resolved_end_time,
+            "batch_size": resolved_batch_size,
+            "num_workers": resolved_num_workers,
+            "max_batches": resolved_max_batches,
+            "evaluated_batches": evaluation["batches"],
+            "loss": evaluation["loss"],
+            "variable_losses": evaluation["variable_losses"],
+            "denorm_mae": evaluation["denorm_mae"],
+            "variable_denorm_mae": evaluation["variable_denorm_mae"],
+            "distributed": runtime.enabled,
+            "world_size": runtime.world_size,
+        }
+        if rollout_report is not None:
+            result["rollout_plots"] = rollout_report
+        if runtime.is_primary:
+            _print_if_primary(
+                runtime,
+                f"[main][validate] split={normalized_split} loss={evaluation['loss']:.6f} "
+                f"denorm_mae={evaluation['denorm_mae']:.6f}",
+            )
+            _print_json_block(
+                "main_validation_loss",
+                {
+                    "overall": evaluation["loss"],
+                    **evaluation["variable_losses"],
+                },
+            )
+            _print_json_block(
+                "main_validation_denorm_mae",
+                {
+                    "overall": evaluation["denorm_mae"],
+                    **evaluation["variable_denorm_mae"],
+                },
+            )
+            if rollout_report is not None:
+                _print_json_block("main_validation_rollout_plots", rollout_report)
+            _print_json_block("main_validation_result", result)
+        return result
+    finally:
+        _cleanup_distributed_runtime(runtime)
+
+
 def train_intrinsic_model(
     config_path: str | Path = DEFAULT_MODEL_CONFIG_PATH,
     *,
     smoke_only: bool = False,
+    resume_checkpoint_path: str | Path | None = None,
 ) -> dict[str, Any]:
     (
         train_config,
@@ -1146,6 +2442,12 @@ def train_intrinsic_model(
         encoder.requires_grad_(False)
 
         intrinsic_model = FuXiIntrinsic(intrinsic_config).to(runtime.device)
+        resolved_resume_checkpoint_path = (
+            train_config.resume_checkpoint_path
+            if resume_checkpoint_path is None
+            else resolve_repo_path(resume_checkpoint_path, config_path=train_config.config_path)
+        )
+        resume_checkpoint: dict[str, Any] | None = None
         smoke_report: dict[str, Any] | None = None
 
         if runtime.is_primary:
@@ -1183,6 +2485,10 @@ def train_intrinsic_model(
             )
         if smoke_only:
             return {"smoke_only": True, "smoke_report": smoke_report}
+        if resolved_resume_checkpoint_path is not None:
+            if not resolved_resume_checkpoint_path.exists():
+                raise FileNotFoundError(f"Resume checkpoint not found at {resolved_resume_checkpoint_path}")
+            resume_checkpoint = _load_intrinsic_checkpoint(intrinsic_model, resolved_resume_checkpoint_path)
 
         intrinsic_model = _wrap_for_distributed_training(intrinsic_model, runtime)
         pin_memory = runtime.device.type == "cuda"
@@ -1206,8 +2512,22 @@ def train_intrinsic_model(
         scaler = _build_grad_scaler(train_config.use_amp, runtime.device)
         criterion = nn.MSELoss()
 
-        best_val_loss = float("inf")
-        history: list[dict[str, float]] = []
+        if resume_checkpoint is not None:
+            _validate_resume_compatibility(
+                resume_checkpoint,
+                checkpoint_path=resolved_resume_checkpoint_path,
+                section_name="train_intrinsic",
+                current_batch_size=train_config.batch_size,
+                current_accumulation_steps=train_config.gradient_accumulation_steps,
+            )
+            if "optimizer_state_dict" not in resume_checkpoint:
+                raise ValueError(
+                    f"Resume checkpoint {resolved_resume_checkpoint_path} does not contain optimizer_state_dict."
+                )
+            optimizer.load_state_dict(resume_checkpoint["optimizer_state_dict"])
+            if "scaler_state_dict" in resume_checkpoint and scaler.is_enabled():
+                scaler.load_state_dict(resume_checkpoint["scaler_state_dict"])
+
         output_dir = train_config.output_dir
         if runtime.is_primary:
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -1226,8 +2546,36 @@ def train_intrinsic_model(
 
         total_train_batches = _limited_length(train_loader, train_config.max_train_batches)
         total_val_batches = 0 if val_loader is None else _limited_length(val_loader, train_config.max_val_batches)
+        resume_state = (
+            None
+            if resume_checkpoint is None
+            else _build_resume_state(
+                resume_checkpoint,
+                checkpoint_path=resolved_resume_checkpoint_path,
+                total_train_batches=total_train_batches,
+                accumulation_steps=train_config.gradient_accumulation_steps,
+            )
+        )
+        history: list[dict[str, float]] = [] if resume_state is None else list(resume_state.history)
+        best_val_loss = float("inf") if resume_state is None else resume_state.best_val_loss
+        optimizer_steps = 0 if resume_state is None else resume_state.optimizer_steps
+        global_batch_steps = 0 if resume_state is None else resume_state.global_batch_steps
+        start_epoch = 1 if resume_state is None else resume_state.start_epoch
+        if resume_state is not None:
+            _print_if_primary(
+                runtime,
+                f"[intrinsic] resuming from {resume_state.checkpoint_path} "
+                f"checkpoint_epoch={resume_state.checkpoint_epoch} start_epoch={resume_state.start_epoch} "
+                f"resume_batch={resume_state.resume_batch_index} optimizer_steps={resume_state.optimizer_steps} "
+                f"global_batch_steps={resume_state.global_batch_steps}",
+            )
+            if start_epoch > train_config.max_epochs:
+                raise ValueError(
+                    f"Resume checkpoint {resume_state.checkpoint_path} would continue at epoch {start_epoch}, "
+                    f"but train_intrinsic.max_epochs={train_config.max_epochs}. Increase max_epochs to continue training."
+                )
 
-        for epoch in range(1, train_config.max_epochs + 1):
+        for epoch in range(start_epoch, train_config.max_epochs + 1):
             if train_sampler is not None:
                 train_sampler.set_epoch(epoch)
             if val_sampler is not None:
@@ -1237,17 +2585,85 @@ def train_intrinsic_model(
             optimizer.zero_grad(set_to_none=True)
             running_loss = 0.0
             train_steps = 0
+            resume_batch_index = (
+                0
+                if resume_state is None or resume_state.resume_epoch != epoch
+                else resume_state.resume_batch_index
+            )
+            replay_start_batch_index = (
+                0
+                if resume_state is None or resume_state.resume_epoch != epoch
+                else resume_state.replay_start_batch_index
+            )
+            if resume_batch_index > 0:
+                replay_from = replay_start_batch_index + 1
+                replay_to = resume_batch_index
+                if replay_start_batch_index < resume_batch_index:
+                    _print_if_primary(
+                        runtime,
+                        f"[intrinsic][epoch {epoch}] rebuilding accumulated gradients from batches "
+                        f"{replay_from}-{replay_to} before resuming at batch {resume_batch_index + 1}",
+                    )
+                else:
+                    _print_if_primary(
+                        runtime,
+                        f"[intrinsic][epoch {epoch}] skipping directly to batch {resume_batch_index + 1}",
+                    )
 
             for batch_index, batch in _iter_prefetched_batches(
                 train_loader,
                 runtime=runtime,
                 max_batches=train_config.max_train_batches,
             ):
+                if batch_index < resume_batch_index:
+                    if batch_index < replay_start_batch_index:
+                        continue
+                    should_step = _should_optimizer_step(
+                        total_train_batches,
+                        batch_index,
+                        train_config.gradient_accumulation_steps,
+                    )
+                    if should_step:
+                        raise RuntimeError(
+                            "Resume replay encountered an optimizer-step batch. "
+                            "This indicates the checkpoint resume window was computed incorrectly."
+                        )
+                    loss_divisor = float(
+                        _accumulation_divisor(
+                            total_train_batches,
+                            batch_index,
+                            train_config.gradient_accumulation_steps,
+                        )
+                    )
+                    sync_context = nullcontext()
+                    if runtime.enabled and isinstance(intrinsic_model, DistributedDataParallel):
+                        sync_context = intrinsic_model.no_sync()
+                    with torch.no_grad():
+                        encoded = encoder(batch["x"], batch["temb"], static_features=batch["static_features"])
+                        second_block_features = (
+                            encoded.second_block_features.detach()
+                            if train_config.detach_second_block_features
+                            else encoded.second_block_features
+                        )
+                    with sync_context:
+                        with _amp_autocast_context(train_config.use_amp, runtime.device, amp_dtype):
+                            outputs = intrinsic_model(second_block_features)
+                            scaled_loss = criterion(
+                                outputs["second_block_features_recon"],
+                                second_block_features,
+                            ) / loss_divisor
+                        if scaler.is_enabled():
+                            scaler.scale(scaled_loss).backward()
+                        else:
+                            scaled_loss.backward()
+                    continue
+
                 should_step = _should_optimizer_step(
                     total_train_batches,
                     batch_index,
                     train_config.gradient_accumulation_steps,
                 )
+                global_batch_steps += 1
                 loss_divisor = float(
                     _accumulation_divisor(
                         total_train_batches,
@@ -1296,6 +2712,72 @@ def train_intrinsic_model(
                     else:
                         optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
+                    optimizer_steps += 1
+
+                    if (
+                        runtime.is_primary
+                        and train_config.save_every_optimizer_steps is not None
+                        and int(optimizer_steps) % train_config.save_every_optimizer_steps == 0
+                    ):
+                        step_checkpoint_payload = {
+                            "epoch": epoch,
+                            "optimizer_step": int(optimizer_steps),
+                            "batch_index_within_epoch": batch_index + 1,
+                            "intrinsic_state_dict": _unwrap_model(intrinsic_model).state_dict(),
+                            "optimizer_state_dict": optimizer.state_dict(),
+                            "scaler_state_dict": scaler.state_dict(),
+                            "history": history,
+                            "best_val_loss": best_val_loss,
+                            "train_config": _to_plain_data(asdict(train_config)),
+                            "encoder_config": _to_plain_data(asdict(encoder_config)),
+                            "intrinsic_config": _to_plain_data(asdict(intrinsic_config)),
+                            "data_config": _to_plain_data(asdict(data_config)),
+                            "main_checkpoint_path": str(train_config.main_checkpoint_path) if train_config.main_checkpoint_path else None,
+                            "distributed_runtime": {
+                                "enabled": runtime.enabled,
+                                "backend": runtime.backend,
+                                "world_size": runtime.world_size,
+                            },
+                            "effective_batch_size": effective_batch_size,
+                            "gradient_accumulation_steps": train_config.gradient_accumulation_steps,
+                        }
+                        _save_checkpoint(
+                            _step_checkpoint_path(output_dir, train_config.checkpoint_name, int(optimizer_steps)),
+                            step_checkpoint_payload,
+                        )
+
+                if (
+                    runtime.is_primary
+                    and train_config.save_every_train_batches is not None
+                    and int(global_batch_steps) % train_config.save_every_train_batches == 0
+                ):
+                    batch_checkpoint_payload = {
+                        "epoch": epoch,
+                        "global_batch_step": int(global_batch_steps),
+                        "optimizer_step": int(optimizer_steps),
+                        "batch_index_within_epoch": batch_index + 1,
+                        "intrinsic_state_dict": _unwrap_model(intrinsic_model).state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "scaler_state_dict": scaler.state_dict(),
+                        "history": history,
+                        "best_val_loss": best_val_loss,
+                        "train_config": _to_plain_data(asdict(train_config)),
+                        "encoder_config": _to_plain_data(asdict(encoder_config)),
+                        "intrinsic_config": _to_plain_data(asdict(intrinsic_config)),
+                        "data_config": _to_plain_data(asdict(data_config)),
+                        "main_checkpoint_path": str(train_config.main_checkpoint_path) if train_config.main_checkpoint_path else None,
+                        "distributed_runtime": {
+                            "enabled": runtime.enabled,
+                            "backend": runtime.backend,
+                            "world_size": runtime.world_size,
+                        },
+                        "effective_batch_size": effective_batch_size,
+                        "gradient_accumulation_steps": train_config.gradient_accumulation_steps,
+                    }
+                    _save_checkpoint(
+                        _step_checkpoint_path(output_dir, train_config.checkpoint_name, int(global_batch_steps)),
+                        batch_checkpoint_payload,
+                    )
 
                 running_loss += float(loss.item())
                 train_steps += 1
@@ -1338,7 +2820,12 @@ def train_intrinsic_model(
                 val_loss_sum, global_val_steps = _reduced_sum_and_count(val_running_loss, val_steps, runtime)
                 val_loss = val_loss_sum / max(global_val_steps, 1)
 
-            epoch_record = {"epoch": float(epoch), "train_loss": train_loss}
+            epoch_record = {
+                "epoch": float(epoch),
+                "train_loss": train_loss,
+                "optimizer_steps": float(optimizer_steps),
+                "global_batch_steps": float(global_batch_steps),
+            }
             if val_loss is not None:
                 epoch_record["val_loss"] = val_loss
             history.append(epoch_record)
@@ -1348,12 +2835,19 @@ def train_intrinsic_model(
                 + (f" val_loss={val_loss:.6f}" if val_loss is not None else ""),
             )
 
-            if runtime.is_primary:
+            if runtime.is_primary and train_config.save_epoch_checkpoint:
+                checkpoint_best_val_loss = (
+                    min(best_val_loss, float(val_loss)) if val_loss is not None else best_val_loss
+                )
                 checkpoint_payload = {
                     "epoch": epoch,
+                    "global_batch_step": int(global_batch_steps),
+                    "optimizer_step": int(optimizer_steps),
                     "intrinsic_state_dict": _unwrap_model(intrinsic_model).state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
+                    "scaler_state_dict": scaler.state_dict(),
                     "history": history,
+                    "best_val_loss": checkpoint_best_val_loss,
                     "train_config": _to_plain_data(asdict(train_config)),
                     "encoder_config": _to_plain_data(asdict(encoder_config)),
                     "intrinsic_config": _to_plain_data(asdict(intrinsic_config)),
@@ -1369,8 +2863,8 @@ def train_intrinsic_model(
                 }
                 _save_checkpoint(output_dir / train_config.checkpoint_name, checkpoint_payload)
 
-                if val_loss is not None and val_loss < best_val_loss:
-                    best_val_loss = val_loss
+                if train_config.save_best_checkpoint and val_loss is not None and val_loss < best_val_loss:
+                    best_val_loss = checkpoint_best_val_loss
                     _save_checkpoint(output_dir / train_config.best_checkpoint_name, checkpoint_payload)
 
         result = {
@@ -1378,10 +2872,13 @@ def train_intrinsic_model(
             "history": history,
             "checkpoint_path": str(output_dir / train_config.checkpoint_name),
             "best_checkpoint_path": str(output_dir / train_config.best_checkpoint_name),
+            "resumed_from_checkpoint": None if resume_state is None else str(resume_state.checkpoint_path),
             "distributed": runtime.enabled,
             "world_size": runtime.world_size,
             "effective_batch_size": effective_batch_size,
             "gradient_accumulation_steps": train_config.gradient_accumulation_steps,
+            "optimizer_steps": int(history[-1]["optimizer_steps"]) if history else 0,
+            "global_batch_steps": int(history[-1]["global_batch_steps"]) if history else 0,
             "train_batches": total_train_batches,
             "val_batches": total_val_batches,
         }

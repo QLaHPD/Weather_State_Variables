@@ -25,12 +25,21 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run model print/summary and a random forward pass without loading remote data or training.",
     )
+    parser.add_argument(
+        "--resume-checkpoint",
+        default=None,
+        help="Optional checkpoint path to resume intrinsic-model training from.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    train_intrinsic_model(args.config, smoke_only=args.smoke_only)
+    train_intrinsic_model(
+        args.config,
+        smoke_only=args.smoke_only,
+        resume_checkpoint_path=args.resume_checkpoint,
+    )
 
 
 if __name__ == "__main__":

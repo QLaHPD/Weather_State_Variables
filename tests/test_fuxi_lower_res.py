@@ -90,12 +90,18 @@ class TestFuXiLowerRes(unittest.TestCase):
         temb = torch.randn(2, 12)
         static_features = torch.randn(2, 2, 2, 17, 32)
 
-        encoded = model.encode(x, temb, static_features=static_features)
+        encoded = model.encode(
+            x,
+            temb,
+            static_features=static_features,
+            return_patch_grid_features=True,
+        )
         forecast = model.decode(encoded)
         next_forecast = model.predict_next(x, temb, static_features=static_features)
         future_forecast = model.predict_future(x, temb, static_features=static_features)
 
         self.assertIsInstance(encoded, FuXiEncoderOutput)
+        self.assertEqual(encoded.patch_grid_features.shape, (2, 16, 4, 8))
         self.assertEqual(encoded.second_block_features.shape, (2, 16, 2, 4))
         self.assertFalse(hasattr(encoded, "skip"))
         self.assertFalse(hasattr(encoded, "temb_emb"))
@@ -127,9 +133,15 @@ class TestFuXiLowerRes(unittest.TestCase):
         temb = torch.randn(2, 12)
         static_features = torch.randn(2, 2, 2, 17, 32)
 
-        encoded = model.encode(x, temb, static_features=static_features)
+        encoded = model.encode(
+            x,
+            temb,
+            static_features=static_features,
+            return_patch_grid_features=True,
+        )
         outputs = model(x, temb, static_features=static_features)
 
+        self.assertEqual(encoded.patch_grid_features.shape, (2, 16, 4, 8))
         self.assertEqual(encoded.second_block_features.shape, (2, 16, 2, 4))
         self.assertEqual(set(outputs.keys()), {"forecast", "second_block_features"})
         self.assertEqual(outputs["second_block_features"].shape, (2, 16, 2, 4))
@@ -167,29 +179,40 @@ class TestFuXiIntrinsic(unittest.TestCase):
         model = FuXiIntrinsic()
         summary = model.summary()
 
-        self.assertEqual(summary["feature_channels"], 768)
-        self.assertEqual(summary["spatial_size"], [23, 45])
+        self.assertEqual(summary["feature_channels"], 1024)
+        self.assertEqual(summary["spatial_size"], [45, 90])
+        self.assertEqual(summary["first_downsampled_size"], [23, 45])
+        self.assertEqual(summary["bottleneck_spatial_size"], [12, 23])
         self.assertEqual(summary["d_intrinsic"], 16)
+        self.assertEqual(summary["transformer_type"], "standard_encoder")
+        self.assertFalse(summary["uses_windowed_attention"])
         self.assertEqual(summary["parameter_device"], "meta")
 
     def test_tiny_config_runs_forward(self) -> None:
         config = FuXiIntrinsicConfig(
             feature_channels=16,
-            spatial_size=(2, 4),
+            spatial_size=(8, 16),
             d_intrinsic=3,
-            hidden_dims=(24, 12),
+            depths=(1, 1),
+            num_heads=4,
+            num_groups=8,
+            mlp_hidden_dim=32,
             apply_tanh=True,
             device="cpu",
             dtype=torch.float32,
         )
         model = FuXiIntrinsic(config)
-        second_block_features = torch.randn(2, 16, 2, 4)
+        patch_grid_features = torch.randn(2, 16, 8, 16)
 
-        outputs = model(second_block_features)
+        outputs = model(patch_grid_features)
 
-        self.assertEqual(set(outputs.keys()), {"z_intrinsic", "second_block_features_recon"})
+        self.assertEqual(
+            set(outputs.keys()),
+            {"z_intrinsic", "patch_grid_features_recon", "second_block_features_recon"},
+        )
         self.assertEqual(outputs["z_intrinsic"].shape, (2, 3))
-        self.assertEqual(outputs["second_block_features_recon"].shape, (2, 16, 2, 4))
+        self.assertEqual(outputs["patch_grid_features_recon"].shape, (2, 16, 8, 16))
+        self.assertEqual(outputs["second_block_features_recon"].shape, (2, 16, 8, 16))
         self.assertTrue(torch.all(outputs["z_intrinsic"] <= 1.0))
         self.assertTrue(torch.all(outputs["z_intrinsic"] >= -1.0))
 

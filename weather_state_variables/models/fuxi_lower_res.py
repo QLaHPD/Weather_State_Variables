@@ -382,6 +382,7 @@ class FuXiLowerResConfig:
 class FuXiEncoderOutput:
     second_block_features: Tensor
     output_size: tuple[int, int]
+    patch_grid_features: Tensor | None = None
 
 
 class FuXiLowerResEncoder(nn.Module):
@@ -527,6 +528,8 @@ class FuXiLowerResEncoder(nn.Module):
         x: Tensor,
         temb: Tensor,
         static_features: Tensor | None = None,
+        *,
+        return_patch_grid_features: bool = False,
     ) -> FuXiEncoderOutput:
         self._validate_input(x, temb)
 
@@ -537,7 +540,8 @@ class FuXiLowerResEncoder(nn.Module):
         temb_emb = self.time_embed(temb.to(dtype=self._model_dtype()))
 
         h = self.patch_embed(x_resized.to(dtype=self._model_dtype()), static)
-        h = h.permute(0, 3, 1, 2)
+        patch_grid_features = h.permute(0, 3, 1, 2) if return_patch_grid_features else None
+        h = patch_grid_features if patch_grid_features is not None else h.permute(0, 3, 1, 2)
         h = self.downsample(h)
         h = self.down_resblock(h, temb_emb)
 
@@ -547,6 +551,7 @@ class FuXiLowerResEncoder(nn.Module):
         return FuXiEncoderOutput(
             second_block_features=s1.permute(0, 3, 1, 2),
             output_size=original_size,
+            patch_grid_features=patch_grid_features,
         )
 
     def summary(self) -> dict[str, Any]:
@@ -716,8 +721,15 @@ class FuXiLowerRes(nn.Module):
         x: Tensor,
         temb: Tensor,
         static_features: Tensor | None = None,
+        *,
+        return_patch_grid_features: bool = False,
     ) -> FuXiEncoderOutput:
-        return self.encoder(x, temb, static_features=static_features)
+        return self.encoder(
+            x,
+            temb,
+            static_features=static_features,
+            return_patch_grid_features=return_patch_grid_features,
+        )
 
     def decode(self, encoded: FuXiEncoderOutput) -> Tensor:
         return self.decoder(encoded)

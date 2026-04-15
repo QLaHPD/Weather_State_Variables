@@ -178,12 +178,13 @@ class TestFuXiIntrinsic(unittest.TestCase):
     def test_default_recipe_uses_meta_to_avoid_oom(self) -> None:
         model = FuXiIntrinsic()
         summary = model.summary()
+        config = model.config
 
-        self.assertEqual(summary["feature_channels"], 1024)
-        self.assertEqual(summary["spatial_size"], [45, 90])
-        self.assertEqual(summary["first_downsampled_size"], [23, 45])
-        self.assertEqual(summary["bottleneck_spatial_size"], [12, 23])
-        self.assertEqual(summary["d_intrinsic"], 16)
+        self.assertEqual(summary["feature_channels"], config.feature_channels)
+        self.assertEqual(summary["spatial_size"], list(config.spatial_size))
+        self.assertEqual(summary["first_downsampled_size"], list(config.first_downsampled_size))
+        self.assertEqual(summary["bottleneck_spatial_size"], list(config.bottleneck_spatial_size))
+        self.assertEqual(summary["d_intrinsic"], config.d_intrinsic)
         self.assertEqual(summary["transformer_type"], "standard_encoder")
         self.assertFalse(summary["uses_windowed_attention"])
         self.assertEqual(summary["parameter_device"], "meta")

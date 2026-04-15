@@ -24,7 +24,7 @@ intrinsic_model:
   num_heads: 16
   num_groups: 32
   mlp_hidden_dim: 2048
-  apply_tanh: fakse
+  apply_tanh: false
   device: meta
   dtype: float32
 
@@ -89,22 +89,22 @@ train_main:
 train_intrinsic:
   batch_size: 1
   num_workers: 0
-  gradient_accumulation_steps: 64
-  learning_rate: 1.0e-4
+  gradient_accumulation_steps: 640
+  learning_rate: 5.0e-5
   weight_decay: 0.05
-  max_epochs: 1
+  max_epochs: 20
   device: auto
   model_dtype: float32
   use_amp: true
   amp_dtype: bfloat16
   gradient_clip_norm: null
-  output_dir: runs/intrinsic
+  output_dir: /media/ramdisk/runs/intrinsic
   checkpoint_name: intrinsic_last.pt
   best_checkpoint_name: intrinsic_best.pt
   resume_checkpoint_path: null
   save_epoch_checkpoint: true
-  save_best_checkpoint: false
-  save_every_train_batches: 33333
+  save_best_checkpoint: true
+  save_every_train_batches: null
   save_every_optimizer_steps: null
   main_checkpoint_path: runs/main/main_best.pt
   detach_second_block_features: false

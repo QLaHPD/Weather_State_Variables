@@ -467,6 +467,24 @@ class FuXiLowerResEncoder(nn.Module):
                 f"Expected matching batch sizes, got x batch {x.shape[0]} and temb batch {temb.shape[0]}"
             )
 
+    def _validate_patch_grid_features(self, patch_grid_features: Tensor, temb: Tensor) -> None:
+        expected_shape = (self.config.embed_dim, *self.config.patch_grid)
+        if patch_grid_features.ndim != 4 or tuple(patch_grid_features.shape[1:]) != expected_shape:
+            raise ValueError(
+                "Expected patch_grid_features shaped "
+                f"[B, {self.config.embed_dim}, {self.config.patch_grid[0]}, {self.config.patch_grid[1]}], "
+                f"got {tuple(patch_grid_features.shape)}"
+            )
+        if temb.ndim != 2 or tuple(temb.shape[1:]) != (self.config.temb_dim,):
+            raise ValueError(
+                f"Expected temb shaped [B, {self.config.temb_dim}], got {tuple(temb.shape)}"
+            )
+        if patch_grid_features.shape[0] != temb.shape[0]:
+            raise ValueError(
+                "Expected matching batch sizes for patch_grid_features and temb, got "
+                f"{patch_grid_features.shape[0]} and {temb.shape[0]}"
+            )
+
     def _resize_steps(self, x: Tensor, size: tuple[int, int]) -> Tensor:
         batch, steps, channels, height, width = x.shape
         x = x.reshape(batch * steps, channels, height, width).float()
@@ -523,6 +541,35 @@ class FuXiLowerResEncoder(nn.Module):
         static = self._resize_map(static, target_size)
         return static.unsqueeze(1).expand(-1, self.config.time_steps, -1, -1, -1)
 
+    def encode_from_patch_grid_features(
+        self,
+        patch_grid_features: Tensor,
+        temb: Tensor,
+        *,
+        output_size: tuple[int, int] | None = None,
+    ) -> FuXiEncoderOutput:
+        self._validate_patch_grid_features(patch_grid_features, temb)
+
+        resolved_output_size = (
+            tuple(int(value) for value in self.config.input_size)
+            if output_size is None
+            else tuple(int(value) for value in output_size)
+        )
+        temb_emb = self.time_embed(temb.to(dtype=self._model_dtype()))
+
+        h = patch_grid_features.to(dtype=self._model_dtype())
+        h = self.downsample(h)
+        h = self.down_resblock(h, temb_emb)
+
+        h = h.permute(0, 2, 3, 1)
+        s0 = self.first_pair_layers[0](h)
+        s1 = self.first_pair_layers[1](s0)
+        return FuXiEncoderOutput(
+            second_block_features=s1.permute(0, 3, 1, 2),
+            output_size=resolved_output_size,
+            patch_grid_features=patch_grid_features,
+        )
+
     def forward(
         self,
         x: Tensor,
@@ -537,21 +584,19 @@ class FuXiLowerResEncoder(nn.Module):
         resized_size = self.config.resized_input_size
         x_resized = self._resize_steps(x, resized_size)
         static = self._prepare_static_features(x.shape[0], static_features)
-        temb_emb = self.time_embed(temb.to(dtype=self._model_dtype()))
 
         h = self.patch_embed(x_resized.to(dtype=self._model_dtype()), static)
         patch_grid_features = h.permute(0, 3, 1, 2) if return_patch_grid_features else None
-        h = patch_grid_features if patch_grid_features is not None else h.permute(0, 3, 1, 2)
-        h = self.downsample(h)
-        h = self.down_resblock(h, temb_emb)
-
-        h = h.permute(0, 2, 3, 1)
-        s0 = self.first_pair_layers[0](h)
-        s1 = self.first_pair_layers[1](s0)
-        return FuXiEncoderOutput(
-            second_block_features=s1.permute(0, 3, 1, 2),
+        encoded = self.encode_from_patch_grid_features(
+            patch_grid_features if patch_grid_features is not None else h.permute(0, 3, 1, 2),
+            temb,
             output_size=original_size,
-            patch_grid_features=patch_grid_features,
+        )
+        if return_patch_grid_features:
+            return encoded
+        return FuXiEncoderOutput(
+            second_block_features=encoded.second_block_features,
+            output_size=encoded.output_size,
         )
 
     def summary(self) -> dict[str, Any]:

@@ -260,8 +260,7 @@ class FuXiIntrinsic(nn.Module):
             mlp_hidden_dim=self.config.mlp_hidden_dim,
             **dd,
         )
-        self.bottleneck_norm = nn.LayerNorm(self.config.feature_channels, **dd)
-        self.to_intrinsic = nn.Linear(self.config.feature_channels, self.config.d_intrinsic, **dd)
+        self.to_intrinsic = nn.Linear(self.config.bottleneck_flat_dim, self.config.d_intrinsic, **dd)
         self.from_intrinsic = nn.Linear(self.config.d_intrinsic, self.config.bottleneck_flat_dim, **dd)
 
         self.decoder_stage2 = IntrinsicTransformerStage(
@@ -341,9 +340,8 @@ class FuXiIntrinsic(nn.Module):
         h = self.encoder_stage2(h)
 
         batch_size = h.shape[0]
-        tokens = h.flatten(2).transpose(1, 2)
-        pooled = self.bottleneck_norm(tokens).mean(dim=1)
-        z_intrinsic = self.to_intrinsic(pooled)
+        flat = h.reshape(batch_size, self.config.bottleneck_flat_dim)
+        z_intrinsic = self.to_intrinsic(flat)
         if self.config.apply_tanh:
             z_intrinsic = torch.tanh(z_intrinsic)
         return z_intrinsic
@@ -395,6 +393,8 @@ class FuXiIntrinsic(nn.Module):
             "apply_tanh": self.config.apply_tanh,
             "transformer_type": "standard_encoder",
             "uses_windowed_attention": False,
+            "bottleneck_projection": "flatten_linear",
+            "bottleneck_flat_dim": self.config.bottleneck_flat_dim,
             "input_feature_name": "patch_grid_features",
             "reconstruction_name": "patch_grid_features_recon",
             "parameter_device": str(self.to_intrinsic.weight.device),

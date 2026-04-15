@@ -462,6 +462,40 @@ def _encode_patch_grid_features_for_intrinsic(
     return patch_grid_features.detach() if detach_features else patch_grid_features
 
 
+class _IntrinsicForecastChain(nn.Module):
+    def __init__(self, main_model: FuXiLowerRes, intrinsic_model: FuXiIntrinsic) -> None:
+        super().__init__()
+        self.main_model = main_model
+        self.intrinsic_model = intrinsic_model
+
+    def forward(
+        self,
+        x: Tensor,
+        temb: Tensor,
+        static_features: Tensor | None = None,
+    ) -> dict[str, Tensor]:
+        encoded = self.main_model.encoder(
+            x,
+            temb,
+            static_features=static_features,
+            return_patch_grid_features=True,
+        )
+        patch_grid_features = _require_patch_grid_features(encoded)
+        intrinsic_outputs = self.intrinsic_model(patch_grid_features)
+        reconstructed_encoding = self.main_model.encoder.encode_from_patch_grid_features(
+            intrinsic_outputs["patch_grid_features_recon"],
+            temb,
+            output_size=tuple(int(value) for value in x.shape[-2:]),
+        )
+        forecast = self.main_model.decoder(reconstructed_encoding)
+        return {
+            "forecast": forecast,
+            "z_intrinsic": intrinsic_outputs["z_intrinsic"],
+            "patch_grid_features_recon": intrinsic_outputs["patch_grid_features_recon"],
+            "second_block_features": reconstructed_encoding.second_block_features,
+        }
+
+
 def _latitude_weight_vector(
     height: int,
     *,
@@ -1875,6 +1909,48 @@ def _evaluate_main_forecast_model(
     }
 
 
+def _evaluate_intrinsic_model(
+    main_model: FuXiLowerRes,
+    intrinsic_model: FuXiIntrinsic,
+    loader: DataLoader[dict[str, Any]],
+    *,
+    runtime: DistributedRuntime,
+    use_amp: bool,
+    amp_dtype: torch.dtype | None,
+    max_batches: int | None,
+) -> dict[str, Any]:
+    main_model.eval()
+    intrinsic_model.eval()
+    criterion = nn.MSELoss()
+    val_running_loss = 0.0
+    val_steps = 0
+
+    with torch.no_grad():
+        for _batch_index, batch in _iter_prefetched_batches(
+            loader,
+            runtime=runtime,
+            max_batches=max_batches,
+        ):
+            with _amp_autocast_context(use_amp, runtime.device, amp_dtype):
+                encoded = main_model.encoder(
+                    batch["x"],
+                    batch["temb"],
+                    static_features=batch["static_features"],
+                    return_patch_grid_features=True,
+                )
+                patch_grid_features = _require_patch_grid_features(encoded)
+                outputs = intrinsic_model(patch_grid_features)
+                loss = criterion(outputs["patch_grid_features_recon"], patch_grid_features)
+            val_running_loss += float(loss.item())
+            val_steps += 1
+
+    val_loss_sum, global_val_steps = _reduced_sum_and_count(val_running_loss, val_steps, runtime)
+    return {
+        "loss": val_loss_sum / max(global_val_steps, 1),
+        "batches": global_val_steps,
+    }
+
+
 def _accumulation_divisor(total_batches: int, batch_index: int, accumulation_steps: int) -> int:
     if total_batches <= 0:
         return accumulation_steps
@@ -2524,6 +2600,301 @@ def validate_main_model(
         _cleanup_distributed_runtime(runtime)
 
 
+def validate_intrinsic_model(
+    config_path: str | Path = DEFAULT_MODEL_CONFIG_PATH,
+    *,
+    intrinsic_checkpoint_path: str | Path | None = None,
+    main_checkpoint_path: str | Path | None = None,
+    split: str = "val",
+    batch_size: int | None = None,
+    num_workers: int | None = None,
+    max_batches: int | None = None,
+    start_time: str | pd.Timestamp | None = None,
+    end_time: str | pd.Timestamp | None = None,
+    print_model_summary: bool = False,
+    mode: str = "intrinsic",
+    save_rollout_plots: bool = False,
+    rollout_output_dir: str | Path | None = None,
+    rollout_samples: int = 1,
+    rollout_passes: int = 3,
+    rollout_anchor_stride_hours: int | None = None,
+) -> dict[str, Any]:
+    (
+        train_config,
+        encoder_config,
+        intrinsic_config,
+        data_config,
+        runtime,
+        _model_dtype,
+        amp_dtype,
+    ) = _build_intrinsic_training_objects(config_path)
+    try:
+        normalized_split = split.strip().lower()
+        if normalized_split not in {"train", "val"}:
+            raise ValueError(f"split must be 'train' or 'val', got {split!r}")
+
+        normalized_mode = mode.strip().lower()
+        if normalized_mode not in {"intrinsic", "chain"}:
+            raise ValueError(f"mode must be 'intrinsic' or 'chain', got {mode!r}")
+        if save_rollout_plots and normalized_mode != "chain":
+            raise ValueError("save_rollout_plots is only supported when mode='chain'.")
+
+        if intrinsic_checkpoint_path is None:
+            resolved_intrinsic_checkpoint_path = train_config.output_dir / train_config.checkpoint_name
+        else:
+            resolved_intrinsic_checkpoint_path = resolve_repo_path(
+                intrinsic_checkpoint_path,
+                config_path=train_config.config_path,
+            )
+        if not resolved_intrinsic_checkpoint_path.exists():
+            raise FileNotFoundError(
+                f"Intrinsic-model checkpoint not found at {resolved_intrinsic_checkpoint_path}"
+            )
+
+        resolved_batch_size = int(train_config.batch_size if batch_size is None else batch_size)
+        resolved_num_workers = int(train_config.num_workers if num_workers is None else num_workers)
+        resolved_max_batches = (
+            (train_config.max_val_batches if normalized_split == "val" else train_config.max_train_batches)
+            if max_batches is None
+            else int(max_batches)
+        )
+        resolved_start_time = _to_optional_timestamp(
+            start_time
+            if start_time is not None
+            else (train_config.val_start_time if normalized_split == "val" else train_config.train_start_time)
+        )
+        resolved_end_time = _to_optional_timestamp(
+            end_time
+            if end_time is not None
+            else (train_config.val_end_time if normalized_split == "val" else train_config.train_end_time)
+        )
+        if resolved_start_time is None and resolved_end_time is None:
+            raise ValueError(
+                f"No {normalized_split} evaluation window is configured. "
+                "Set train_intrinsic/train_start_time and train_end_time or pass --start-time/--end-time."
+            )
+
+        intrinsic_model = FuXiIntrinsic(intrinsic_config).to(runtime.device)
+        if print_model_summary and runtime.is_primary:
+            intrinsic_summary_inputs = (
+                _make_intrinsic_random_inputs(
+                    intrinsic_config,
+                    batch_size=train_config.random_smoke_batch_size,
+                    device=runtime.device,
+                ),
+            )
+            _print_model_and_summary(
+                "Intrinsic Model",
+                intrinsic_model,
+                input_data=intrinsic_summary_inputs,
+                depth=train_config.summary_depth,
+                print_summary=True,
+            )
+        intrinsic_checkpoint_metadata = _load_intrinsic_checkpoint(
+            intrinsic_model,
+            resolved_intrinsic_checkpoint_path,
+        )
+
+        intrinsic_checkpoint_main_path = None
+        if intrinsic_checkpoint_metadata is not None:
+            checkpoint_main_path = intrinsic_checkpoint_metadata.get("main_checkpoint_path")
+            if checkpoint_main_path not in {None, ""}:
+                intrinsic_checkpoint_main_path = resolve_repo_path(
+                    checkpoint_main_path,
+                    config_path=train_config.config_path,
+                )
+        if main_checkpoint_path is not None:
+            resolved_main_checkpoint_path = resolve_repo_path(
+                main_checkpoint_path,
+                config_path=train_config.config_path,
+            )
+        elif intrinsic_checkpoint_main_path is not None:
+            resolved_main_checkpoint_path = intrinsic_checkpoint_main_path
+        elif train_config.main_checkpoint_path is not None:
+            resolved_main_checkpoint_path = train_config.main_checkpoint_path
+        else:
+            raise FileNotFoundError(
+                "A main-model checkpoint is required for intrinsic validation. "
+                "Pass --main-checkpoint, set train_intrinsic.main_checkpoint_path, or use an intrinsic "
+                "checkpoint that records main_checkpoint_path."
+            )
+        if not resolved_main_checkpoint_path.exists():
+            raise FileNotFoundError(f"Main-model checkpoint not found at {resolved_main_checkpoint_path}")
+
+        main_model = FuXiLowerRes(encoder_config).to(runtime.device)
+        if print_model_summary and runtime.is_primary:
+            main_summary_inputs = _make_main_random_inputs(
+                encoder_config,
+                batch_size=train_config.random_smoke_batch_size,
+                device=runtime.device,
+            )
+            _print_model_and_summary(
+                "Forecast Model",
+                main_model,
+                input_data=main_summary_inputs,
+                depth=train_config.summary_depth,
+                print_summary=True,
+            )
+        main_checkpoint_metadata = _load_main_forecast_checkpoint(main_model, resolved_main_checkpoint_path)
+
+        pin_memory = runtime.device.type == "cuda"
+        eval_loader, eval_sampler = _build_eval_dataloader(
+            data_config,
+            batch_size=resolved_batch_size,
+            num_workers=resolved_num_workers,
+            runtime=runtime,
+            start_time=resolved_start_time,
+            end_time=resolved_end_time,
+            pin_memory=pin_memory,
+        )
+        if eval_sampler is not None:
+            eval_sampler.set_epoch(0)
+
+        intrinsic_evaluation = _evaluate_intrinsic_model(
+            main_model,
+            intrinsic_model,
+            eval_loader,
+            runtime=runtime,
+            use_amp=train_config.use_amp,
+            amp_dtype=amp_dtype,
+            max_batches=resolved_max_batches,
+        )
+
+        forecast_evaluation: dict[str, Any] | None = None
+        rollout_report: dict[str, Any] | None = None
+        if normalized_mode == "chain":
+            chain_model = _IntrinsicForecastChain(main_model, intrinsic_model)
+            main_train_config = MainTrainingConfig.from_yaml(config_path)
+            criterion = _build_main_forecast_criterion(main_train_config, data_config).to(runtime.device)
+            forecast_evaluation = _evaluate_main_forecast_model(
+                chain_model,
+                eval_loader,
+                criterion=criterion,
+                data_config=data_config,
+                runtime=runtime,
+                use_amp=train_config.use_amp,
+                amp_dtype=amp_dtype,
+                max_batches=resolved_max_batches,
+            )
+            if save_rollout_plots:
+                if not runtime.is_primary:
+                    rollout_report = {
+                        "output_dir": None,
+                        "rollout_samples": 0,
+                        "rollout_passes": int(rollout_passes),
+                        "rollout_anchor_stride_hours": _resolve_rollout_anchor_stride_hours(
+                            data_config,
+                            rollout_anchor_stride_hours,
+                        ),
+                        "samples": [],
+                    }
+                else:
+                    resolved_rollout_output_dir = resolve_repo_path(
+                        rollout_output_dir or (train_config.output_dir / "validation_rollouts_chain"),
+                        config_path=train_config.config_path,
+                    )
+                    dataset_for_rollout = eval_loader.dataset
+                    if not isinstance(dataset_for_rollout, ArcoEra5FuXiDataset):
+                        raise TypeError(
+                            "Expected the validation loader to wrap ArcoEra5FuXiDataset for rollout plotting."
+                        )
+                    rollout_report = _save_main_rollout_plots(
+                        chain_model,
+                        dataset_for_rollout,
+                        data_config=data_config,
+                        runtime=runtime,
+                        use_amp=train_config.use_amp,
+                        amp_dtype=amp_dtype,
+                        output_dir=resolved_rollout_output_dir,
+                        rollout_samples=rollout_samples,
+                        rollout_passes=rollout_passes,
+                        rollout_anchor_stride_hours=rollout_anchor_stride_hours,
+                    )
+
+        result = {
+            "mode": normalized_mode,
+            "intrinsic_checkpoint_path": str(resolved_intrinsic_checkpoint_path),
+            "intrinsic_checkpoint_epoch": (
+                None if intrinsic_checkpoint_metadata is None else intrinsic_checkpoint_metadata.get("epoch")
+            ),
+            "intrinsic_checkpoint_optimizer_step": (
+                None if intrinsic_checkpoint_metadata is None else intrinsic_checkpoint_metadata.get("optimizer_step")
+            ),
+            "intrinsic_checkpoint_global_batch_step": (
+                None if intrinsic_checkpoint_metadata is None else intrinsic_checkpoint_metadata.get("global_batch_step")
+            ),
+            "main_checkpoint_path": str(resolved_main_checkpoint_path),
+            "main_checkpoint_epoch": (
+                None if main_checkpoint_metadata is None else main_checkpoint_metadata.get("epoch")
+            ),
+            "main_checkpoint_optimizer_step": (
+                None if main_checkpoint_metadata is None else main_checkpoint_metadata.get("optimizer_step")
+            ),
+            "main_checkpoint_global_batch_step": (
+                None if main_checkpoint_metadata is None else main_checkpoint_metadata.get("global_batch_step")
+            ),
+            "split": normalized_split,
+            "start_time": resolved_start_time,
+            "end_time": resolved_end_time,
+            "batch_size": resolved_batch_size,
+            "num_workers": resolved_num_workers,
+            "max_batches": resolved_max_batches,
+            "intrinsic_evaluated_batches": intrinsic_evaluation["batches"],
+            "intrinsic_loss": intrinsic_evaluation["loss"],
+            "distributed": runtime.enabled,
+            "world_size": runtime.world_size,
+        }
+        if forecast_evaluation is not None:
+            result.update(
+                {
+                    "forecast_evaluated_batches": forecast_evaluation["batches"],
+                    "forecast_loss": forecast_evaluation["loss"],
+                    "variable_losses": forecast_evaluation["variable_losses"],
+                    "denorm_mae": forecast_evaluation["denorm_mae"],
+                    "variable_denorm_mae": forecast_evaluation["variable_denorm_mae"],
+                }
+            )
+        if rollout_report is not None:
+            result["rollout_plots"] = rollout_report
+
+        if runtime.is_primary:
+            status_message = (
+                f"[intrinsic][validate] mode={normalized_mode} split={normalized_split} "
+                f"intrinsic_loss={intrinsic_evaluation['loss']:.6f}"
+            )
+            if forecast_evaluation is not None:
+                status_message += (
+                    f" forecast_loss={forecast_evaluation['loss']:.6f}"
+                    f" denorm_mae={forecast_evaluation['denorm_mae']:.6f}"
+                )
+            _print_if_primary(runtime, status_message)
+            _print_json_block(
+                "intrinsic_validation_loss",
+                {"reconstruction": intrinsic_evaluation["loss"]},
+            )
+            if forecast_evaluation is not None:
+                _print_json_block(
+                    "intrinsic_chain_validation_loss",
+                    {
+                        "overall": forecast_evaluation["loss"],
+                        **forecast_evaluation["variable_losses"],
+                    },
+                )
+                _print_json_block(
+                    "intrinsic_chain_validation_denorm_mae",
+                    {
+                        "overall": forecast_evaluation["denorm_mae"],
+                        **forecast_evaluation["variable_denorm_mae"],
+                    },
+                )
+            if rollout_report is not None:
+                _print_json_block("intrinsic_chain_validation_rollout_plots", rollout_report)
+            _print_json_block("intrinsic_validation_result", result)
+        return result
+    finally:
+        _cleanup_distributed_runtime(runtime)
+
+
 def train_intrinsic_model(
     config_path: str | Path = DEFAULT_MODEL_CONFIG_PATH,
     *,
@@ -3017,4 +3388,6 @@ __all__ = [
     "run_main_model_smoke_test",
     "train_intrinsic_model",
     "train_main_model",
+    "validate_intrinsic_model",
+    "validate_main_model",
 ]

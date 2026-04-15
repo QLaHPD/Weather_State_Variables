@@ -14,7 +14,7 @@ import torch.distributed as dist
 from torch import Tensor, nn
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel
-from torch.optim import AdamW
+from torch.optim import AdamW, Optimizer
 from torch.utils.data import DataLoader, Sampler
 try:
     from torchinfo import summary as torchinfo_summary
@@ -1669,27 +1669,88 @@ def _validate_resume_compatibility(
     section_name: str,
     current_batch_size: int,
     current_accumulation_steps: int,
-) -> None:
+    resume_state: TrainingResumeState | None,
+) -> list[str]:
+    warnings: list[str] = []
     if checkpoint is None:
-        return
+        return warnings
     saved_train_config = checkpoint.get("train_config")
     if not isinstance(saved_train_config, dict):
-        return
+        return warnings
+    is_mid_epoch_resume = resume_state is not None and resume_state.resume_epoch is not None
     saved_batch_size = saved_train_config.get("batch_size")
     if saved_batch_size is not None and int(saved_batch_size) != int(current_batch_size):
-        raise ValueError(
+        message = (
             f"{section_name} resume checkpoint {checkpoint_path} was created with batch_size={saved_batch_size}, "
-            f"but the current config uses batch_size={current_batch_size}. "
-            "Keep batch_size consistent when resuming."
+            f"but the current config uses batch_size={current_batch_size}."
+        )
+        if is_mid_epoch_resume:
+            raise ValueError(
+                f"{message} Keep batch_size consistent when resuming from a mid-epoch checkpoint."
+            )
+        warnings.append(
+            f"{message} Resuming from an epoch-complete checkpoint is allowed; training will continue "
+            "with the new batch size from the next epoch onward."
         )
     saved_accumulation = saved_train_config.get("gradient_accumulation_steps")
     if saved_accumulation is not None and int(saved_accumulation) != int(current_accumulation_steps):
-        raise ValueError(
+        message = (
             f"{section_name} resume checkpoint {checkpoint_path} was created with "
             f"gradient_accumulation_steps={saved_accumulation}, but the current config uses "
-            f"gradient_accumulation_steps={current_accumulation_steps}. "
-            "Keep gradient accumulation consistent when resuming."
+            f"gradient_accumulation_steps={current_accumulation_steps}."
         )
+        if is_mid_epoch_resume:
+            raise ValueError(
+                f"{message} Keep gradient accumulation consistent when resuming from a mid-epoch checkpoint."
+            )
+        warnings.append(
+            f"{message} Resuming from an epoch-complete checkpoint is allowed; the effective batch size "
+            "changes from the next epoch onward."
+        )
+    return warnings
+
+
+def _apply_optimizer_hyperparameter_overrides(
+    optimizer: Optimizer,
+    *,
+    learning_rate: float,
+    weight_decay: float,
+) -> None:
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = float(learning_rate)
+        param_group["weight_decay"] = float(weight_decay)
+        if "initial_lr" in param_group:
+            param_group["initial_lr"] = float(learning_rate)
+
+
+def _resume_optimizer_override_messages(
+    checkpoint: dict[str, Any] | None,
+    *,
+    learning_rate: float,
+    weight_decay: float,
+    section_name: str,
+) -> list[str]:
+    messages: list[str] = []
+    if checkpoint is None:
+        return messages
+    saved_train_config = checkpoint.get("train_config")
+    if not isinstance(saved_train_config, dict):
+        return messages
+
+    saved_learning_rate = saved_train_config.get("learning_rate")
+    if saved_learning_rate is not None and float(saved_learning_rate) != float(learning_rate):
+        messages.append(
+            f"{section_name} resume is overriding checkpoint learning_rate={saved_learning_rate} "
+            f"with config learning_rate={learning_rate}."
+        )
+
+    saved_weight_decay = saved_train_config.get("weight_decay")
+    if saved_weight_decay is not None and float(saved_weight_decay) != float(weight_decay):
+        messages.append(
+            f"{section_name} resume is overriding checkpoint weight_decay={saved_weight_decay} "
+            f"with config weight_decay={weight_decay}."
+        )
+    return messages
 
 
 def _evaluate_main_forecast_model(
@@ -1857,22 +1918,6 @@ def train_main_model(
         scaler = _build_grad_scaler(train_config.use_amp, runtime.device)
         criterion = _build_main_forecast_criterion(train_config, data_config).to(runtime.device)
 
-        if resume_checkpoint is not None:
-            _validate_resume_compatibility(
-                resume_checkpoint,
-                checkpoint_path=resolved_resume_checkpoint_path,
-                section_name="train_main",
-                current_batch_size=train_config.batch_size,
-                current_accumulation_steps=train_config.gradient_accumulation_steps,
-            )
-            if "optimizer_state_dict" not in resume_checkpoint:
-                raise ValueError(
-                    f"Resume checkpoint {resolved_resume_checkpoint_path} does not contain optimizer_state_dict."
-                )
-            optimizer.load_state_dict(resume_checkpoint["optimizer_state_dict"])
-            if "scaler_state_dict" in resume_checkpoint and scaler.is_enabled():
-                scaler.load_state_dict(resume_checkpoint["scaler_state_dict"])
-
         output_dir = train_config.output_dir
         if runtime.is_primary:
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -1901,6 +1946,34 @@ def train_main_model(
                 accumulation_steps=train_config.gradient_accumulation_steps,
             )
         )
+        if resume_checkpoint is not None:
+            resume_warnings = _validate_resume_compatibility(
+                resume_checkpoint,
+                checkpoint_path=resolved_resume_checkpoint_path,
+                section_name="train_main",
+                current_batch_size=train_config.batch_size,
+                current_accumulation_steps=train_config.gradient_accumulation_steps,
+                resume_state=resume_state,
+            )
+            if "optimizer_state_dict" not in resume_checkpoint:
+                raise ValueError(
+                    f"Resume checkpoint {resolved_resume_checkpoint_path} does not contain optimizer_state_dict."
+                )
+            optimizer.load_state_dict(resume_checkpoint["optimizer_state_dict"])
+            _apply_optimizer_hyperparameter_overrides(
+                optimizer,
+                learning_rate=train_config.learning_rate,
+                weight_decay=train_config.weight_decay,
+            )
+            if "scaler_state_dict" in resume_checkpoint and scaler.is_enabled():
+                scaler.load_state_dict(resume_checkpoint["scaler_state_dict"])
+            for message in resume_warnings + _resume_optimizer_override_messages(
+                resume_checkpoint,
+                learning_rate=train_config.learning_rate,
+                weight_decay=train_config.weight_decay,
+                section_name="train_main",
+            ):
+                _print_if_primary(runtime, f"[main][resume] {message}")
         history: list[dict[str, float]] = [] if resume_state is None else list(resume_state.history)
         best_val_loss = float("inf") if resume_state is None else resume_state.best_val_loss
         optimizer_steps = 0 if resume_state is None else resume_state.optimizer_steps
@@ -2512,22 +2585,6 @@ def train_intrinsic_model(
         scaler = _build_grad_scaler(train_config.use_amp, runtime.device)
         criterion = nn.MSELoss()
 
-        if resume_checkpoint is not None:
-            _validate_resume_compatibility(
-                resume_checkpoint,
-                checkpoint_path=resolved_resume_checkpoint_path,
-                section_name="train_intrinsic",
-                current_batch_size=train_config.batch_size,
-                current_accumulation_steps=train_config.gradient_accumulation_steps,
-            )
-            if "optimizer_state_dict" not in resume_checkpoint:
-                raise ValueError(
-                    f"Resume checkpoint {resolved_resume_checkpoint_path} does not contain optimizer_state_dict."
-                )
-            optimizer.load_state_dict(resume_checkpoint["optimizer_state_dict"])
-            if "scaler_state_dict" in resume_checkpoint and scaler.is_enabled():
-                scaler.load_state_dict(resume_checkpoint["scaler_state_dict"])
-
         output_dir = train_config.output_dir
         if runtime.is_primary:
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -2556,6 +2613,34 @@ def train_intrinsic_model(
                 accumulation_steps=train_config.gradient_accumulation_steps,
             )
         )
+        if resume_checkpoint is not None:
+            resume_warnings = _validate_resume_compatibility(
+                resume_checkpoint,
+                checkpoint_path=resolved_resume_checkpoint_path,
+                section_name="train_intrinsic",
+                current_batch_size=train_config.batch_size,
+                current_accumulation_steps=train_config.gradient_accumulation_steps,
+                resume_state=resume_state,
+            )
+            if "optimizer_state_dict" not in resume_checkpoint:
+                raise ValueError(
+                    f"Resume checkpoint {resolved_resume_checkpoint_path} does not contain optimizer_state_dict."
+                )
+            optimizer.load_state_dict(resume_checkpoint["optimizer_state_dict"])
+            _apply_optimizer_hyperparameter_overrides(
+                optimizer,
+                learning_rate=train_config.learning_rate,
+                weight_decay=train_config.weight_decay,
+            )
+            if "scaler_state_dict" in resume_checkpoint and scaler.is_enabled():
+                scaler.load_state_dict(resume_checkpoint["scaler_state_dict"])
+            for message in resume_warnings + _resume_optimizer_override_messages(
+                resume_checkpoint,
+                learning_rate=train_config.learning_rate,
+                weight_decay=train_config.weight_decay,
+                section_name="train_intrinsic",
+            ):
+                _print_if_primary(runtime, f"[intrinsic][resume] {message}")
         history: list[dict[str, float]] = [] if resume_state is None else list(resume_state.history)
         best_val_loss = float("inf") if resume_state is None else resume_state.best_val_loss
         optimizer_steps = 0 if resume_state is None else resume_state.optimizer_steps

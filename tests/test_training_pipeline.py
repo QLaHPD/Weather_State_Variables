@@ -200,6 +200,78 @@ class TestTrainingSmoke(unittest.TestCase):
 
         self.assertAlmostEqual(state.best_val_loss, 1.25)
 
+    def test_resume_compatibility_allows_epoch_checkpoint_batching_changes(self) -> None:
+        checkpoint = {
+            "epoch": 3,
+            "optimizer_step": 12,
+            "global_batch_step": 96,
+            "train_config": {
+                "batch_size": 8,
+                "gradient_accumulation_steps": 32,
+            },
+        }
+        resume_state = training_pipeline._build_resume_state(
+            checkpoint,
+            checkpoint_path=Path("runs/main/main_best.pt"),
+            total_train_batches=32,
+            accumulation_steps=320,
+        )
+
+        warnings = training_pipeline._validate_resume_compatibility(
+            checkpoint,
+            checkpoint_path=Path("runs/main/main_best.pt"),
+            section_name="train_main",
+            current_batch_size=2,
+            current_accumulation_steps=320,
+            resume_state=resume_state,
+        )
+
+        self.assertEqual(len(warnings), 2)
+        self.assertTrue(any("batch_size" in message for message in warnings))
+        self.assertTrue(any("gradient_accumulation_steps" in message for message in warnings))
+
+    def test_resume_compatibility_rejects_mid_epoch_batching_changes(self) -> None:
+        checkpoint = {
+            "epoch": 3,
+            "batch_index_within_epoch": 20,
+            "optimizer_step": 14,
+            "train_config": {
+                "batch_size": 8,
+                "gradient_accumulation_steps": 32,
+            },
+        }
+        resume_state = training_pipeline._build_resume_state(
+            checkpoint,
+            checkpoint_path=Path("runs/main/main_last_step_00000020.pt"),
+            total_train_batches=50,
+            accumulation_steps=320,
+        )
+
+        with self.assertRaisesRegex(ValueError, "mid-epoch checkpoint"):
+            training_pipeline._validate_resume_compatibility(
+                checkpoint,
+                checkpoint_path=Path("runs/main/main_last_step_00000020.pt"),
+                section_name="train_main",
+                current_batch_size=2,
+                current_accumulation_steps=320,
+                resume_state=resume_state,
+            )
+
+    def test_apply_optimizer_hyperparameter_overrides(self) -> None:
+        parameter = nn.Parameter(torch.tensor(1.0))
+        optimizer = torch.optim.AdamW([parameter], lr=1.0e-4, weight_decay=0.05)
+        checkpoint_optimizer = torch.optim.AdamW([parameter], lr=2.0e-4, weight_decay=0.1)
+        optimizer.load_state_dict(checkpoint_optimizer.state_dict())
+
+        training_pipeline._apply_optimizer_hyperparameter_overrides(
+            optimizer,
+            learning_rate=3.0e-4,
+            weight_decay=0.2,
+        )
+
+        self.assertEqual(optimizer.param_groups[0]["lr"], 3.0e-4)
+        self.assertEqual(optimizer.param_groups[0]["weight_decay"], 0.2)
+
     def test_charbonnier_loss_downweights_surface_channels(self) -> None:
         criterion = LatitudeWeightedCharbonnierLoss(
             build_fuxi_channel_names(),

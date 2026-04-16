@@ -367,7 +367,7 @@ def _make_intrinsic_random_inputs(
     dtype = intrinsic_config.dtype or torch.float32
     return torch.randn(
         batch_size,
-        intrinsic_config.feature_channels,
+        intrinsic_config.resolved_input_channels,
         *intrinsic_config.spatial_size,
         device=device,
         dtype=dtype,
@@ -706,6 +706,16 @@ class ForecastRolloutPlotGroup:
     is_upper_air: bool
 
 
+@dataclass(frozen=True)
+class ForecastRolloutChannelSpec:
+    channel_index: int
+    channel_name: str
+    display_name: str
+    folder_name: str
+    variable_name: str
+    level_label: str
+
+
 def _forecast_variable_display_name(variable_name: str) -> str:
     display_names = {
         "geopotential": "Geopotential",
@@ -751,6 +761,41 @@ def _forecast_rollout_plot_groups(
         )
         channel_index += 1
     return groups
+
+
+def _forecast_rollout_channel_specs(
+    data_config: ArcoEra5FuXiDataConfig,
+) -> list[ForecastRolloutChannelSpec]:
+    specs: list[ForecastRolloutChannelSpec] = []
+    channel_index = 0
+    for variable_name in data_config.upper_air_variables:
+        display_name = _forecast_variable_display_name(variable_name)
+        variable_slug = _rollout_filename_slug(variable_name)
+        for level in data_config.pressure_levels:
+            specs.append(
+                ForecastRolloutChannelSpec(
+                    channel_index=channel_index,
+                    channel_name=data_config.channel_names[channel_index],
+                    display_name=f"{display_name} {int(level)} hPa",
+                    folder_name=f"{variable_slug}_{int(level)}hpa",
+                    variable_name=variable_name,
+                    level_label=f"{int(level)} hPa",
+                )
+            )
+            channel_index += 1
+    for variable_name in data_config.surface_variables:
+        specs.append(
+            ForecastRolloutChannelSpec(
+                channel_index=channel_index,
+                channel_name=data_config.channel_names[channel_index],
+                display_name=_forecast_variable_display_name(variable_name),
+                folder_name=_rollout_filename_slug(variable_name),
+                variable_name=variable_name,
+                level_label="surface",
+            )
+        )
+        channel_index += 1
+    return specs
 
 
 def _rollout_filename_slug(value: str) -> str:
@@ -952,6 +997,205 @@ def _save_rollout_error_graphs(
         saved_paths.append(str(figure_path))
 
     return saved_paths
+
+
+def _save_rollout_prediction_frame_images(
+    *,
+    output_dir: Path,
+    channel_specs: Sequence[ForecastRolloutChannelSpec],
+    prediction: Tensor,
+    horizon_hours: int,
+) -> list[str]:
+    plt = _import_pyplot()
+    if prediction.ndim != 3:
+        raise ValueError(
+            f"Expected denormalized prediction shaped [C, H, W], got {tuple(prediction.shape)}"
+        )
+
+    filename = f"t{int(horizon_hours)}h.png"
+    saved_paths: list[str] = []
+    for spec in channel_specs:
+        channel_dir = output_dir / spec.folder_name
+        channel_dir.mkdir(parents=True, exist_ok=True)
+        image = prediction[spec.channel_index].detach().cpu().numpy()
+        value_min = float(np.nanmin(image))
+        value_max = float(np.nanmax(image))
+        if np.isclose(value_min, value_max):
+            value_max = value_min + 1.0
+        image_path = channel_dir / filename
+        plt.imsave(image_path, image, cmap="viridis", vmin=value_min, vmax=value_max)
+        saved_paths.append(str(image_path))
+    return saved_paths
+
+
+def _should_use_intrinsic_for_rollout_step(
+    *,
+    rollout_step: int,
+    intrinsic_model: nn.Module | None,
+    intrinsic_frequency: int | None,
+) -> bool:
+    if intrinsic_model is None:
+        return False
+    if intrinsic_frequency is None:
+        return True
+    resolved_frequency = int(intrinsic_frequency)
+    if resolved_frequency <= 0:
+        raise ValueError(f"intrinsic_frequency must be positive when set, got {resolved_frequency}")
+    return (int(rollout_step) + 1) % resolved_frequency == 0
+
+
+def _save_main_rollout_channel_frames(
+    main_model: nn.Module,
+    dataset: ArcoEra5FuXiDataset,
+    *,
+    data_config: ArcoEra5FuXiDataConfig,
+    runtime: DistributedRuntime,
+    use_amp: bool,
+    amp_dtype: torch.dtype | None,
+    output_dir: Path,
+    sample_index: int,
+    future_steps: int,
+    intrinsic_model: FuXiIntrinsic | None = None,
+    intrinsic_frequency: int | None = None,
+) -> dict[str, Any]:
+    if sample_index < 0:
+        raise ValueError(f"sample_index must be non-negative, got {sample_index}")
+    if future_steps <= 0:
+        raise ValueError(f"future_steps must be positive, got {future_steps}")
+
+    from ..models.fuxi_short import build_fuxi_time_embeddings
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    channel_specs = _forecast_rollout_channel_specs(data_config)
+    intrinsic_chain_model = (
+        None if intrinsic_model is None else _IntrinsicForecastChain(main_model, intrinsic_model)
+    )
+    if intrinsic_chain_model is not None:
+        intrinsic_chain_model.eval()
+    lead_step_count = dataset._step_count(data_config.lead_time_hours)
+    input_offset_steps = [dataset._step_count(hours) for hours in data_config.input_time_offsets_hours]
+    dataset_step_hours = dataset._dataset_frequency_hours()
+    time_values = dataset._load_time_values()
+    valid_anchor_indices = dataset._build_valid_anchor_indices()
+    if len(valid_anchor_indices) == 0:
+        raise ValueError("The rollout dataset window does not contain any valid forecast anchors.")
+    if sample_index >= len(valid_anchor_indices):
+        raise IndexError(
+            f"sample_index={sample_index} is out of range for {len(valid_anchor_indices)} valid anchors."
+        )
+
+    static_features = dataset._build_static_features().to(runtime.device)
+    sample_output_dir = output_dir / f"sample_{sample_index:05d}"
+    sample_output_dir.mkdir(parents=True, exist_ok=True)
+
+    initial_anchor_index = int(valid_anchor_indices[sample_index])
+    seed_input_indices = [initial_anchor_index + offset for offset in input_offset_steps]
+    dataset._ensure_dynamic_chunk(seed_input_indices)
+    seed_inputs = torch.from_numpy(dataset._read_dynamic_tensor_from_ring(seed_input_indices)).float()
+    frame_store = {
+        int(time_index): seed_inputs[position].clone()
+        for position, time_index in enumerate(seed_input_indices)
+    }
+
+    saved_image_paths: list[str] = []
+    saved_horizons: list[int] = []
+    intrinsic_used_rollout_steps: list[int] = []
+    intrinsic_used_horizon_hours: list[int] = []
+    total_time_steps = len(time_values)
+
+    for rollout_step in range(int(future_steps)):
+        current_anchor_index = initial_anchor_index + rollout_step * lead_step_count
+        model_input_indices = [current_anchor_index + offset for offset in input_offset_steps]
+        target_index = current_anchor_index + lead_step_count
+        if target_index < 0 or target_index >= total_time_steps:
+            break
+
+        missing_indices = [index for index in model_input_indices if index not in frame_store]
+        if missing_indices:
+            raise ValueError(
+                "Autoregressive rollout is missing model-input frames at dataset indices "
+                f"{missing_indices}. This rollout advances one lead-time step at a time."
+            )
+
+        model_inputs_norm = torch.stack([frame_store[index] for index in model_input_indices], dim=0)
+        anchor_time = pd.Timestamp(time_values[current_anchor_index])
+        temb = torch.from_numpy(
+            build_fuxi_time_embeddings(anchor_time, total_steps=1, freq_hours=data_config.lead_time_hours)[0, 0]
+        ).to(runtime.device)
+        use_intrinsic = _should_use_intrinsic_for_rollout_step(
+            rollout_step=rollout_step,
+            intrinsic_model=intrinsic_model,
+            intrinsic_frequency=intrinsic_frequency,
+        )
+        step_model: nn.Module = intrinsic_chain_model if use_intrinsic and intrinsic_chain_model is not None else main_model
+
+        with torch.no_grad():
+            with _amp_autocast_context(use_amp, runtime.device, amp_dtype):
+                outputs = step_model(
+                    model_inputs_norm.unsqueeze(0).to(runtime.device),
+                    temb.unsqueeze(0),
+                    static_features=static_features,
+                )
+        prediction_norm = outputs["forecast"][0, 0].detach().cpu().float()
+        frame_store[int(target_index)] = prediction_norm.clone()
+
+        prediction_denorm = dataset.denormalize_dynamic_tensor(prediction_norm.unsqueeze(0))[0]
+        horizon_hours = int((target_index - initial_anchor_index) * dataset_step_hours)
+        saved_horizons.append(horizon_hours)
+        if use_intrinsic:
+            intrinsic_used_rollout_steps.append(int(rollout_step + 1))
+            intrinsic_used_horizon_hours.append(horizon_hours)
+        saved_image_paths.extend(
+            _save_rollout_prediction_frame_images(
+                output_dir=sample_output_dir,
+                channel_specs=channel_specs,
+                prediction=prediction_denorm,
+                horizon_hours=horizon_hours,
+            )
+        )
+
+    manifest = {
+        "sample_index": sample_index,
+        "initial_anchor_time": str(pd.Timestamp(time_values[initial_anchor_index])),
+        "input_time_offsets_hours": list(data_config.input_time_offsets_hours),
+        "lead_time_hours": int(data_config.lead_time_hours),
+        "future_steps_requested": int(future_steps),
+        "future_steps_generated": len(saved_horizons),
+        "saved_horizon_hours": saved_horizons,
+        "intrinsic_enabled": intrinsic_model is not None,
+        "intrinsic_frequency": None if intrinsic_model is None else int(intrinsic_frequency or 1),
+        "intrinsic_used_rollout_steps": intrinsic_used_rollout_steps,
+        "intrinsic_used_horizon_hours": intrinsic_used_horizon_hours,
+        "channel_folders": [
+            {
+                "channel_index": spec.channel_index,
+                "channel_name": spec.channel_name,
+                "display_name": spec.display_name,
+                "folder_name": spec.folder_name,
+                "level_label": spec.level_label,
+            }
+            for spec in channel_specs
+        ],
+    }
+    manifest_path = sample_output_dir / "rollout_manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+
+    return {
+        "output_dir": str(output_dir),
+        "sample_output_dir": str(sample_output_dir),
+        "sample_index": sample_index,
+        "initial_anchor_time": str(pd.Timestamp(time_values[initial_anchor_index])),
+        "future_steps_requested": int(future_steps),
+        "future_steps_generated": len(saved_horizons),
+        "saved_horizon_hours": saved_horizons,
+        "intrinsic_enabled": intrinsic_model is not None,
+        "intrinsic_frequency": None if intrinsic_model is None else int(intrinsic_frequency or 1),
+        "intrinsic_used_rollout_steps": intrinsic_used_rollout_steps,
+        "intrinsic_used_horizon_hours": intrinsic_used_horizon_hours,
+        "channel_folder_count": len(channel_specs),
+        "saved_images": len(saved_image_paths),
+        "manifest_path": str(manifest_path),
+    }
 
 
 def _save_main_rollout_plots(
@@ -1367,7 +1611,7 @@ def _build_intrinsic_training_objects(
         FuXiIntrinsicConfig.from_yaml(config_path),
         device=runtime.device,
         dtype=model_dtype,
-        feature_channels=encoder_config.embed_dim,
+        input_channels=encoder_config.embed_dim,
         spatial_size=encoder_config.patch_grid,
     )
     data_config = replace(
@@ -2486,6 +2730,7 @@ def validate_main_model(
                 print_summary=True,
             )
         checkpoint_metadata = _load_main_forecast_checkpoint(model, resolved_checkpoint_path)
+        model.eval()
 
         pin_memory = runtime.device.type == "cuda"
         eval_loader, eval_sampler = _build_eval_dataloader(
@@ -2595,6 +2840,207 @@ def validate_main_model(
             if rollout_report is not None:
                 _print_json_block("main_validation_rollout_plots", rollout_report)
             _print_json_block("main_validation_result", result)
+        return result
+    finally:
+        _cleanup_distributed_runtime(runtime)
+
+
+def rollout_main_model(
+    config_path: str | Path = DEFAULT_MODEL_CONFIG_PATH,
+    *,
+    checkpoint_path: str | Path | None = None,
+    intrinsic_checkpoint_path: str | Path | None = None,
+    intrinsic_frequency: int | None = None,
+    split: str = "val",
+    sample_index: int = 0,
+    future_steps: int = 8,
+    start_time: str | pd.Timestamp | None = None,
+    end_time: str | pd.Timestamp | None = None,
+    output_dir: str | Path | None = None,
+    print_model_summary: bool = False,
+) -> dict[str, Any]:
+    train_config, model_config, data_config, runtime, _model_dtype, amp_dtype = _build_main_training_objects(config_path)
+    try:
+        normalized_split = split.strip().lower()
+        if normalized_split not in {"train", "val"}:
+            raise ValueError(f"split must be 'train' or 'val', got {split!r}")
+        if sample_index < 0:
+            raise ValueError(f"sample_index must be non-negative, got {sample_index}")
+        if future_steps <= 0:
+            raise ValueError(f"future_steps must be positive, got {future_steps}")
+        if intrinsic_checkpoint_path is None and intrinsic_frequency is not None:
+            raise ValueError(
+                "intrinsic_frequency was provided, but no intrinsic_checkpoint_path was set. "
+                "Pass an intrinsic checkpoint to enable intrinsic rollout chaining."
+            )
+        if intrinsic_frequency is not None and int(intrinsic_frequency) <= 0:
+            raise ValueError(f"intrinsic_frequency must be positive when set, got {intrinsic_frequency}")
+
+        if checkpoint_path is None:
+            resolved_checkpoint_path = train_config.output_dir / train_config.checkpoint_name
+        else:
+            resolved_checkpoint_path = resolve_repo_path(checkpoint_path, config_path=train_config.config_path)
+        if not resolved_checkpoint_path.exists():
+            raise FileNotFoundError(f"Main-model checkpoint not found at {resolved_checkpoint_path}")
+        resolved_intrinsic_checkpoint_path: Path | None = None
+        if intrinsic_checkpoint_path is not None:
+            resolved_intrinsic_checkpoint_path = resolve_repo_path(
+                intrinsic_checkpoint_path,
+                config_path=train_config.config_path,
+            )
+            if not resolved_intrinsic_checkpoint_path.exists():
+                raise FileNotFoundError(
+                    f"Intrinsic-model checkpoint not found at {resolved_intrinsic_checkpoint_path}"
+                )
+
+        resolved_start_time = _to_optional_timestamp(
+            start_time
+            if start_time is not None
+            else (train_config.val_start_time if normalized_split == "val" else train_config.train_start_time)
+        )
+        resolved_end_time = _to_optional_timestamp(
+            end_time
+            if end_time is not None
+            else (train_config.val_end_time if normalized_split == "val" else train_config.train_end_time)
+        )
+        if resolved_start_time is None and resolved_end_time is None:
+            raise ValueError(
+                f"No {normalized_split} rollout window is configured. "
+                "Set train_main/train_start_time and train_end_time or pass --start-time/--end-time."
+            )
+
+        model = FuXiLowerRes(model_config).to(runtime.device)
+        if print_model_summary and runtime.is_primary:
+            summary_inputs = _make_main_random_inputs(
+                model_config,
+                batch_size=train_config.random_smoke_batch_size,
+                device=runtime.device,
+            )
+            _print_model_and_summary(
+                "Forecast Model",
+                model,
+                input_data=summary_inputs,
+                depth=train_config.summary_depth,
+                print_summary=True,
+            )
+        checkpoint_metadata = _load_main_forecast_checkpoint(model, resolved_checkpoint_path)
+
+        intrinsic_model: FuXiIntrinsic | None = None
+        intrinsic_checkpoint_metadata: dict[str, Any] | None = None
+        if resolved_intrinsic_checkpoint_path is not None:
+            intrinsic_config = replace(
+                FuXiIntrinsicConfig.from_yaml(config_path),
+                device=runtime.device,
+                dtype=model_config.dtype,
+                input_channels=model_config.embed_dim,
+                spatial_size=model_config.patch_grid,
+            )
+            intrinsic_model = FuXiIntrinsic(intrinsic_config).to(runtime.device)
+            if print_model_summary and runtime.is_primary:
+                intrinsic_summary_inputs = (
+                    _make_intrinsic_random_inputs(
+                        intrinsic_config,
+                        batch_size=train_config.random_smoke_batch_size,
+                        device=runtime.device,
+                    ),
+                )
+                _print_model_and_summary(
+                    "Intrinsic Model",
+                    intrinsic_model,
+                    input_data=intrinsic_summary_inputs,
+                    depth=train_config.summary_depth,
+                    print_summary=True,
+                )
+            intrinsic_checkpoint_metadata = _load_intrinsic_checkpoint(
+                intrinsic_model,
+                resolved_intrinsic_checkpoint_path,
+            )
+            intrinsic_model.eval()
+
+        dataset = ArcoEra5FuXiDataset(
+            replace(
+                data_config,
+                start_time=resolved_start_time,
+                end_time=resolved_end_time,
+            )
+        )
+        if data_config.apply_normalization:
+            if runtime.is_primary:
+                dataset.ensure_normalization_stats()
+            if runtime.enabled:
+                dist.barrier()
+
+        rollout_report: dict[str, Any]
+        if not runtime.is_primary:
+            rollout_report = {
+                "output_dir": None,
+                "sample_output_dir": None,
+                "sample_index": int(sample_index),
+                "future_steps_requested": int(future_steps),
+                "future_steps_generated": 0,
+                "saved_horizon_hours": [],
+                "intrinsic_enabled": intrinsic_model is not None,
+                "intrinsic_frequency": None if intrinsic_model is None else int(intrinsic_frequency or 1),
+                "intrinsic_used_rollout_steps": [],
+                "intrinsic_used_horizon_hours": [],
+                "channel_folder_count": 0,
+                "saved_images": 0,
+                "manifest_path": None,
+            }
+        else:
+            resolved_output_dir = resolve_repo_path(
+                output_dir or (train_config.output_dir / "rollout_frames"),
+                config_path=train_config.config_path,
+            )
+            rollout_report = _save_main_rollout_channel_frames(
+                model,
+                dataset,
+                data_config=data_config,
+                runtime=runtime,
+                use_amp=train_config.use_amp,
+                amp_dtype=amp_dtype,
+                output_dir=resolved_output_dir,
+                sample_index=sample_index,
+                future_steps=future_steps,
+                intrinsic_model=intrinsic_model,
+                intrinsic_frequency=intrinsic_frequency,
+            )
+
+        result = {
+            "checkpoint_path": str(resolved_checkpoint_path),
+            "checkpoint_epoch": None if checkpoint_metadata is None else checkpoint_metadata.get("epoch"),
+            "checkpoint_optimizer_step": (
+                None if checkpoint_metadata is None else checkpoint_metadata.get("optimizer_step")
+            ),
+            "checkpoint_global_batch_step": (
+                None if checkpoint_metadata is None else checkpoint_metadata.get("global_batch_step")
+            ),
+            "intrinsic_checkpoint_path": (
+                None if resolved_intrinsic_checkpoint_path is None else str(resolved_intrinsic_checkpoint_path)
+            ),
+            "intrinsic_checkpoint_epoch": (
+                None if intrinsic_checkpoint_metadata is None else intrinsic_checkpoint_metadata.get("epoch")
+            ),
+            "split": normalized_split,
+            "start_time": resolved_start_time,
+            "end_time": resolved_end_time,
+            "sample_index": int(sample_index),
+            "future_steps": int(future_steps),
+            "lead_time_hours": int(data_config.lead_time_hours),
+            "intrinsic_enabled": intrinsic_model is not None,
+            "intrinsic_frequency": None if intrinsic_model is None else int(intrinsic_frequency or 1),
+            "distributed": runtime.enabled,
+            "world_size": runtime.world_size,
+            "rollout": rollout_report,
+        }
+        if runtime.is_primary:
+            _print_if_primary(
+                runtime,
+                f"[main][rollout] split={normalized_split} sample_index={sample_index} "
+                f"future_steps={future_steps} saved_images={rollout_report['saved_images']} "
+                f"intrinsic_enabled={intrinsic_model is not None}",
+            )
+            _print_json_block("main_rollout_result", result)
         return result
     finally:
         _cleanup_distributed_runtime(runtime)
@@ -3384,6 +3830,7 @@ __all__ = [
     "IntrinsicTrainingConfig",
     "LatitudeWeightedCharbonnierLoss",
     "MainTrainingConfig",
+    "rollout_main_model",
     "run_intrinsic_model_smoke_test",
     "run_main_model_smoke_test",
     "train_intrinsic_model",

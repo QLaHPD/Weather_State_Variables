@@ -19,11 +19,9 @@ forecast_model:
 
 intrinsic_model:
   feature_channels: 1024
+  resblocks_per_stage: [1, 1, 1]
   d_intrinsic: 512
-  depths: [4, 4]
-  num_heads: 16
   num_groups: 32
-  mlp_hidden_dim: 2048
   apply_tanh: false
   device: meta
   dtype: float32
@@ -89,7 +87,7 @@ train_main:
 train_intrinsic:
   batch_size: 1
   num_workers: 0
-  gradient_accumulation_steps: 640
+  gradient_accumulation_steps: 16
   learning_rate: 5.0e-5
   weight_decay: 0.05
   max_epochs: 20

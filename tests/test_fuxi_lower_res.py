@@ -180,13 +180,22 @@ class TestFuXiIntrinsic(unittest.TestCase):
         summary = model.summary()
         config = model.config
 
+        self.assertEqual(summary["input_channels"], config.resolved_input_channels)
+        self.assertEqual(summary["output_channels"], config.resolved_input_channels)
         self.assertEqual(summary["feature_channels"], config.feature_channels)
         self.assertEqual(summary["spatial_size"], list(config.spatial_size))
         self.assertEqual(summary["first_downsampled_size"], list(config.first_downsampled_size))
+        self.assertEqual(summary["second_downsampled_size"], list(config.second_downsampled_size))
         self.assertEqual(summary["bottleneck_spatial_size"], list(config.bottleneck_spatial_size))
         self.assertEqual(summary["d_intrinsic"], config.d_intrinsic)
-        self.assertEqual(summary["transformer_type"], "standard_encoder")
+        self.assertEqual(summary["depths"], list(config.stage_depths))
+        self.assertEqual(summary["resblocks_per_stage"], list(config.resblocks_per_stage))
+        self.assertEqual(summary["architecture"], "conv_autoencoder")
+        self.assertEqual(summary["transformer_type"], "none")
+        self.assertFalse(summary["uses_attention"])
         self.assertFalse(summary["uses_windowed_attention"])
+        self.assertFalse(summary["uses_positional_embeddings"])
+        self.assertEqual(summary["downsample_count"], 3)
         self.assertEqual(summary["parameter_device"], "meta")
 
     def test_tiny_config_runs_forward(self) -> None:
@@ -216,6 +225,26 @@ class TestFuXiIntrinsic(unittest.TestCase):
         self.assertEqual(outputs["second_block_features_recon"].shape, (2, 16, 8, 16))
         self.assertTrue(torch.all(outputs["z_intrinsic"] <= 1.0))
         self.assertTrue(torch.all(outputs["z_intrinsic"] >= -1.0))
+
+    def test_tiny_config_supports_distinct_input_and_hidden_channels(self) -> None:
+        config = FuXiIntrinsicConfig(
+            input_channels=24,
+            feature_channels=16,
+            spatial_size=(8, 16),
+            d_intrinsic=3,
+            depths=(1, 1, 1),
+            num_groups=8,
+            apply_tanh=False,
+            device="cpu",
+            dtype=torch.float32,
+        )
+        model = FuXiIntrinsic(config)
+        patch_grid_features = torch.randn(2, 24, 8, 16)
+
+        outputs = model(patch_grid_features)
+
+        self.assertEqual(outputs["z_intrinsic"].shape, (2, 3))
+        self.assertEqual(outputs["patch_grid_features_recon"].shape, (2, 24, 8, 16))
 
 
 if __name__ == "__main__":

@@ -41,75 +41,47 @@ def _conv_transpose_output_padding(
     return tuple(padding)
 
 
-class IntrinsicTransformerStage(nn.Module):
-    """Full-sequence transformer encoder over a fixed spatial grid."""
+class IntrinsicConvStage(nn.Module):
+    """Stack of unconditioned convolutional residual blocks at a fixed spatial grid."""
 
     def __init__(
         self,
         *,
-        dim: int,
-        spatial_size: tuple[int, int],
+        channels: int,
         depth: int,
-        num_heads: int,
-        mlp_hidden_dim: int,
+        num_groups: int,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
-        dd = {"device": device, "dtype": dtype}
         super().__init__()
-        self.dim = int(dim)
-        self.spatial_size = tuple(int(value) for value in spatial_size)
-        self.seq_len = int(self.spatial_size[0] * self.spatial_size[1])
-
-        self.position_embedding = nn.Parameter(torch.zeros(1, self.seq_len, self.dim, **dd))
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=self.dim,
-            nhead=int(num_heads),
-            dim_feedforward=int(mlp_hidden_dim),
-            dropout=0.0,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-            **dd,
+        self.blocks = nn.ModuleList(
+            [
+                ResBlock(
+                    in_channels=channels,
+                    out_channels=channels,
+                    num_groups=num_groups,
+                    device=device,
+                    dtype=dtype,
+                )
+                for _ in range(int(depth))
+            ]
         )
-        self.encoder = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=int(depth),
-            enable_nested_tensor=False,
-        )
-        self.output_norm = nn.LayerNorm(self.dim, **dd)
-
-        if self.position_embedding.device.type != "meta":
-            nn.init.trunc_normal_(self.position_embedding, std=0.02)
 
     def forward(self, x: Tensor) -> Tensor:
-        if x.ndim != 4:
-            raise ValueError(
-                f"Expected transformer stage input shaped [B, C, H, W], got {tuple(x.shape)}"
-            )
-        batch_size, channels, height, width = x.shape
-        if channels != self.dim or (height, width) != self.spatial_size:
-            raise ValueError(
-                "Expected transformer stage input shaped "
-                f"[B, {self.dim}, {self.spatial_size[0]}, {self.spatial_size[1]}], "
-                f"got {tuple(x.shape)}"
-            )
-
-        tokens = x.permute(0, 2, 3, 1).reshape(batch_size, self.seq_len, self.dim)
-        tokens = tokens + self.position_embedding.to(dtype=tokens.dtype)
-        tokens = self.encoder(tokens)
-        tokens = self.output_norm(tokens)
-        return tokens.reshape(batch_size, height, width, channels).permute(0, 3, 1, 2)
+        for block in self.blocks:
+            x = block(x)
+        return x
 
 
 @dataclass(frozen=True)
 class FuXiIntrinsicConfig:
-    """Hierarchical intrinsic autoencoder over the encoder patch-grid feature map."""
+    """All-convolution intrinsic autoencoder over the encoder patch-grid feature map."""
 
+    input_channels: int | None = None
     feature_channels: int = 128
     spatial_size: tuple[int, int] = (45, 90)
     d_intrinsic: int = 16
-    depths: tuple[int, int] = (8, 8)
+    depths: tuple[int, ...] = (8, 8, 8)
     num_heads: int = 16
     num_groups: int = 32
     mlp_hidden_dim: int = 2048
@@ -119,6 +91,8 @@ class FuXiIntrinsicConfig:
     dtype: torch.dtype | None = torch.float16
 
     def __post_init__(self) -> None:
+        if self.input_channels is not None and int(self.input_channels) <= 0:
+            raise ValueError(f"input_channels must be positive when set, got {self.input_channels}")
         if self.feature_channels <= 0:
             raise ValueError(f"feature_channels must be positive, got {self.feature_channels}")
         if len(self.spatial_size) != 2:
@@ -127,21 +101,15 @@ class FuXiIntrinsicConfig:
             raise ValueError(f"spatial_size must be positive, got {self.spatial_size}")
         if self.d_intrinsic <= 0:
             raise ValueError(f"d_intrinsic must be positive, got {self.d_intrinsic}")
-        if len(self.depths) != 2:
-            raise ValueError(f"Expected 2 intrinsic transformer stages, got {self.depths}")
+        if len(self.depths) not in {2, 3}:
+            raise ValueError(
+                "Expected 2 or 3 intrinsic convolution stage depths, "
+                f"got {self.depths}"
+            )
         if any(int(value) <= 0 for value in self.depths):
             raise ValueError(f"Intrinsic stage depths must be positive, got {self.depths}")
-        if self.num_heads <= 0:
-            raise ValueError(f"num_heads must be positive, got {self.num_heads}")
-        if self.feature_channels % self.num_heads != 0:
-            raise ValueError(
-                "feature_channels must be divisible by num_heads, got "
-                f"feature_channels={self.feature_channels}, num_heads={self.num_heads}"
-            )
         if self.num_groups <= 0:
             raise ValueError(f"num_groups must be positive, got {self.num_groups}")
-        if self.mlp_hidden_dim <= 0:
-            raise ValueError(f"mlp_hidden_dim must be positive, got {self.mlp_hidden_dim}")
 
     @classmethod
     def from_yaml(
@@ -151,8 +119,18 @@ class FuXiIntrinsicConfig:
         resolved_config_path, intrinsic_data = load_config_section("intrinsic_model", config_path)
         forecast_config = FuXiLowerResConfig.from_yaml(resolved_config_path)
 
-        default_depths = tuple(int(value) for value in forecast_config.depths[:2])
+        default_depths = tuple(int(value) for value in forecast_config.depths[:3])
+        if not default_depths:
+            default_depths = (8, 8, 8)
+        if len(default_depths) < 3:
+            default_depths = default_depths + (default_depths[-1],) * (3 - len(default_depths))
+
         return cls(
+            input_channels=(
+                None
+                if intrinsic_data.get("input_channels") in {None, ""}
+                else int(intrinsic_data.get("input_channels"))
+            ),
             feature_channels=int(
                 intrinsic_data.get(
                     "feature_channels",
@@ -163,7 +141,12 @@ class FuXiIntrinsicConfig:
                 intrinsic_data.get("spatial_size", list(forecast_config.patch_grid))
             ),
             d_intrinsic=int(intrinsic_data["d_intrinsic"]),
-            depths=_to_int_tuple(intrinsic_data.get("depths", list(default_depths))),
+            depths=_to_int_tuple(
+                intrinsic_data.get(
+                    "resblocks_per_stage",
+                    intrinsic_data.get("depths", list(default_depths)),
+                )
+            ),
             num_heads=int(intrinsic_data.get("num_heads", forecast_config.num_heads)),
             num_groups=int(intrinsic_data.get("num_groups", forecast_config.num_groups)),
             mlp_hidden_dim=int(
@@ -178,17 +161,43 @@ class FuXiIntrinsicConfig:
         )
 
     @property
+    def stage_depths(self) -> tuple[int, int, int]:
+        if len(self.depths) == 3:
+            return tuple(int(value) for value in self.depths)
+        first_depth, second_depth = (int(value) for value in self.depths)
+        return (first_depth, second_depth, second_depth)
+
+    @property
+    def resblocks_per_stage(self) -> tuple[int, int, int]:
+        return self.stage_depths
+
+    @property
+    def resolved_input_channels(self) -> int:
+        return self.feature_channels if self.input_channels is None else int(self.input_channels)
+
+    @property
     def first_downsampled_size(self) -> tuple[int, int]:
         return _stride2_same_shape(self.spatial_size)
 
     @property
-    def bottleneck_spatial_size(self) -> tuple[int, int]:
+    def second_downsampled_size(self) -> tuple[int, int]:
         return _stride2_same_shape(self.first_downsampled_size)
+
+    @property
+    def bottleneck_spatial_size(self) -> tuple[int, int]:
+        return _stride2_same_shape(self.second_downsampled_size)
+
+    @property
+    def decoder_stage3_output_padding(self) -> tuple[int, int]:
+        return _conv_transpose_output_padding(
+            self.bottleneck_spatial_size,
+            self.second_downsampled_size,
+        )
 
     @property
     def decoder_stage2_output_padding(self) -> tuple[int, int]:
         return _conv_transpose_output_padding(
-            self.bottleneck_spatial_size,
+            self.second_downsampled_size,
             self.first_downsampled_size,
         )
 
@@ -200,21 +209,36 @@ class FuXiIntrinsicConfig:
         )
 
     @property
-    def bottleneck_flat_dim(self) -> int:
-        return (
-            self.feature_channels
-            * self.bottleneck_spatial_size[0]
-            * self.bottleneck_spatial_size[1]
-        )
+    def bottleneck_kernel_size(self) -> tuple[int, int]:
+        return self.bottleneck_spatial_size
 
 
 class FuXiIntrinsic(nn.Module):
-    """Hierarchical intrinsic autoencoder over encoder patch-grid features."""
+    """Three-level convolutional intrinsic autoencoder over encoder patch-grid features."""
 
     def __init__(self, config: FuXiIntrinsicConfig | None = None) -> None:
         super().__init__()
         self.config = config or FuXiIntrinsicConfig.from_yaml()
         dd = {"device": self.config.device, "dtype": self.config.dtype}
+        stage_depths = self.config.stage_depths
+        input_channels = self.config.resolved_input_channels
+
+        if input_channels == self.config.feature_channels:
+            self.input_proj: nn.Module = nn.Identity()
+        else:
+            self.input_proj = nn.Conv2d(
+                input_channels,
+                self.config.feature_channels,
+                kernel_size=1,
+                **dd,
+            )
+
+        self.input_resblock = ResBlock(
+            in_channels=self.config.feature_channels,
+            out_channels=self.config.feature_channels,
+            num_groups=self.config.num_groups,
+            **dd,
+        )
 
         self.downsample1 = nn.Conv2d(
             self.config.feature_channels,
@@ -224,20 +248,13 @@ class FuXiIntrinsic(nn.Module):
             padding=1,
             **dd,
         )
-        self.down_resblock1 = ResBlock(
-            in_channels=self.config.feature_channels,
-            out_channels=self.config.feature_channels,
+        self.encoder_stage1 = IntrinsicConvStage(
+            channels=self.config.feature_channels,
+            depth=stage_depths[0],
             num_groups=self.config.num_groups,
             **dd,
         )
-        self.encoder_stage1 = IntrinsicTransformerStage(
-            dim=self.config.feature_channels,
-            spatial_size=self.config.first_downsampled_size,
-            depth=self.config.depths[0],
-            num_heads=self.config.num_heads,
-            mlp_hidden_dim=self.config.mlp_hidden_dim,
-            **dd,
-        )
+
         self.downsample2 = nn.Conv2d(
             self.config.feature_channels,
             self.config.feature_channels,
@@ -246,29 +263,66 @@ class FuXiIntrinsic(nn.Module):
             padding=1,
             **dd,
         )
-        self.down_resblock2 = ResBlock(
-            in_channels=self.config.feature_channels,
-            out_channels=self.config.feature_channels,
+        self.encoder_stage2 = IntrinsicConvStage(
+            channels=self.config.feature_channels,
+            depth=stage_depths[1],
             num_groups=self.config.num_groups,
             **dd,
         )
-        self.encoder_stage2 = IntrinsicTransformerStage(
-            dim=self.config.feature_channels,
-            spatial_size=self.config.bottleneck_spatial_size,
-            depth=self.config.depths[1],
-            num_heads=self.config.num_heads,
-            mlp_hidden_dim=self.config.mlp_hidden_dim,
+
+        self.downsample3 = nn.Conv2d(
+            self.config.feature_channels,
+            self.config.feature_channels,
+            kernel_size=3,
+            stride=2,
+            padding=1,
             **dd,
         )
-        self.to_intrinsic = nn.Linear(self.config.bottleneck_flat_dim, self.config.d_intrinsic, **dd)
-        self.from_intrinsic = nn.Linear(self.config.d_intrinsic, self.config.bottleneck_flat_dim, **dd)
+        self.encoder_stage3 = IntrinsicConvStage(
+            channels=self.config.feature_channels,
+            depth=stage_depths[2],
+            num_groups=self.config.num_groups,
+            **dd,
+        )
 
-        self.decoder_stage2 = IntrinsicTransformerStage(
-            dim=self.config.feature_channels,
-            spatial_size=self.config.bottleneck_spatial_size,
-            depth=self.config.depths[1],
-            num_heads=self.config.num_heads,
-            mlp_hidden_dim=self.config.mlp_hidden_dim,
+        # Collapse the full bottleneck map to a learned 1x1 intrinsic code without flattening.
+        self.to_intrinsic = nn.Conv2d(
+            self.config.feature_channels,
+            self.config.d_intrinsic,
+            kernel_size=self.config.bottleneck_kernel_size,
+            stride=1,
+            padding=0,
+            **dd,
+        )
+        self.from_intrinsic = nn.ConvTranspose2d(
+            self.config.d_intrinsic,
+            self.config.feature_channels,
+            kernel_size=self.config.bottleneck_kernel_size,
+            stride=1,
+            padding=0,
+            **dd,
+        )
+
+        self.decoder_stage3 = IntrinsicConvStage(
+            channels=self.config.feature_channels,
+            depth=stage_depths[2],
+            num_groups=self.config.num_groups,
+            **dd,
+        )
+        self.upsample3 = nn.ConvTranspose2d(
+            self.config.feature_channels,
+            self.config.feature_channels,
+            kernel_size=3,
+            stride=2,
+            padding=1,
+            output_padding=self.config.decoder_stage3_output_padding,
+            **dd,
+        )
+
+        self.decoder_stage2 = IntrinsicConvStage(
+            channels=self.config.feature_channels,
+            depth=stage_depths[1],
+            num_groups=self.config.num_groups,
             **dd,
         )
         self.upsample2 = nn.ConvTranspose2d(
@@ -280,18 +334,11 @@ class FuXiIntrinsic(nn.Module):
             output_padding=self.config.decoder_stage2_output_padding,
             **dd,
         )
-        self.up_resblock2 = ResBlock(
-            in_channels=self.config.feature_channels,
-            out_channels=self.config.feature_channels,
+
+        self.decoder_stage1 = IntrinsicConvStage(
+            channels=self.config.feature_channels,
+            depth=stage_depths[0],
             num_groups=self.config.num_groups,
-            **dd,
-        )
-        self.decoder_stage1 = IntrinsicTransformerStage(
-            dim=self.config.feature_channels,
-            spatial_size=self.config.first_downsampled_size,
-            depth=self.config.depths[0],
-            num_heads=self.config.num_heads,
-            mlp_hidden_dim=self.config.mlp_hidden_dim,
             **dd,
         )
         self.upsample1 = nn.ConvTranspose2d(
@@ -303,7 +350,8 @@ class FuXiIntrinsic(nn.Module):
             output_padding=self.config.decoder_stage1_output_padding,
             **dd,
         )
-        self.up_resblock1 = ResBlock(
+
+        self.output_resblock = ResBlock(
             in_channels=self.config.feature_channels,
             out_channels=self.config.feature_channels,
             num_groups=self.config.num_groups,
@@ -311,7 +359,7 @@ class FuXiIntrinsic(nn.Module):
         )
         self.output_proj = nn.Conv2d(
             self.config.feature_channels,
-            self.config.feature_channels,
+            input_channels,
             kernel_size=1,
             **dd,
         )
@@ -320,28 +368,31 @@ class FuXiIntrinsic(nn.Module):
         return self.to_intrinsic.weight.dtype
 
     def _validate_feature_grid(self, feature_grid: Tensor) -> None:
-        expected_shape = (self.config.feature_channels, *self.config.spatial_size)
+        expected_shape = (self.config.resolved_input_channels, *self.config.spatial_size)
         if feature_grid.ndim != 4 or tuple(feature_grid.shape[1:]) != expected_shape:
             raise ValueError(
                 "Expected patch-grid features shaped "
-                f"[B, {self.config.feature_channels}, {self.config.spatial_size[0]}, {self.config.spatial_size[1]}], "
+                f"[B, {self.config.resolved_input_channels}, {self.config.spatial_size[0]}, {self.config.spatial_size[1]}], "
                 f"got {tuple(feature_grid.shape)}"
             )
 
     def encode(self, feature_grid: Tensor) -> Tensor:
         self._validate_feature_grid(feature_grid)
         h = feature_grid.to(dtype=self._model_dtype())
+        h = self.input_proj(h)
+        h = self.input_resblock(h)
+
         h = self.downsample1(h)
-        h = self.down_resblock1(h)
         h = self.encoder_stage1(h)
 
         h = self.downsample2(h)
-        h = self.down_resblock2(h)
         h = self.encoder_stage2(h)
 
+        h = self.downsample3(h)
+        h = self.encoder_stage3(h)
+
         batch_size = h.shape[0]
-        flat = h.reshape(batch_size, self.config.bottleneck_flat_dim)
-        z_intrinsic = self.to_intrinsic(flat)
+        z_intrinsic = self.to_intrinsic(h).reshape(batch_size, self.config.d_intrinsic)
         if self.config.apply_tanh:
             z_intrinsic = torch.tanh(z_intrinsic)
         return z_intrinsic
@@ -353,20 +404,19 @@ class FuXiIntrinsic(nn.Module):
             )
 
         batch_size = z_intrinsic.shape[0]
-        h = self.from_intrinsic(z_intrinsic.to(dtype=self._model_dtype()))
-        h = h.reshape(
-            batch_size,
-            self.config.feature_channels,
-            *self.config.bottleneck_spatial_size,
+        h = self.from_intrinsic(
+            z_intrinsic.to(dtype=self._model_dtype()).reshape(batch_size, self.config.d_intrinsic, 1, 1)
         )
+        h = self.decoder_stage3(h)
+
+        h = self.upsample3(h)
         h = self.decoder_stage2(h)
 
         h = self.upsample2(h)
-        h = self.up_resblock2(h)
         h = self.decoder_stage1(h)
 
         h = self.upsample1(h)
-        h = self.up_resblock1(h)
+        h = self.output_resblock(h)
         return self.output_proj(h)
 
     def forward(self, feature_grid: Tensor) -> dict[str, Tensor]:
@@ -381,20 +431,29 @@ class FuXiIntrinsic(nn.Module):
     def summary(self) -> dict[str, Any]:
         return {
             "config_path": str(self.config.config_path),
+            "input_channels": self.config.resolved_input_channels,
+            "output_channels": self.config.resolved_input_channels,
             "feature_channels": self.config.feature_channels,
             "spatial_size": list(self.config.spatial_size),
             "first_downsampled_size": list(self.config.first_downsampled_size),
+            "second_downsampled_size": list(self.config.second_downsampled_size),
             "bottleneck_spatial_size": list(self.config.bottleneck_spatial_size),
             "d_intrinsic": self.config.d_intrinsic,
-            "depths": list(self.config.depths),
+            "depths": list(self.config.stage_depths),
+            "resblocks_per_stage": list(self.config.resblocks_per_stage),
             "num_heads": self.config.num_heads,
             "num_groups": self.config.num_groups,
             "mlp_hidden_dim": self.config.mlp_hidden_dim,
             "apply_tanh": self.config.apply_tanh,
-            "transformer_type": "standard_encoder",
+            "architecture": "conv_autoencoder",
+            "transformer_type": "none",
+            "block_type": "resblock_conv",
+            "uses_attention": False,
             "uses_windowed_attention": False,
-            "bottleneck_projection": "flatten_linear",
-            "bottleneck_flat_dim": self.config.bottleneck_flat_dim,
+            "uses_positional_embeddings": False,
+            "downsample_count": 3,
+            "bottleneck_projection": "global_conv_1x1_code",
+            "bottleneck_kernel_size": list(self.config.bottleneck_kernel_size),
             "input_feature_name": "patch_grid_features",
             "reconstruction_name": "patch_grid_features_recon",
             "parameter_device": str(self.to_intrinsic.weight.device),

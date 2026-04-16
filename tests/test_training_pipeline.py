@@ -106,6 +106,33 @@ class TestTrainingSmoke(unittest.TestCase):
             intrinsic_yaml.get("save_every_optimizer_steps"),
         )
 
+    def test_build_intrinsic_training_objects_preserves_intrinsic_feature_controls(self) -> None:
+        config_path, intrinsic_yaml = load_config_section("intrinsic_model")
+        _, encoder_config, intrinsic_config, _data_config, runtime, _model_dtype, _amp_dtype = (
+            training_pipeline._build_intrinsic_training_objects(config_path)
+        )
+
+        try:
+            expected_resblocks = tuple(
+                int(value)
+                for value in intrinsic_yaml.get(
+                    "resblocks_per_stage",
+                    intrinsic_yaml.get("depths"),
+                )
+            )
+            if len(expected_resblocks) == 2:
+                expected_resblocks = (
+                    expected_resblocks[0],
+                    expected_resblocks[1],
+                    expected_resblocks[1],
+                )
+
+            self.assertEqual(intrinsic_config.input_channels, encoder_config.embed_dim)
+            self.assertEqual(intrinsic_config.feature_channels, int(intrinsic_yaml["feature_channels"]))
+            self.assertEqual(intrinsic_config.resblocks_per_stage, expected_resblocks)
+        finally:
+            training_pipeline._cleanup_distributed_runtime(runtime)
+
     def test_step_checkpoint_path_includes_zero_padded_optimizer_step(self) -> None:
         path = training_pipeline._step_checkpoint_path(Path("runs/main"), "main_last.pt", 12)
 
@@ -131,6 +158,56 @@ class TestTrainingSmoke(unittest.TestCase):
         self.assertEqual(sum(len(group.channel_indices) for group in plot_groups), len(data_config.channel_names))
         self.assertEqual(plot_groups[0].row_labels[0], f"{data_config.pressure_levels[0]} hPa")
         self.assertEqual(plot_groups[-1].row_labels, ("surface",))
+
+    def test_forecast_rollout_channel_specs_cover_all_channels(self) -> None:
+        data_config = ArcoEra5FuXiDataConfig()
+
+        specs = training_pipeline._forecast_rollout_channel_specs(data_config)
+
+        self.assertEqual(len(specs), len(data_config.channel_names))
+        self.assertEqual(specs[0].folder_name, "geopotential_50hpa")
+        self.assertEqual(specs[0].channel_name, data_config.channel_names[0])
+        self.assertEqual(specs[len(data_config.pressure_levels)].folder_name, "temperature_50hpa")
+        self.assertEqual(specs[-1].folder_name, "total_precipitation")
+
+    def test_should_use_intrinsic_for_rollout_step_respects_frequency(self) -> None:
+        dummy_model = nn.Identity()
+
+        self.assertFalse(
+            training_pipeline._should_use_intrinsic_for_rollout_step(
+                rollout_step=0,
+                intrinsic_model=None,
+                intrinsic_frequency=None,
+            )
+        )
+        self.assertTrue(
+            training_pipeline._should_use_intrinsic_for_rollout_step(
+                rollout_step=0,
+                intrinsic_model=dummy_model,
+                intrinsic_frequency=None,
+            )
+        )
+        self.assertFalse(
+            training_pipeline._should_use_intrinsic_for_rollout_step(
+                rollout_step=0,
+                intrinsic_model=dummy_model,
+                intrinsic_frequency=4,
+            )
+        )
+        self.assertTrue(
+            training_pipeline._should_use_intrinsic_for_rollout_step(
+                rollout_step=3,
+                intrinsic_model=dummy_model,
+                intrinsic_frequency=4,
+            )
+        )
+        self.assertTrue(
+            training_pipeline._should_use_intrinsic_for_rollout_step(
+                rollout_step=7,
+                intrinsic_model=dummy_model,
+                intrinsic_frequency=4,
+            )
+        )
 
     def test_resume_state_for_epoch_checkpoint_starts_next_epoch(self) -> None:
         checkpoint = {

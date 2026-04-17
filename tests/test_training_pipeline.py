@@ -1,6 +1,8 @@
 from pathlib import Path
 import unittest
 
+import numpy as np
+import pandas as pd
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
@@ -208,6 +210,41 @@ class TestTrainingSmoke(unittest.TestCase):
                 intrinsic_frequency=4,
             )
         )
+
+    def test_levina_bickel_estimator_recovers_two_dimensional_plane(self) -> None:
+        rng = np.random.default_rng(0)
+        base = rng.normal(size=(256, 2)).astype(np.float32)
+        embedded = np.concatenate(
+            [base, np.zeros((256, 4), dtype=np.float32)],
+            axis=1,
+        )
+
+        report = training_pipeline._estimate_levina_bickel_dimension(
+            embedded,
+            k1=10,
+            k2=20,
+            bias_correction=False,
+            n_jobs=1,
+        )
+
+        self.assertGreater(report["dimension_estimate"], 1.5)
+        self.assertLess(report["dimension_estimate"], 2.5)
+        self.assertEqual(report["rounded_dimension_estimate"], 2)
+
+    def test_to_plain_data_converts_timestamps_numpy_and_tensors(self) -> None:
+        plain = training_pipeline._to_plain_data(
+            {
+                "start_time": pd.Timestamp("2024-01-01 00:00:00"),
+                "scalar": np.float32(2.5),
+                "vector": np.array([1, 2, 3], dtype=np.int64),
+                "tensor": torch.tensor([[1.0, 2.0]]),
+            }
+        )
+
+        self.assertEqual(plain["start_time"], "2024-01-01 00:00:00")
+        self.assertEqual(plain["scalar"], 2.5)
+        self.assertEqual(plain["vector"], [1, 2, 3])
+        self.assertEqual(plain["tensor"], [[1.0, 2.0]])
 
     def test_resume_state_for_epoch_checkpoint_starts_next_epoch(self) -> None:
         checkpoint = {

@@ -52,7 +52,7 @@ data:
 train_main:
   batch_size: 2
   num_workers: 16
-  gradient_accumulation_steps: 320
+  gradient_accumulation_steps: 16
   learning_rate: 1.0e-5
   weight_decay: 0.005
   max_epochs: 100

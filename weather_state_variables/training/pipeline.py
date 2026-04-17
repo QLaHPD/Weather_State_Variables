@@ -170,6 +170,16 @@ def _to_plain_data(value: Any) -> Any:
         return str(value)
     if isinstance(value, pd.Timestamp):
         return str(value)
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, torch.device):
+        return str(value)
+    if isinstance(value, torch.dtype):
+        return str(value)
+    if isinstance(value, Tensor):
+        return value.detach().cpu().tolist()
     if isinstance(value, dict):
         return {key: _to_plain_data(inner) for key, inner in value.items()}
     if isinstance(value, (list, tuple)):
@@ -2195,6 +2205,120 @@ def _evaluate_intrinsic_model(
     }
 
 
+def _extract_main_model_latent_batch(
+    model: FuXiLowerRes,
+    batch: dict[str, Tensor],
+    *,
+    latent_source: str,
+) -> Tensor:
+    normalized_source = latent_source.strip().lower()
+    if normalized_source not in {"second_block_features", "patch_grid_features"}:
+        raise ValueError(
+            "latent_source must be 'second_block_features' or 'patch_grid_features', "
+            f"got {latent_source!r}"
+        )
+
+    return_patch_grid_features = normalized_source == "patch_grid_features"
+    encoded = model.encoder(
+        batch["x"],
+        batch["temb"],
+        static_features=batch["static_features"],
+        return_patch_grid_features=return_patch_grid_features,
+    )
+    if normalized_source == "patch_grid_features":
+        return _require_patch_grid_features(encoded)
+    return encoded.second_block_features
+
+
+def _estimate_levina_bickel_dimension(
+    samples: np.ndarray,
+    *,
+    k1: int,
+    k2: int,
+    bias_correction: bool = False,
+    n_jobs: int | None = None,
+) -> dict[str, Any]:
+    try:
+        from sklearn.neighbors import NearestNeighbors
+    except ImportError as exc:  # pragma: no cover - depends on optional env dependency
+        raise ImportError(
+            "Levina-Bickel estimation requires scikit-learn. Install it in the active environment."
+        ) from exc
+
+    array = np.asarray(samples, dtype=np.float32)
+    if array.ndim != 2:
+        raise ValueError(f"Expected samples shaped [N, D], got {tuple(array.shape)}")
+    sample_count, feature_dim = array.shape
+    if sample_count < 4:
+        raise ValueError(
+            "Levina-Bickel estimation requires at least 4 samples, "
+            f"got {sample_count}"
+        )
+    if k1 < 3:
+        raise ValueError(f"k1 must be at least 3 for Levina-Bickel, got {k1}")
+    if k2 < k1:
+        raise ValueError(f"k2 must be >= k1, got k1={k1}, k2={k2}")
+    if sample_count <= k2:
+        raise ValueError(
+            f"Need more samples than k2 for Levina-Bickel, got sample_count={sample_count}, k2={k2}"
+        )
+
+    neighbors = NearestNeighbors(
+        n_neighbors=int(k2) + 1,
+        algorithm="brute",
+        metric="euclidean",
+        n_jobs=n_jobs,
+    )
+    neighbors.fit(array)
+    distances, _indices = neighbors.kneighbors(array)
+    neighbor_distances = np.maximum(
+        distances[:, 1:].astype(np.float64, copy=False),
+        np.finfo(np.float64).tiny,
+    )
+
+    estimates_by_k: dict[str, float] = {}
+    stderr_by_k: dict[str, float] = {}
+    local_estimates_by_k: dict[int, np.ndarray] = {}
+    k_values = list(range(int(k1), int(k2) + 1))
+
+    for k in k_values:
+        kth_distance = neighbor_distances[:, [k - 1]]
+        previous_distances = neighbor_distances[:, : k - 1]
+        log_ratio_sums = np.log(kth_distance / previous_distances).sum(axis=1)
+        log_ratio_sums = np.maximum(log_ratio_sums, np.finfo(np.float64).tiny)
+        k_factor = float((k - 2) if bias_correction else (k - 1))
+        local_estimates = k_factor / log_ratio_sums
+        finite_mask = np.isfinite(local_estimates) & (local_estimates > 0.0)
+        if not np.any(finite_mask):
+            raise ValueError(f"Levina-Bickel produced no finite estimates for k={k}")
+        valid_estimates = local_estimates[finite_mask]
+        local_estimates_by_k[k] = valid_estimates
+        estimates_by_k[str(k)] = float(valid_estimates.mean())
+        stderr_by_k[str(k)] = float(
+            0.0
+            if valid_estimates.size <= 1
+            else valid_estimates.std(ddof=1) / np.sqrt(valid_estimates.size)
+        )
+
+    estimate_values = np.array([estimates_by_k[str(k)] for k in k_values], dtype=np.float64)
+    pointwise_estimate = np.concatenate([local_estimates_by_k[k] for k in k_values]).mean()
+    global_estimate = float(estimate_values.mean())
+    rounded_estimate = int(np.rint(global_estimate))
+
+    return {
+        "sample_count": int(sample_count),
+        "feature_dim": int(feature_dim),
+        "k1": int(k1),
+        "k2": int(k2),
+        "bias_correction": bool(bias_correction),
+        "dimension_estimate": global_estimate,
+        "rounded_dimension_estimate": rounded_estimate,
+        "mean_pointwise_dimension_estimate": float(pointwise_estimate),
+        "estimates_by_k": estimates_by_k,
+        "stderr_by_k": stderr_by_k,
+    }
+
+
 def _accumulation_divisor(total_batches: int, batch_index: int, accumulation_steps: int) -> int:
     if total_batches <= 0:
         return accumulation_steps
@@ -3046,6 +3170,160 @@ def rollout_main_model(
         _cleanup_distributed_runtime(runtime)
 
 
+def estimate_main_model_intrinsic_dimension(
+    config_path: str | Path = DEFAULT_MODEL_CONFIG_PATH,
+    *,
+    checkpoint_path: str | Path | None = None,
+    split: str = "val",
+    batch_size: int | None = None,
+    num_workers: int | None = None,
+    max_samples: int = 64,
+    start_time: str | pd.Timestamp | None = None,
+    end_time: str | pd.Timestamp | None = None,
+    latent_source: str = "second_block_features",
+    k1: int = 10,
+    k2: int = 20,
+    bias_correction: bool = False,
+    print_model_summary: bool = False,
+    n_jobs: int | None = None,
+    print_result: bool = True,
+) -> dict[str, Any]:
+    train_config, model_config, data_config, runtime, _model_dtype, amp_dtype = _build_main_training_objects(config_path)
+    try:
+        if runtime.enabled:
+            raise ValueError(
+                "Intrinsic-dimension estimation currently supports single-process execution only. "
+                "Run it without distributed launch environment variables."
+            )
+
+        normalized_split = split.strip().lower()
+        if normalized_split not in {"train", "val"}:
+            raise ValueError(f"split must be 'train' or 'val', got {split!r}")
+        if max_samples <= 0:
+            raise ValueError(f"max_samples must be positive, got {max_samples}")
+
+        if checkpoint_path is None:
+            resolved_checkpoint_path = train_config.output_dir / train_config.checkpoint_name
+        else:
+            resolved_checkpoint_path = resolve_repo_path(checkpoint_path, config_path=train_config.config_path)
+        if not resolved_checkpoint_path.exists():
+            raise FileNotFoundError(f"Main-model checkpoint not found at {resolved_checkpoint_path}")
+
+        resolved_batch_size = int(train_config.batch_size if batch_size is None else batch_size)
+        resolved_num_workers = int(train_config.num_workers if num_workers is None else num_workers)
+        resolved_start_time = _to_optional_timestamp(
+            start_time
+            if start_time is not None
+            else (train_config.val_start_time if normalized_split == "val" else train_config.train_start_time)
+        )
+        resolved_end_time = _to_optional_timestamp(
+            end_time
+            if end_time is not None
+            else (train_config.val_end_time if normalized_split == "val" else train_config.train_end_time)
+        )
+        if resolved_start_time is None and resolved_end_time is None:
+            raise ValueError(
+                f"No {normalized_split} evaluation window is configured. "
+                "Set train_main/train_start_time and train_end_time or pass --start-time/--end-time."
+            )
+
+        model = FuXiLowerRes(model_config).to(runtime.device)
+        if print_model_summary and runtime.is_primary:
+            summary_inputs = _make_main_random_inputs(
+                model_config,
+                batch_size=train_config.random_smoke_batch_size,
+                device=runtime.device,
+            )
+            _print_model_and_summary(
+                "Forecast Model",
+                model,
+                input_data=summary_inputs,
+                depth=train_config.summary_depth,
+                print_summary=True,
+            )
+        checkpoint_metadata = _load_main_forecast_checkpoint(model, resolved_checkpoint_path)
+        model.eval()
+
+        pin_memory = runtime.device.type == "cuda"
+        eval_loader, _eval_sampler = _build_eval_dataloader(
+            data_config,
+            batch_size=resolved_batch_size,
+            num_workers=resolved_num_workers,
+            runtime=runtime,
+            start_time=resolved_start_time,
+            end_time=resolved_end_time,
+            pin_memory=pin_memory,
+        )
+
+        latent_vectors: list[np.ndarray] = []
+        latent_shape: tuple[int, ...] | None = None
+        collected_samples = 0
+
+        with torch.no_grad():
+            for _batch_index, batch in _iter_prefetched_batches(eval_loader, runtime=runtime, max_batches=None):
+                with _amp_autocast_context(train_config.use_amp, runtime.device, amp_dtype):
+                    latent_batch = _extract_main_model_latent_batch(
+                        model,
+                        batch,
+                        latent_source=latent_source,
+                    )
+                if latent_shape is None:
+                    latent_shape = tuple(int(value) for value in latent_batch.shape[1:])
+                flat_batch = latent_batch.reshape(latent_batch.shape[0], -1).detach().cpu().float().numpy()
+                remaining = int(max_samples) - collected_samples
+                if remaining <= 0:
+                    break
+                if flat_batch.shape[0] > remaining:
+                    flat_batch = flat_batch[:remaining]
+                latent_vectors.append(np.ascontiguousarray(flat_batch))
+                collected_samples += int(flat_batch.shape[0])
+                if collected_samples >= int(max_samples):
+                    break
+
+        if not latent_vectors:
+            raise ValueError("No latent samples were collected for intrinsic-dimension estimation.")
+        latent_matrix = np.concatenate(latent_vectors, axis=0)
+        estimation = _estimate_levina_bickel_dimension(
+            latent_matrix,
+            k1=int(k1),
+            k2=int(k2),
+            bias_correction=bool(bias_correction),
+            n_jobs=n_jobs,
+        )
+
+        result = {
+            "checkpoint_path": str(resolved_checkpoint_path),
+            "checkpoint_epoch": None if checkpoint_metadata is None else checkpoint_metadata.get("epoch"),
+            "checkpoint_optimizer_step": (
+                None if checkpoint_metadata is None else checkpoint_metadata.get("optimizer_step")
+            ),
+            "checkpoint_global_batch_step": (
+                None if checkpoint_metadata is None else checkpoint_metadata.get("global_batch_step")
+            ),
+            "split": normalized_split,
+            "start_time": resolved_start_time,
+            "end_time": resolved_end_time,
+            "batch_size": resolved_batch_size,
+            "num_workers": resolved_num_workers,
+            "max_samples": int(max_samples),
+            "latent_source": latent_source,
+            "latent_shape": None if latent_shape is None else list(latent_shape),
+            "flattened_latent_dim": int(latent_matrix.shape[1]),
+            "levina_bickel": estimation,
+        }
+        if runtime.is_primary and print_result:
+            _print_if_primary(
+                runtime,
+                f"[main][intrinsic-dimension] split={normalized_split} latent_source={latent_source} "
+                f"samples={estimation['sample_count']} estimate={estimation['dimension_estimate']:.4f} "
+                f"rounded={estimation['rounded_dimension_estimate']}",
+            )
+            _print_json_block("main_intrinsic_dimension_result", result)
+        return result
+    finally:
+        _cleanup_distributed_runtime(runtime)
+
+
 def validate_intrinsic_model(
     config_path: str | Path = DEFAULT_MODEL_CONFIG_PATH,
     *,
@@ -3827,6 +4105,7 @@ def train_intrinsic_model(
 
 
 __all__ = [
+    "estimate_main_model_intrinsic_dimension",
     "IntrinsicTrainingConfig",
     "LatitudeWeightedCharbonnierLoss",
     "MainTrainingConfig",

@@ -1,6 +1,7 @@
 """Training pipeline helpers for the forecast and intrinsic models."""
 
 from .pipeline import (
+    estimate_main_model_intrinsic_dimension,
     IntrinsicTrainingConfig,
     LatitudeWeightedCharbonnierLoss,
     MainTrainingConfig,
@@ -14,6 +15,7 @@ from .pipeline import (
 )
 
 __all__ = [
+    "estimate_main_model_intrinsic_dimension",
     "IntrinsicTrainingConfig",
     "LatitudeWeightedCharbonnierLoss",
     "MainTrainingConfig",

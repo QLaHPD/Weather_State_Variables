@@ -131,11 +131,11 @@ train_intrinsic:
   random_smoke_batch_size: 1
 
 train_bottleneck_compressor:
-  batch_size: 8
+  batch_size: 2
   num_workers: 0
-  gradient_accumulation_steps: 16
+  gradient_accumulation_steps: 8
   learning_rate: 1.0e-5
-  weight_decay: 0.001
+  weight_decay: 0.0
   max_epochs: 5
   device: auto
   model_dtype: float32

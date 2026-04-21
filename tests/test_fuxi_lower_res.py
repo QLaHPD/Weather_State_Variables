@@ -198,6 +198,8 @@ class TestFuXiIntrinsic(unittest.TestCase):
         self.assertFalse(summary["uses_windowed_attention"])
         self.assertFalse(summary["uses_positional_embeddings"])
         self.assertEqual(summary["downsample_count"], 3)
+        self.assertEqual(summary["input_feature_name"], "second_block_features")
+        self.assertEqual(summary["reconstruction_name"], "second_block_features_recon")
         self.assertEqual(summary["parameter_device"], "meta")
 
     def test_tiny_config_runs_forward(self) -> None:
@@ -214,17 +216,17 @@ class TestFuXiIntrinsic(unittest.TestCase):
             dtype=torch.float32,
         )
         model = FuXiIntrinsic(config)
-        patch_grid_features = torch.randn(2, 16, 8, 16)
+        second_block_features = torch.randn(2, 16, 8, 16)
 
-        outputs = model(patch_grid_features)
+        outputs = model(second_block_features)
 
         self.assertEqual(
             set(outputs.keys()),
             {"z_intrinsic", "patch_grid_features_recon", "second_block_features_recon"},
         )
         self.assertEqual(outputs["z_intrinsic"].shape, (2, 3))
-        self.assertEqual(outputs["patch_grid_features_recon"].shape, (2, 16, 8, 16))
         self.assertEqual(outputs["second_block_features_recon"].shape, (2, 16, 8, 16))
+        self.assertEqual(outputs["patch_grid_features_recon"].shape, (2, 16, 8, 16))
         self.assertTrue(torch.all(outputs["z_intrinsic"] <= 1.0))
         self.assertTrue(torch.all(outputs["z_intrinsic"] >= -1.0))
 
@@ -241,12 +243,12 @@ class TestFuXiIntrinsic(unittest.TestCase):
             dtype=torch.float32,
         )
         model = FuXiIntrinsic(config)
-        patch_grid_features = torch.randn(2, 24, 8, 16)
+        second_block_features = torch.randn(2, 24, 8, 16)
 
-        outputs = model(patch_grid_features)
+        outputs = model(second_block_features)
 
         self.assertEqual(outputs["z_intrinsic"].shape, (2, 3))
-        self.assertEqual(outputs["patch_grid_features_recon"].shape, (2, 24, 8, 16))
+        self.assertEqual(outputs["second_block_features_recon"].shape, (2, 24, 8, 16))
 
 
 class TestFuXiBottleneckCompressor(unittest.TestCase):

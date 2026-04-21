@@ -75,11 +75,11 @@ class IntrinsicConvStage(nn.Module):
 
 @dataclass(frozen=True)
 class FuXiIntrinsicConfig:
-    """All-convolution intrinsic autoencoder over the encoder patch-grid feature map."""
+    """All-convolution intrinsic autoencoder over the main encoder bottleneck feature map."""
 
     input_channels: int | None = None
     feature_channels: int = 128
-    spatial_size: tuple[int, int] = (45, 90)
+    spatial_size: tuple[int, int] = (23, 45)
     d_intrinsic: int = 16
     depths: tuple[int, ...] = (8, 8, 8)
     num_heads: int = 16
@@ -138,7 +138,7 @@ class FuXiIntrinsicConfig:
                 )
             ),
             spatial_size=_to_int_tuple(
-                intrinsic_data.get("spatial_size", list(forecast_config.patch_grid))
+                intrinsic_data.get("spatial_size", list(forecast_config.latent_grid))
             ),
             d_intrinsic=int(intrinsic_data["d_intrinsic"]),
             depths=_to_int_tuple(
@@ -214,7 +214,7 @@ class FuXiIntrinsicConfig:
 
 
 class FuXiIntrinsic(nn.Module):
-    """Three-level convolutional intrinsic autoencoder over encoder patch-grid features."""
+    """Three-level convolutional intrinsic autoencoder over main encoder bottleneck features."""
 
     def __init__(self, config: FuXiIntrinsicConfig | None = None) -> None:
         super().__init__()
@@ -371,7 +371,7 @@ class FuXiIntrinsic(nn.Module):
         expected_shape = (self.config.resolved_input_channels, *self.config.spatial_size)
         if feature_grid.ndim != 4 or tuple(feature_grid.shape[1:]) != expected_shape:
             raise ValueError(
-                "Expected patch-grid features shaped "
+                "Expected second-block bottleneck features shaped "
                 f"[B, {self.config.resolved_input_channels}, {self.config.spatial_size[0]}, {self.config.spatial_size[1]}], "
                 f"got {tuple(feature_grid.shape)}"
             )
@@ -421,11 +421,11 @@ class FuXiIntrinsic(nn.Module):
 
     def forward(self, feature_grid: Tensor) -> dict[str, Tensor]:
         z_intrinsic = self.encode(feature_grid)
-        patch_grid_features_recon = self.decode(z_intrinsic)
+        second_block_features_recon = self.decode(z_intrinsic)
         return {
             "z_intrinsic": z_intrinsic,
-            "patch_grid_features_recon": patch_grid_features_recon,
-            "second_block_features_recon": patch_grid_features_recon,
+            "second_block_features_recon": second_block_features_recon,
+            "patch_grid_features_recon": second_block_features_recon,
         }
 
     def summary(self) -> dict[str, Any]:
@@ -454,8 +454,8 @@ class FuXiIntrinsic(nn.Module):
             "downsample_count": 3,
             "bottleneck_projection": "global_conv_1x1_code",
             "bottleneck_kernel_size": list(self.config.bottleneck_kernel_size),
-            "input_feature_name": "patch_grid_features",
-            "reconstruction_name": "patch_grid_features_recon",
+            "input_feature_name": "second_block_features",
+            "reconstruction_name": "second_block_features_recon",
             "parameter_device": str(self.to_intrinsic.weight.device),
             "parameter_dtype": str(self.to_intrinsic.weight.dtype),
         }

@@ -164,6 +164,7 @@ class TestTrainingSmoke(unittest.TestCase):
 
             self.assertEqual(intrinsic_config.input_channels, encoder_config.embed_dim)
             self.assertEqual(intrinsic_config.feature_channels, int(intrinsic_yaml["feature_channels"]))
+            self.assertEqual(intrinsic_config.spatial_size, encoder_config.latent_grid)
             self.assertEqual(intrinsic_config.resblocks_per_stage, expected_resblocks)
         finally:
             training_pipeline._cleanup_distributed_runtime(runtime)
@@ -574,7 +575,7 @@ class TestTrainingSmoke(unittest.TestCase):
         self.assertEqual(optimizer.param_groups[0]["lr"], 3.0e-4)
         self.assertEqual(optimizer.param_groups[0]["weight_decay"], 0.2)
 
-    def test_encode_patch_grid_features_for_intrinsic_keeps_encoder_graph_when_not_detached(self) -> None:
+    def test_encode_second_block_features_for_intrinsic_keeps_encoder_graph_when_not_detached(self) -> None:
         encoder_config = FuXiLowerResConfig(
             input_size=(33, 64),
             time_steps=2,
@@ -600,16 +601,17 @@ class TestTrainingSmoke(unittest.TestCase):
             "static_features": torch.randn(2, 2, 33, 64),
         }
 
-        patch_grid_features = training_pipeline._encode_patch_grid_features_for_intrinsic(
+        second_block_features = training_pipeline._encode_second_block_features_for_intrinsic(
             encoder,
             batch,
             detach_features=False,
             clear_encoder_grads=True,
         )
-        loss = patch_grid_features.square().mean()
+        loss = second_block_features.square().mean()
         loss.backward()
 
-        self.assertTrue(patch_grid_features.requires_grad)
+        self.assertEqual(second_block_features.shape, (2, 16, 4, 8))
+        self.assertTrue(second_block_features.requires_grad)
         self.assertTrue(
             any(parameter.grad is not None for parameter in encoder.parameters())
         )
@@ -792,7 +794,7 @@ class TestTrainingSmoke(unittest.TestCase):
         )
         intrinsic_config = FuXiIntrinsicConfig(
             feature_channels=16,
-            spatial_size=encoder_config.patch_grid,
+            spatial_size=encoder_config.latent_grid,
             d_intrinsic=3,
             depths=(1, 1),
             num_heads=4,
@@ -812,9 +814,9 @@ class TestTrainingSmoke(unittest.TestCase):
             print_outputs=False,
         )
 
-        self.assertEqual(report["patch_grid_features"]["shape"], [2, 16, 8, 16])
+        self.assertEqual(report["second_block_features"]["shape"], [2, 16, 4, 8])
         self.assertEqual(report["intrinsic_output"]["z_intrinsic"]["shape"], [2, 3])
-        self.assertEqual(report["intrinsic_output"]["patch_grid_features_recon"]["shape"], [2, 16, 8, 16])
+        self.assertEqual(report["intrinsic_output"]["second_block_features_recon"]["shape"], [2, 16, 4, 8])
 
     def test_bottleneck_compressor_smoke_test_runs_on_tiny_models(self) -> None:
         encoder_config = FuXiLowerResConfig(
@@ -885,7 +887,7 @@ class TestTrainingSmoke(unittest.TestCase):
         )
         intrinsic_config = FuXiIntrinsicConfig(
             feature_channels=16,
-            spatial_size=encoder_config.patch_grid,
+            spatial_size=encoder_config.latent_grid,
             d_intrinsic=3,
             depths=(1, 1),
             num_heads=4,
@@ -908,13 +910,12 @@ class TestTrainingSmoke(unittest.TestCase):
             x,
             temb,
             static_features=static_features,
-            return_patch_grid_features=True,
         )
         outputs = chain_model(x, temb, static_features=static_features)
 
         self.assertEqual(outputs["forecast"].shape, (2, 2, 8, 33, 64))
         self.assertEqual(outputs["z_intrinsic"].shape, (2, 3))
-        self.assertEqual(outputs["patch_grid_features_recon"].shape, (2, 16, 8, 16))
+        self.assertEqual(outputs["second_block_features_recon"].shape, (2, 16, 4, 8))
         self.assertEqual(
             outputs["second_block_features"].shape,
             encoded.second_block_features.shape,

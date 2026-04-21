@@ -41,6 +41,7 @@ from ..data import (
 from ..models import (
     FuXiBottleneckCompressor,
     FuXiBottleneckCompressorConfig,
+    FuXiEncoderOutput,
     FuXiIntrinsic,
     FuXiIntrinsicConfig,
     FuXiLowerRes,
@@ -503,20 +504,17 @@ def run_intrinsic_model_smoke_test(
             x,
             temb,
             static_features=static_features,
-            return_patch_grid_features=True,
         )
-        if encoded.patch_grid_features is None:
-            raise RuntimeError("Encoder did not return patch_grid_features for the intrinsic smoke test.")
-        outputs = intrinsic_model(encoded.patch_grid_features)
+        outputs = intrinsic_model(encoded.second_block_features)
     report = {
         "encoder_input": {
             "x": {"shape": list(x.shape), "dtype": str(x.dtype)},
             "temb": {"shape": list(temb.shape), "dtype": str(temb.dtype)},
             "static_features": {"shape": list(static_features.shape), "dtype": str(static_features.dtype)},
         },
-        "patch_grid_features": {
-            "shape": list(encoded.patch_grid_features.shape),
-            "dtype": str(encoded.patch_grid_features.dtype),
+        "second_block_features": {
+            "shape": list(encoded.second_block_features.shape),
+            "dtype": str(encoded.second_block_features.dtype),
         },
         "intrinsic_output": _tensor_tree_shapes(outputs),
     }
@@ -530,7 +528,7 @@ def _require_patch_grid_features(encoded: Any) -> Tensor:
     if patch_grid_features is None:
         raise RuntimeError(
             "The encoder did not expose patch_grid_features. "
-            "Call the encoder with return_patch_grid_features=True for intrinsic training."
+            "Call the encoder with return_patch_grid_features=True for patch-grid feature extraction."
         )
     return patch_grid_features
 
@@ -552,6 +550,24 @@ def _encode_patch_grid_features_for_intrinsic(
     )
     patch_grid_features = _require_patch_grid_features(encoded)
     return patch_grid_features.detach() if detach_features else patch_grid_features
+
+
+def _encode_second_block_features_for_intrinsic(
+    encoder: FuXiLowerResEncoder,
+    batch: dict[str, Tensor],
+    *,
+    detach_features: bool,
+    clear_encoder_grads: bool,
+) -> Tensor:
+    if clear_encoder_grads:
+        encoder.zero_grad(set_to_none=True)
+    encoded = encoder(
+        batch["x"],
+        batch["temb"],
+        static_features=batch["static_features"],
+    )
+    second_block_features = encoded.second_block_features
+    return second_block_features.detach() if detach_features else second_block_features
 
 
 def _encode_features_for_bottleneck_compressor(
@@ -598,20 +614,17 @@ class _IntrinsicForecastChain(nn.Module):
             x,
             temb,
             static_features=static_features,
-            return_patch_grid_features=True,
         )
-        patch_grid_features = _require_patch_grid_features(encoded)
-        intrinsic_outputs = self.intrinsic_model(patch_grid_features)
-        reconstructed_encoding = self.main_model.encoder.encode_from_patch_grid_features(
-            intrinsic_outputs["patch_grid_features_recon"],
-            temb,
+        intrinsic_outputs = self.intrinsic_model(encoded.second_block_features)
+        reconstructed_encoding = FuXiEncoderOutput(
+            second_block_features=intrinsic_outputs["second_block_features_recon"],
             output_size=tuple(int(value) for value in x.shape[-2:]),
         )
         forecast = self.main_model.decoder(reconstructed_encoding)
         return {
             "forecast": forecast,
             "z_intrinsic": intrinsic_outputs["z_intrinsic"],
-            "patch_grid_features_recon": intrinsic_outputs["patch_grid_features_recon"],
+            "second_block_features_recon": intrinsic_outputs["second_block_features_recon"],
             "second_block_features": reconstructed_encoding.second_block_features,
         }
 
@@ -1835,7 +1848,7 @@ def _build_intrinsic_training_objects(
         device=runtime.device,
         dtype=model_dtype,
         input_channels=encoder_config.embed_dim,
-        spatial_size=encoder_config.patch_grid,
+        spatial_size=encoder_config.latent_grid,
     )
     data_config = replace(
         ArcoEra5FuXiDataConfig.from_yaml(config_path),
@@ -2519,11 +2532,10 @@ def _evaluate_intrinsic_model(
                     batch["x"],
                     batch["temb"],
                     static_features=batch["static_features"],
-                    return_patch_grid_features=True,
                 )
-                patch_grid_features = _require_patch_grid_features(encoded)
-                outputs = intrinsic_model(patch_grid_features)
-                loss = criterion(outputs["patch_grid_features_recon"], patch_grid_features)
+                second_block_features = encoded.second_block_features
+                outputs = intrinsic_model(second_block_features)
+                loss = criterion(outputs["second_block_features_recon"], second_block_features)
             val_running_loss += float(loss.item())
             val_steps += 1
 
@@ -5419,7 +5431,7 @@ def train_intrinsic_model(
                     sync_context = nullcontext()
                     if runtime.enabled and isinstance(intrinsic_model, DistributedDataParallel):
                         sync_context = intrinsic_model.no_sync()
-                    patch_grid_features = _encode_patch_grid_features_for_intrinsic(
+                    second_block_features = _encode_second_block_features_for_intrinsic(
                         encoder,
                         batch,
                         detach_features=train_config.detach_second_block_features,
@@ -5427,10 +5439,10 @@ def train_intrinsic_model(
                     )
                     with sync_context:
                         with _amp_autocast_context(train_config.use_amp, runtime.device, amp_dtype):
-                            outputs = intrinsic_model(patch_grid_features)
+                            outputs = intrinsic_model(second_block_features)
                             scaled_loss = criterion(
-                                outputs["patch_grid_features_recon"],
-                                patch_grid_features,
+                                outputs["second_block_features_recon"],
+                                second_block_features,
                             ) / loss_divisor
                         if scaler.is_enabled():
                             scaler.scale(scaled_loss).backward()
@@ -5455,7 +5467,7 @@ def train_intrinsic_model(
                 if runtime.enabled and isinstance(intrinsic_model, DistributedDataParallel) and not should_step:
                     sync_context = intrinsic_model.no_sync()
 
-                patch_grid_features = _encode_patch_grid_features_for_intrinsic(
+                second_block_features = _encode_second_block_features_for_intrinsic(
                     encoder,
                     batch,
                     detach_features=train_config.detach_second_block_features,
@@ -5464,10 +5476,10 @@ def train_intrinsic_model(
 
                 with sync_context:
                     with _amp_autocast_context(train_config.use_amp, runtime.device, amp_dtype):
-                        outputs = intrinsic_model(patch_grid_features)
+                        outputs = intrinsic_model(second_block_features)
                         loss = criterion(
-                            outputs["patch_grid_features_recon"],
-                            patch_grid_features,
+                            outputs["second_block_features_recon"],
+                            second_block_features,
                         )
                         scaled_loss = loss / loss_divisor
 
@@ -5582,17 +5594,17 @@ def train_intrinsic_model(
                         runtime=runtime,
                         max_batches=train_config.max_val_batches,
                     ):
-                        patch_grid_features = _encode_patch_grid_features_for_intrinsic(
+                        second_block_features = _encode_second_block_features_for_intrinsic(
                             encoder,
                             batch,
                             detach_features=train_config.detach_second_block_features,
                             clear_encoder_grads=False,
                         )
                         with _amp_autocast_context(train_config.use_amp, runtime.device, amp_dtype):
-                            outputs = intrinsic_model(patch_grid_features)
+                            outputs = intrinsic_model(second_block_features)
                             loss = criterion(
-                                outputs["patch_grid_features_recon"],
-                                patch_grid_features,
+                                outputs["second_block_features_recon"],
+                                second_block_features,
                             )
                         val_running_loss += float(loss.item())
                         val_steps += 1

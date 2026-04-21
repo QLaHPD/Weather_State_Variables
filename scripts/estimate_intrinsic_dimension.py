@@ -32,6 +32,17 @@ def parse_args() -> argparse.Namespace:
         help="Optional main-model checkpoint path. Defaults to train_main.output_dir/train_main.checkpoint_name.",
     )
     parser.add_argument(
+        "--bottleneck-compressor-checkpoint",
+        "--compressor-checkpoint",
+        dest="bottleneck_compressor_checkpoint",
+        default=None,
+        help=(
+            "Optional bottleneck-compressor checkpoint path when "
+            "--latent-source=bottleneck_compressor. Defaults to the configured best "
+            "compressor checkpoint if it exists, otherwise the configured last checkpoint."
+        ),
+    )
+    parser.add_argument(
         "--split",
         choices=("train", "val"),
         default="val",
@@ -67,9 +78,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--latent-source",
-        choices=("second_block_features", "patch_grid_features"),
+        choices=("second_block_features", "patch_grid_features", "bottleneck_compressor"),
         default="second_block_features",
-        help="Which encoder latent tensor to flatten into sample vectors.",
+        help=(
+            "Which latent tensor to flatten into sample vectors. "
+            "'bottleneck_compressor' estimates the compressor's z_bottleneck output."
+        ),
     )
     parser.add_argument(
         "--method",
@@ -181,6 +195,7 @@ def main() -> None:
     report = estimate_main_model_intrinsic_dimension(
         args.config,
         checkpoint_path=args.checkpoint,
+        bottleneck_compressor_checkpoint_path=args.bottleneck_compressor_checkpoint,
         split=args.split,
         batch_size=args.batch_size,
         num_workers=args.num_workers,

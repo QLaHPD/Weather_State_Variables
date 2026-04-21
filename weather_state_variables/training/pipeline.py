@@ -2539,15 +2539,31 @@ def _extract_main_model_latent_batch(
     batch: dict[str, Tensor],
     *,
     latent_source: str,
+    bottleneck_compressor: FuXiBottleneckCompressor | None = None,
 ) -> Tensor:
     normalized_source = latent_source.strip().lower()
-    if normalized_source not in {"second_block_features", "patch_grid_features"}:
+    if normalized_source not in {
+        "second_block_features",
+        "patch_grid_features",
+        "bottleneck_compressor",
+    }:
         raise ValueError(
-            "latent_source must be 'second_block_features' or 'patch_grid_features', "
+            "latent_source must be 'second_block_features', 'patch_grid_features', "
+            "or 'bottleneck_compressor', "
             f"got {latent_source!r}"
         )
+    if normalized_source == "bottleneck_compressor" and bottleneck_compressor is None:
+        raise ValueError(
+            "latent_source='bottleneck_compressor' requires a loaded bottleneck compressor model."
+        )
 
-    return_patch_grid_features = normalized_source == "patch_grid_features"
+    compressor_feature_source = (
+        None if bottleneck_compressor is None else bottleneck_compressor.config.feature_source
+    )
+    return_patch_grid_features = normalized_source == "patch_grid_features" or (
+        normalized_source == "bottleneck_compressor"
+        and compressor_feature_source == "patch_grid_features"
+    )
     encoded = model.encoder(
         batch["x"],
         batch["temb"],
@@ -2556,7 +2572,20 @@ def _extract_main_model_latent_batch(
     )
     if normalized_source == "patch_grid_features":
         return _require_patch_grid_features(encoded)
-    return encoded.second_block_features
+    if normalized_source == "second_block_features":
+        return encoded.second_block_features
+
+    assert bottleneck_compressor is not None
+    if compressor_feature_source == "patch_grid_features":
+        compressor_input = _require_patch_grid_features(encoded)
+    elif compressor_feature_source == "second_block_features":
+        compressor_input = encoded.second_block_features
+    else:
+        raise ValueError(
+            "Bottleneck compressor feature_source must be 'second_block_features' "
+            f"or 'patch_grid_features', got {compressor_feature_source!r}"
+        )
+    return bottleneck_compressor.encode(compressor_input)
 
 
 def _compute_pairwise_distance_matrix(
@@ -3961,6 +3990,7 @@ def estimate_main_model_intrinsic_dimension(
     config_path: str | Path = DEFAULT_MODEL_CONFIG_PATH,
     *,
     checkpoint_path: str | Path | None = None,
+    bottleneck_compressor_checkpoint_path: str | Path | None = None,
     split: str = "val",
     batch_size: int | None = None,
     num_workers: int | None = None,
@@ -3994,6 +4024,16 @@ def estimate_main_model_intrinsic_dimension(
         if normalized_method not in {"two_nn", "levina_bickel"}:
             raise ValueError(
                 f"method must be 'two_nn' or 'levina_bickel', got {method!r}"
+            )
+        normalized_latent_source = latent_source.strip().lower()
+        if normalized_latent_source not in {
+            "second_block_features",
+            "patch_grid_features",
+            "bottleneck_compressor",
+        }:
+            raise ValueError(
+                "latent_source must be 'second_block_features', 'patch_grid_features', "
+                f"or 'bottleneck_compressor', got {latent_source!r}"
             )
         if max_samples <= 0:
             raise ValueError(f"max_samples must be positive, got {max_samples}")
@@ -4039,6 +4079,63 @@ def estimate_main_model_intrinsic_dimension(
             )
         checkpoint_metadata = _load_main_forecast_checkpoint(model, resolved_checkpoint_path)
         model.eval()
+
+        bottleneck_compressor: FuXiBottleneckCompressor | None = None
+        compressor_checkpoint_metadata: dict[str, Any] | None = None
+        resolved_compressor_checkpoint_path: Path | None = None
+        compressor_config: FuXiBottleneckCompressorConfig | None = None
+        if normalized_latent_source == "bottleneck_compressor":
+            compressor_train_config = BottleneckCompressorTrainingConfig.from_yaml(config_path)
+            loaded_compressor_config = FuXiBottleneckCompressorConfig.from_yaml(config_path)
+            compressor_spatial_size = (
+                model_config.patch_grid
+                if loaded_compressor_config.feature_source == "patch_grid_features"
+                else model_config.latent_grid
+            )
+            compressor_config = replace(
+                loaded_compressor_config,
+                device=runtime.device,
+                dtype=model_config.dtype,
+                input_channels=model_config.embed_dim,
+                spatial_size=compressor_spatial_size,
+            )
+            bottleneck_compressor = FuXiBottleneckCompressor(compressor_config).to(runtime.device)
+
+            if bottleneck_compressor_checkpoint_path is None:
+                best_path = compressor_train_config.output_dir / compressor_train_config.best_checkpoint_name
+                last_path = compressor_train_config.output_dir / compressor_train_config.checkpoint_name
+                resolved_compressor_checkpoint_path = best_path if best_path.exists() else last_path
+            else:
+                resolved_compressor_checkpoint_path = resolve_repo_path(
+                    bottleneck_compressor_checkpoint_path,
+                    config_path=compressor_train_config.config_path,
+                )
+            if not resolved_compressor_checkpoint_path.exists():
+                raise FileNotFoundError(
+                    "Bottleneck-compressor checkpoint not found at "
+                    f"{resolved_compressor_checkpoint_path}. Pass --bottleneck-compressor-checkpoint "
+                    "or train the compressor first."
+                )
+            if print_model_summary and runtime.is_primary:
+                compressor_summary_input = (
+                    _make_bottleneck_compressor_random_inputs(
+                        compressor_config,
+                        batch_size=train_config.random_smoke_batch_size,
+                        device=runtime.device,
+                    ),
+                )
+                _print_model_and_summary(
+                    "Bottleneck Compressor",
+                    bottleneck_compressor,
+                    input_data=compressor_summary_input,
+                    depth=train_config.summary_depth,
+                    print_summary=True,
+                )
+            compressor_checkpoint_metadata = _load_bottleneck_compressor_checkpoint(
+                bottleneck_compressor,
+                resolved_compressor_checkpoint_path,
+            )
+            bottleneck_compressor.eval()
 
         pin_memory = runtime.device.type == "cuda"
         eval_dataset = _build_eval_dataset(
@@ -4118,7 +4215,8 @@ def estimate_main_model_intrinsic_dimension(
                         latent_batch = _extract_main_model_latent_batch(
                             model,
                             batch,
-                            latent_source=latent_source,
+                            latent_source=normalized_latent_source,
+                            bottleneck_compressor=bottleneck_compressor,
                         )
                     if latent_shape is None:
                         latent_shape = tuple(int(value) for value in latent_batch.shape[1:])
@@ -4247,7 +4345,25 @@ def estimate_main_model_intrinsic_dimension(
                 "num_workers": resolved_num_workers,
                 "max_samples": int(max_samples),
                 "latent_pool_sample_count": int(latent_matrix.shape[0]),
-                "latent_source": latent_source,
+                "latent_source": normalized_latent_source,
+                "bottleneck_compressor_checkpoint_path": (
+                    None
+                    if resolved_compressor_checkpoint_path is None
+                    else str(resolved_compressor_checkpoint_path)
+                ),
+                "bottleneck_compressor_checkpoint_epoch": (
+                    None
+                    if compressor_checkpoint_metadata is None
+                    else compressor_checkpoint_metadata.get("epoch")
+                ),
+                "bottleneck_compressor_checkpoint_optimizer_step": (
+                    None
+                    if compressor_checkpoint_metadata is None
+                    else compressor_checkpoint_metadata.get("optimizer_step")
+                ),
+                "bottleneck_compressor_feature_source": (
+                    None if compressor_config is None else compressor_config.feature_source
+                ),
                 "method": normalized_method,
                 "distributed": runtime.enabled,
                 "world_size": int(runtime.world_size),
@@ -4279,7 +4395,7 @@ def estimate_main_model_intrinsic_dimension(
                     )
                 _print_if_primary(
                     runtime,
-                    f"[main][intrinsic-dimension] split={normalized_split} latent_source={latent_source} "
+                    f"[main][intrinsic-dimension] split={normalized_split} latent_source={normalized_latent_source} "
                     f"method={normalized_method} "
                     f"samples={estimation['sample_count']} estimate={estimation['dimension_estimate']:.4f} "
                     f"rounded={estimation['rounded_dimension_estimate']}"

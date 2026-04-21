@@ -651,6 +651,55 @@ class TestTrainingSmoke(unittest.TestCase):
         self.assertEqual(features.shape, (2, 16, 4, 8))
         self.assertFalse(features.requires_grad)
 
+    def test_extract_main_model_latent_batch_can_use_bottleneck_compressor(self) -> None:
+        model_config = FuXiLowerResConfig(
+            input_size=(33, 64),
+            time_steps=2,
+            in_chans=8,
+            aux_chans=2,
+            out_chans=8,
+            forecast_steps=2,
+            temb_dim=12,
+            patch_size=(4, 4),
+            embed_dim=16,
+            num_heads=4,
+            window_size=2,
+            depths=(1, 1, 1, 1),
+            num_groups=8,
+            mlp_hidden_dim=32,
+            device="cpu",
+            dtype=torch.float32,
+        )
+        compressor_config = FuXiBottleneckCompressorConfig(
+            input_channels=16,
+            spatial_size=model_config.latent_grid,
+            model_dim=16,
+            bottleneck_channels=1,
+            num_heads=4,
+            encoder_depth=1,
+            decoder_depth=1,
+            mlp_hidden_dim=32,
+            feature_source="second_block_features",
+            device="cpu",
+            dtype=torch.float32,
+        )
+        model = FuXiLowerRes(model_config)
+        compressor = FuXiBottleneckCompressor(compressor_config)
+        batch = {
+            "x": torch.randn(2, 2, 8, 33, 64),
+            "temb": torch.randn(2, 12),
+            "static_features": torch.randn(2, 2, 33, 64),
+        }
+
+        latent = training_pipeline._extract_main_model_latent_batch(
+            model,
+            batch,
+            latent_source="bottleneck_compressor",
+            bottleneck_compressor=compressor,
+        )
+
+        self.assertEqual(latent.shape, (2, 1, 4, 8))
+
     def test_charbonnier_loss_downweights_surface_channels(self) -> None:
         criterion = LatitudeWeightedCharbonnierLoss(
             build_fuxi_channel_names(),

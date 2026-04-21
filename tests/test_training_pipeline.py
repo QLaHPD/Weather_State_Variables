@@ -10,6 +10,8 @@ from torch.utils.data import DataLoader, Dataset
 from weather_state_variables.config import load_config_section
 from weather_state_variables.data import ArcoEra5FuXiDataConfig, build_fuxi_channel_names
 from weather_state_variables.models import (
+    FuXiBottleneckCompressor,
+    FuXiBottleneckCompressorConfig,
     FuXiIntrinsic,
     FuXiIntrinsicConfig,
     FuXiLowerRes,
@@ -17,9 +19,11 @@ from weather_state_variables.models import (
     FuXiLowerResEncoder,
 )
 from weather_state_variables.training import (
+    BottleneckCompressorTrainingConfig,
     IntrinsicTrainingConfig,
     LatitudeWeightedCharbonnierLoss,
     MainTrainingConfig,
+    run_bottleneck_compressor_smoke_test,
     run_intrinsic_model_smoke_test,
     run_main_model_smoke_test,
 )
@@ -74,8 +78,10 @@ class TestTrainingSmoke(unittest.TestCase):
     def test_training_configs_expose_gradient_accumulation(self) -> None:
         main_config = MainTrainingConfig.from_yaml()
         intrinsic_config = IntrinsicTrainingConfig.from_yaml()
+        compressor_config = BottleneckCompressorTrainingConfig.from_yaml()
         _, main_yaml = load_config_section("train_main")
         _, intrinsic_yaml = load_config_section("train_intrinsic")
+        _, compressor_yaml = load_config_section("train_bottleneck_compressor")
 
         self.assertGreaterEqual(main_config.gradient_accumulation_steps, 1)
         self.assertEqual(main_config.forecast_loss, "charbonnier")
@@ -107,6 +113,33 @@ class TestTrainingSmoke(unittest.TestCase):
             intrinsic_config.save_every_optimizer_steps,
             intrinsic_yaml.get("save_every_optimizer_steps"),
         )
+        self.assertGreaterEqual(compressor_config.gradient_accumulation_steps, 1)
+        self.assertEqual(
+            compressor_config.save_epoch_checkpoint,
+            bool(compressor_yaml.get("save_epoch_checkpoint", True)),
+        )
+        self.assertEqual(
+            compressor_config.save_best_checkpoint,
+            bool(compressor_yaml.get("save_best_checkpoint", True)),
+        )
+        self.assertIsNone(compressor_config.resume_checkpoint_path)
+        self.assertEqual(
+            compressor_config.detach_second_block_features,
+            bool(
+                compressor_yaml.get(
+                    "detach_second_block_features",
+                    compressor_yaml.get("detach_encoder_features", True),
+                )
+            ),
+        )
+        self.assertEqual(
+            compressor_config.save_every_train_batches,
+            compressor_yaml.get("save_every_train_batches"),
+        )
+        self.assertEqual(
+            compressor_config.save_every_optimizer_steps,
+            compressor_yaml.get("save_every_optimizer_steps"),
+        )
 
     def test_build_intrinsic_training_objects_preserves_intrinsic_feature_controls(self) -> None:
         config_path, intrinsic_yaml = load_config_section("intrinsic_model")
@@ -132,6 +165,21 @@ class TestTrainingSmoke(unittest.TestCase):
             self.assertEqual(intrinsic_config.input_channels, encoder_config.embed_dim)
             self.assertEqual(intrinsic_config.feature_channels, int(intrinsic_yaml["feature_channels"]))
             self.assertEqual(intrinsic_config.resblocks_per_stage, expected_resblocks)
+        finally:
+            training_pipeline._cleanup_distributed_runtime(runtime)
+
+    def test_build_bottleneck_compressor_training_objects_targets_encoder_bottleneck(self) -> None:
+        config_path, compressor_yaml = load_config_section("bottleneck_compressor_model")
+        _, encoder_config, compressor_config, _data_config, runtime, _model_dtype, _amp_dtype = (
+            training_pipeline._build_bottleneck_compressor_training_objects(config_path)
+        )
+
+        try:
+            self.assertEqual(compressor_config.input_channels, encoder_config.embed_dim)
+            self.assertEqual(compressor_config.feature_source, compressor_yaml["feature_source"])
+            self.assertEqual(compressor_config.spatial_size, encoder_config.latent_grid)
+            self.assertEqual(compressor_config.bottleneck_channels, 1)
+            self.assertEqual(compressor_config.positional_embedding, "learned_2d")
         finally:
             training_pipeline._cleanup_distributed_runtime(runtime)
 
@@ -230,6 +278,142 @@ class TestTrainingSmoke(unittest.TestCase):
         self.assertGreater(report["dimension_estimate"], 1.5)
         self.assertLess(report["dimension_estimate"], 2.5)
         self.assertEqual(report["rounded_dimension_estimate"], 2)
+
+    def test_two_nn_estimator_recovers_two_dimensional_plane(self) -> None:
+        rng = np.random.default_rng(0)
+        base = rng.normal(size=(512, 2)).astype(np.float32)
+        embedded = np.concatenate(
+            [base, np.zeros((512, 4), dtype=np.float32)],
+            axis=1,
+        )
+
+        report = training_pipeline._estimate_two_nn_dimension(
+            embedded,
+            discard_fraction=0.1,
+            n_jobs=1,
+        )
+
+        self.assertGreater(report["dimension_estimate"], 1.4)
+        self.assertLess(report["dimension_estimate"], 2.6)
+        self.assertEqual(report["rounded_dimension_estimate"], 2)
+        self.assertGreater(report["used_ratio_count"], 100)
+
+    def test_two_nn_estimator_from_cached_distances_matches_direct_estimator(self) -> None:
+        rng = np.random.default_rng(0)
+        base = rng.normal(size=(256, 2)).astype(np.float32)
+        embedded = np.concatenate(
+            [base, np.zeros((256, 4), dtype=np.float32)],
+            axis=1,
+        )
+
+        direct = training_pipeline._estimate_two_nn_dimension(
+            embedded,
+            discard_fraction=0.1,
+            n_jobs=1,
+        )
+        distance_matrix, feature_dim = training_pipeline._compute_pairwise_distance_matrix(
+            embedded,
+            n_jobs=1,
+        )
+        cached = training_pipeline._estimate_two_nn_dimension_from_distances(
+            distance_matrix,
+            discard_fraction=0.1,
+            feature_dim=feature_dim,
+        )
+
+        self.assertAlmostEqual(direct["dimension_estimate"], cached["dimension_estimate"], places=6)
+        self.assertEqual(cached["feature_dim"], embedded.shape[1])
+
+    def test_default_plateau_sample_sizes_double_to_max(self) -> None:
+        sample_sizes = training_pipeline._default_plateau_sample_sizes(
+            max_samples=1024,
+            min_samples=128,
+        )
+
+        self.assertEqual(sample_sizes, [128, 256, 512, 1024])
+
+    def test_detect_intrinsic_dimension_plateau_prefers_long_stable_window(self) -> None:
+        plateau = training_pipeline._detect_intrinsic_dimension_plateau(
+            [
+                {"sample_size": 64, "mean_dimension_estimate": 1.4, "stderr_dimension_estimate": 0.2},
+                {"sample_size": 128, "mean_dimension_estimate": 2.02, "stderr_dimension_estimate": 0.05},
+                {"sample_size": 256, "mean_dimension_estimate": 2.06, "stderr_dimension_estimate": 0.04},
+                {"sample_size": 512, "mean_dimension_estimate": 2.01, "stderr_dimension_estimate": 0.03},
+                {"sample_size": 1024, "mean_dimension_estimate": 2.45, "stderr_dimension_estimate": 0.07},
+            ],
+            relative_tolerance=0.05,
+            min_plateau_points=2,
+        )
+
+        self.assertTrue(plateau["found"])
+        self.assertEqual(plateau["start_sample_size"], 128)
+        self.assertEqual(plateau["end_sample_size"], 512)
+        self.assertGreater(plateau["dimension_estimate"], 1.9)
+        self.assertLess(plateau["dimension_estimate"], 2.1)
+
+    def test_plateau_search_reuses_single_latent_pool(self) -> None:
+        rng = np.random.default_rng(0)
+        base = rng.normal(size=(256, 2)).astype(np.float32)
+        embedded = np.concatenate(
+            [base, np.zeros((256, 4), dtype=np.float32)],
+            axis=1,
+        )
+        distance_matrix, feature_dim = training_pipeline._compute_pairwise_distance_matrix(
+            embedded,
+            n_jobs=1,
+        )
+        estimator = training_pipeline._build_intrinsic_dimension_estimator(
+            method="two_nn",
+            k1=10,
+            k2=20,
+            bias_correction=False,
+            two_nn_discard_fraction=0.1,
+        )
+
+        report = training_pipeline._run_intrinsic_dimension_plateau_search(
+            distance_matrix,
+            estimator=estimator,
+            feature_dim=feature_dim,
+            sample_sizes=[64, 128, 256],
+            repeats=3,
+            seed=0,
+            relative_tolerance=0.2,
+            min_plateau_points=2,
+        )
+
+        self.assertEqual(report["latent_pool_sample_count"], 256)
+        self.assertEqual(report["sample_sizes"], [64, 128, 256])
+        self.assertEqual(len(report["curve"]), 3)
+        self.assertEqual(report["curve"][-1]["repeat_count"], 3)
+        self.assertIn("single_cached_latent_pool", report["sampling_strategy"])
+
+    def test_fixed_index_shard_sampler_partitions_without_padding_or_duplicates(self) -> None:
+        indices = list(range(11))
+
+        shards = [
+            list(training_pipeline._FixedIndexShardSampler(indices, num_replicas=5, rank=rank))
+            for rank in range(5)
+        ]
+
+        self.assertEqual(sum(len(shard) for shard in shards), len(indices))
+        self.assertEqual(sorted(index for shard in shards for index in shard), indices)
+        self.assertEqual(len(set(index for shard in shards for index in shard)), len(indices))
+        self.assertEqual(shards[0], [0, 1, 2])
+        self.assertEqual(shards[-1], [9, 10])
+
+    def test_fixed_index_shard_sampler_handles_more_ranks_than_indices(self) -> None:
+        indices = [10, 20, 30]
+
+        shards = [
+            list(training_pipeline._FixedIndexShardSampler(indices, num_replicas=5, rank=rank))
+            for rank in range(5)
+        ]
+
+        self.assertEqual(shards[0], [10])
+        self.assertEqual(shards[1], [20])
+        self.assertEqual(shards[2], [30])
+        self.assertEqual(shards[3], [])
+        self.assertEqual(shards[4], [])
 
     def test_to_plain_data_converts_timestamps_numpy_and_tensors(self) -> None:
         plain = training_pipeline._to_plain_data(
@@ -430,6 +614,43 @@ class TestTrainingSmoke(unittest.TestCase):
             any(parameter.grad is not None for parameter in encoder.parameters())
         )
 
+    def test_encode_features_for_bottleneck_compressor_uses_second_block_features(self) -> None:
+        encoder_config = FuXiLowerResConfig(
+            input_size=(33, 64),
+            time_steps=2,
+            in_chans=8,
+            aux_chans=2,
+            out_chans=8,
+            forecast_steps=2,
+            temb_dim=12,
+            patch_size=(4, 4),
+            embed_dim=16,
+            num_heads=4,
+            window_size=2,
+            depths=(1, 1, 1, 1),
+            num_groups=8,
+            mlp_hidden_dim=32,
+            device="cpu",
+            dtype=torch.float32,
+        )
+        encoder = FuXiLowerResEncoder(encoder_config)
+        batch = {
+            "x": torch.randn(2, 2, 8, 33, 64),
+            "temb": torch.randn(2, 12),
+            "static_features": torch.randn(2, 2, 33, 64),
+        }
+
+        features = training_pipeline._encode_features_for_bottleneck_compressor(
+            encoder,
+            batch,
+            feature_source="second_block_features",
+            detach_features=True,
+            clear_encoder_grads=True,
+        )
+
+        self.assertEqual(features.shape, (2, 16, 4, 8))
+        self.assertFalse(features.requires_grad)
+
     def test_charbonnier_loss_downweights_surface_channels(self) -> None:
         criterion = LatitudeWeightedCharbonnierLoss(
             build_fuxi_channel_names(),
@@ -545,6 +766,54 @@ class TestTrainingSmoke(unittest.TestCase):
         self.assertEqual(report["patch_grid_features"]["shape"], [2, 16, 8, 16])
         self.assertEqual(report["intrinsic_output"]["z_intrinsic"]["shape"], [2, 3])
         self.assertEqual(report["intrinsic_output"]["patch_grid_features_recon"]["shape"], [2, 16, 8, 16])
+
+    def test_bottleneck_compressor_smoke_test_runs_on_tiny_models(self) -> None:
+        encoder_config = FuXiLowerResConfig(
+            input_size=(33, 64),
+            time_steps=2,
+            in_chans=8,
+            aux_chans=2,
+            out_chans=8,
+            forecast_steps=2,
+            temb_dim=12,
+            patch_size=(4, 4),
+            embed_dim=16,
+            num_heads=4,
+            window_size=2,
+            depths=(1, 1, 1, 1),
+            num_groups=8,
+            mlp_hidden_dim=32,
+            device="cpu",
+            dtype=torch.float32,
+        )
+        compressor_config = FuXiBottleneckCompressorConfig(
+            input_channels=16,
+            spatial_size=encoder_config.latent_grid,
+            model_dim=16,
+            bottleneck_channels=1,
+            num_heads=4,
+            encoder_depth=1,
+            decoder_depth=1,
+            mlp_hidden_dim=32,
+            positional_embedding="learned_2d",
+            feature_source="second_block_features",
+            device="cpu",
+            dtype=torch.float32,
+        )
+        encoder = FuXiLowerResEncoder(encoder_config)
+        compressor_model = FuXiBottleneckCompressor(compressor_config)
+
+        report = run_bottleneck_compressor_smoke_test(
+            encoder,
+            compressor_model,
+            batch_size=2,
+            print_outputs=False,
+        )
+
+        self.assertEqual(report["feature_source"], "second_block_features")
+        self.assertEqual(report["feature_grid"]["shape"], [2, 16, 4, 8])
+        self.assertEqual(report["compressor_output"]["z_bottleneck"]["shape"], [2, 1, 4, 8])
+        self.assertEqual(report["compressor_output"]["feature_grid_recon"]["shape"], [2, 16, 4, 8])
 
     def test_intrinsic_forecast_chain_runs_on_tiny_models(self) -> None:
         encoder_config = FuXiLowerResConfig(

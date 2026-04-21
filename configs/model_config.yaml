@@ -20,9 +20,22 @@ forecast_model:
 intrinsic_model:
   feature_channels: 1024
   resblocks_per_stage: [1, 1, 1]
-  d_intrinsic: 512
+  d_intrinsic: 6
   num_groups: 32
   apply_tanh: false
+  device: meta
+  dtype: float32
+
+bottleneck_compressor_model:
+  feature_source: second_block_features
+  model_dim: 1024
+  bottleneck_channels: 1
+  num_heads: 32
+  encoder_depth: 4
+  decoder_depth: 4
+  mlp_hidden_dim: 2048
+  dropout: 0.0
+  positional_embedding: learned_2d
   device: meta
   dtype: float32
 
@@ -55,7 +68,7 @@ train_main:
   gradient_accumulation_steps: 16
   learning_rate: 1.0e-5
   weight_decay: 0.005
-  max_epochs: 100
+  max_epochs: 55
   device: auto
   model_dtype: float32
   use_amp: true
@@ -65,7 +78,7 @@ train_main:
   upper_air_loss_weight: 1.0
   surface_loss_weight: 0.1
   gradient_clip_norm: null
-  output_dir: runs/main
+  output_dir: /media/ramdisk/runs/main
   checkpoint_name: main_last.pt
   best_checkpoint_name: main_best.pt
   resume_checkpoint_path: null
@@ -78,17 +91,17 @@ train_main:
   val_start_time: 2012-01-01 00:00:00
   val_end_time: 2012-12-31 23:00:00
   max_train_batches: 300000
-  max_val_batches: 100
+  max_val_batches: 1000
   log_every: 1
   print_model_summary: true
   summary_depth: 3
   random_smoke_batch_size: 1
 
 train_intrinsic:
-  batch_size: 1
+  batch_size: 4
   num_workers: 0
-  gradient_accumulation_steps: 16
-  learning_rate: 5.0e-5
+  gradient_accumulation_steps: 4
+  learning_rate: 1.0e-4
   weight_decay: 0.05
   max_epochs: 20
   device: auto
@@ -106,6 +119,39 @@ train_intrinsic:
   save_every_optimizer_steps: null
   main_checkpoint_path: runs/main/main_best.pt
   detach_second_block_features: false
+  train_start_time: 2000-01-01 00:00:00
+  train_end_time: 2011-12-31 23:00:00
+  val_start_time: 2012-01-01 00:00:00
+  val_end_time: 2012-12-31 23:00:00
+  max_train_batches: 100000
+  max_val_batches: 100
+  log_every: 1
+  print_model_summary: true
+  summary_depth: 3
+  random_smoke_batch_size: 1
+
+train_bottleneck_compressor:
+  batch_size: 8
+  num_workers: 0
+  gradient_accumulation_steps: 16
+  learning_rate: 1.0e-5
+  weight_decay: 0.001
+  max_epochs: 5
+  device: auto
+  model_dtype: float32
+  use_amp: true
+  amp_dtype: bfloat16
+  gradient_clip_norm: 1.0
+  output_dir: /media/ramdisk/runs/bottleneck_compressor
+  checkpoint_name: bottleneck_compressor_last.pt
+  best_checkpoint_name: bottleneck_compressor_best.pt
+  resume_checkpoint_path: null
+  save_epoch_checkpoint: true
+  save_best_checkpoint: true
+  save_every_train_batches: null
+  save_every_optimizer_steps: null
+  main_checkpoint_path: runs/main/main_best.pt
+  detach_second_block_features: true
   train_start_time: 2000-01-01 00:00:00
   train_end_time: 2011-12-31 23:00:00
   val_start_time: 2012-01-01 00:00:00

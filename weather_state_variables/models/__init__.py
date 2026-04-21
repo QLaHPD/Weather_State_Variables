@@ -7,12 +7,18 @@ from importlib import import_module
 from ..config import DEFAULT_MODEL_CONFIG_PATH
 
 _INTRINSIC_MODULE = f"{__name__}.fuxi_intrinsic"
+_BOTTLENECK_COMPRESSOR_MODULE = f"{__name__}.bottleneck_compressor"
 _LOWER_RES_MODULE = f"{__name__}.fuxi_lower_res"
 _SHORT_MODULE = f"{__name__}.fuxi_short"
 
 _LAZY_IMPORTS = {
     "DEFAULT_MODEL_PATH": (_SHORT_MODULE, "DEFAULT_MODEL_PATH"),
     "FuXiEncoderOutput": (_LOWER_RES_MODULE, "FuXiEncoderOutput"),
+    "FuXiBottleneckCompressor": (_BOTTLENECK_COMPRESSOR_MODULE, "FuXiBottleneckCompressor"),
+    "FuXiBottleneckCompressorConfig": (
+        _BOTTLENECK_COMPRESSOR_MODULE,
+        "FuXiBottleneckCompressorConfig",
+    ),
     "FuXiIntrinsic": (_INTRINSIC_MODULE, "FuXiIntrinsic"),
     "FuXiIntrinsicConfig": (_INTRINSIC_MODULE, "FuXiIntrinsicConfig"),
     "FuXiLowerRes": (_LOWER_RES_MODULE, "FuXiLowerRes"),

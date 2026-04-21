@@ -1,0 +1,45 @@
+{
+  "batch_size": 2,
+  "checkpoint_epoch": 26,
+  "checkpoint_global_batch_step": 273494,
+  "checkpoint_optimizer_step": 8357,
+  "checkpoint_path": "/home/lemm2/CursorProjetcs/Weather_State_Variables/runs/main/main_best.pt",
+  "end_time": "2012-12-31 23:00:00",
+  "estimation": {
+    "dimension_estimate": 6.360561578714924,
+    "discard_fraction": 0.1,
+    "feature_dim": 1059840,
+    "fit_intercept": false,
+    "origin_fit_r2": 0.7784983840140245,
+    "retained_ratio_count": 460,
+    "rounded_dimension_estimate": 6,
+    "sample_count": 512,
+    "used_ratio_count": 460,
+    "valid_ratio_count": 512
+  },
+  "flattened_latent_dim": 1059840,
+  "latent_shape": [
+    1024,
+    23,
+    45
+  ],
+  "latent_source": "second_block_features",
+  "max_samples": 512,
+  "method": "two_nn",
+  "num_workers": 16,
+  "split": "val",
+  "start_time": "2012-01-01 00:00:00",
+  "two_nn": {
+    "dimension_estimate": 6.360561578714924,
+    "discard_fraction": 0.1,
+    "feature_dim": 1059840,
+    "fit_intercept": false,
+    "origin_fit_r2": 0.7784983840140245,
+    "retained_ratio_count": 460,
+    "rounded_dimension_estimate": 6,
+    "sample_count": 512,
+    "used_ratio_count": 460,
+    "valid_ratio_count": 512
+  }
+}
+

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -16,8 +17,8 @@ from weather_state_variables.training.pipeline import _to_plain_data
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Estimate the intrinsic dimension of a main-model latent using the "
-            "Levina-Bickel nearest-neighbor estimator."
+            "Estimate the intrinsic dimension of a main-model latent using a "
+            "nearest-neighbor intrinsic-dimension estimator."
         )
     )
     parser.add_argument(
@@ -71,21 +72,85 @@ def parse_args() -> argparse.Namespace:
         help="Which encoder latent tensor to flatten into sample vectors.",
     )
     parser.add_argument(
+        "--method",
+        choices=("two_nn", "levina_bickel"),
+        default="two_nn",
+        help="Intrinsic-dimension estimator to use.",
+    )
+    parser.add_argument(
         "--k1",
         type=int,
         default=10,
-        help="First neighborhood size for Levina-Bickel aggregation.",
+        help="First neighborhood size for Levina-Bickel aggregation. Ignored for Two-NN.",
     )
     parser.add_argument(
         "--k2",
         type=int,
         default=20,
-        help="Last neighborhood size for Levina-Bickel aggregation.",
+        help="Last neighborhood size for Levina-Bickel aggregation. Ignored for Two-NN.",
     )
     parser.add_argument(
         "--bias-corrected",
         action="store_true",
-        help="Use the common MacKay-style bias correction (k-2 numerator) instead of the original k-1 form.",
+        help="Use the common MacKay-style bias correction for Levina-Bickel. Ignored for Two-NN.",
+    )
+    parser.add_argument(
+        "--two-nn-discard-fraction",
+        type=float,
+        default=0.1,
+        help=(
+            "Discard this top fraction of largest r2/r1 ratios before the Two-NN "
+            "origin-constrained line fit. The original paper suggests a high-percentile cutoff such as 90%%."
+        ),
+    )
+    parser.add_argument(
+        "--plateau-search",
+        action="store_true",
+        help=(
+            "Run repeated subsample-size analysis from one cached latent pool to search for an effective-ID plateau."
+        ),
+    )
+    parser.add_argument(
+        "--plateau-sample-sizes",
+        nargs="+",
+        type=int,
+        default=None,
+        help=(
+            "Optional explicit subset sizes for plateau search. If omitted, the script uses a doubling schedule "
+            "such as 128 256 512 ... up to max-samples."
+        ),
+    )
+    parser.add_argument(
+        "--plateau-min-samples",
+        type=int,
+        default=128,
+        help="Minimum subset size for the automatic plateau-search schedule.",
+    )
+    parser.add_argument(
+        "--plateau-repeats",
+        type=int,
+        default=8,
+        help="How many random prefix-subset repeats to run per plateau-search sample size.",
+    )
+    parser.add_argument(
+        "--plateau-seed",
+        type=int,
+        default=0,
+        help="Random seed for plateau-search subset permutations.",
+    )
+    parser.add_argument(
+        "--plateau-relative-tolerance",
+        type=float,
+        default=0.1,
+        help=(
+            "Relative range tolerance used to declare a plateau from the repeated sample-size curve."
+        ),
+    )
+    parser.add_argument(
+        "--plateau-min-points",
+        type=int,
+        default=2,
+        help="Minimum number of consecutive sample sizes required for a detected plateau.",
     )
     parser.add_argument(
         "--n-jobs",
@@ -103,6 +168,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print the final report as JSON only.",
     )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable the latent-sample generation progress bar.",
+    )
     return parser.parse_args()
 
 
@@ -118,14 +188,24 @@ def main() -> None:
         start_time=args.start_time,
         end_time=args.end_time,
         latent_source=args.latent_source,
+        method=args.method,
         k1=args.k1,
         k2=args.k2,
         bias_correction=args.bias_corrected,
+        two_nn_discard_fraction=args.two_nn_discard_fraction,
+        plateau_search=args.plateau_search,
+        plateau_sample_sizes=args.plateau_sample_sizes,
+        plateau_min_samples=args.plateau_min_samples,
+        plateau_repeats=args.plateau_repeats,
+        plateau_seed=args.plateau_seed,
+        plateau_relative_tolerance=args.plateau_relative_tolerance,
+        plateau_min_points=args.plateau_min_points,
+        show_progress=not args.json and not args.no_progress,
         print_model_summary=args.print_model_summary,
         n_jobs=args.n_jobs,
         print_result=not args.json,
     )
-    if args.json:
+    if args.json and int(os.environ.get("RANK", "0")) == 0:
         print(json.dumps(_to_plain_data(report), indent=2, sort_keys=True))
 
 

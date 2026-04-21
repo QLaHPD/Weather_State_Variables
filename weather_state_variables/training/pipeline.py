@@ -5,7 +5,8 @@ from dataclasses import asdict, dataclass, replace
 import json
 import os
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from tempfile import mkdtemp
+from typing import Any, Callable, Iterable, Sequence
 
 import numpy as np
 import pandas as pd
@@ -20,6 +21,10 @@ try:
     from torchinfo import summary as torchinfo_summary
 except ImportError:
     torchinfo_summary = None
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover
+    tqdm = None
 
 from ..config import (
     DEFAULT_MODEL_CONFIG_PATH,
@@ -34,6 +39,8 @@ from ..data import (
     build_arco_era5_dataloader,
 )
 from ..models import (
+    FuXiBottleneckCompressor,
+    FuXiBottleneckCompressorConfig,
     FuXiIntrinsic,
     FuXiIntrinsicConfig,
     FuXiLowerRes,
@@ -81,7 +88,13 @@ def _resolve_distributed_runtime(device_name: str) -> DistributedRuntime:
             backend = "gloo"
 
         if not dist.is_initialized():
-            dist.init_process_group(backend=backend)
+            if device.type == "cuda":
+                try:
+                    dist.init_process_group(backend=backend, device_id=device)
+                except TypeError:
+                    dist.init_process_group(backend=backend)
+            else:
+                dist.init_process_group(backend=backend)
 
         return DistributedRuntime(
             enabled=True,
@@ -100,6 +113,18 @@ def _resolve_distributed_runtime(device_name: str) -> DistributedRuntime:
         world_size=1,
         device=_resolve_device(device_name),
     )
+
+
+def _distributed_barrier(runtime: DistributedRuntime) -> None:
+    if not runtime.enabled:
+        return
+    if runtime.device.type == "cuda":
+        device_index = runtime.device.index
+        if device_index is None:
+            raise RuntimeError("CUDA distributed barrier requires a concrete device index.")
+        dist.barrier(device_ids=[int(device_index)])
+        return
+    dist.barrier()
 
 
 def _cleanup_distributed_runtime(runtime: DistributedRuntime) -> None:
@@ -384,6 +409,22 @@ def _make_intrinsic_random_inputs(
     )
 
 
+def _make_bottleneck_compressor_random_inputs(
+    compressor_config: FuXiBottleneckCompressorConfig,
+    *,
+    batch_size: int,
+    device: torch.device,
+) -> Tensor:
+    dtype = compressor_config.dtype or torch.float32
+    return torch.randn(
+        batch_size,
+        compressor_config.resolved_input_channels,
+        *compressor_config.spatial_size,
+        device=device,
+        dtype=dtype,
+    )
+
+
 def run_main_model_smoke_test(
     model: FuXiLowerRes,
     *,
@@ -404,6 +445,47 @@ def run_main_model_smoke_test(
     }
     if print_outputs:
         _print_json_block("main_smoke_test", report)
+    return report
+
+
+def run_bottleneck_compressor_smoke_test(
+    encoder: FuXiLowerResEncoder,
+    compressor_model: FuXiBottleneckCompressor,
+    *,
+    batch_size: int,
+    print_outputs: bool = True,
+) -> dict[str, Any]:
+    device = next(compressor_model.parameters()).device
+    x, temb, static_features = _make_main_random_inputs(encoder.config, batch_size=batch_size, device=device)
+    with torch.no_grad():
+        encoded = encoder(
+            x,
+            temb,
+            static_features=static_features,
+            return_patch_grid_features=(
+                compressor_model.config.feature_source == "patch_grid_features"
+            ),
+        )
+        if compressor_model.config.feature_source == "patch_grid_features":
+            feature_grid = _require_patch_grid_features(encoded)
+        else:
+            feature_grid = encoded.second_block_features
+        outputs = compressor_model(feature_grid)
+    report = {
+        "encoder_input": {
+            "x": {"shape": list(x.shape), "dtype": str(x.dtype)},
+            "temb": {"shape": list(temb.shape), "dtype": str(temb.dtype)},
+            "static_features": {"shape": list(static_features.shape), "dtype": str(static_features.dtype)},
+        },
+        "feature_source": compressor_model.config.feature_source,
+        "feature_grid": {
+            "shape": list(feature_grid.shape),
+            "dtype": str(feature_grid.dtype),
+        },
+        "compressor_output": _tensor_tree_shapes(outputs),
+    }
+    if print_outputs:
+        _print_json_block("bottleneck_compressor_smoke_test", report)
     return report
 
 
@@ -470,6 +552,34 @@ def _encode_patch_grid_features_for_intrinsic(
     )
     patch_grid_features = _require_patch_grid_features(encoded)
     return patch_grid_features.detach() if detach_features else patch_grid_features
+
+
+def _encode_features_for_bottleneck_compressor(
+    encoder: FuXiLowerResEncoder,
+    batch: dict[str, Tensor],
+    *,
+    feature_source: str,
+    detach_features: bool,
+    clear_encoder_grads: bool,
+) -> Tensor:
+    if clear_encoder_grads:
+        encoder.zero_grad(set_to_none=True)
+    encoded = encoder(
+        batch["x"],
+        batch["temb"],
+        static_features=batch["static_features"],
+        return_patch_grid_features=(feature_source == "patch_grid_features"),
+    )
+    if feature_source == "patch_grid_features":
+        feature_grid = _require_patch_grid_features(encoded)
+    elif feature_source == "second_block_features":
+        feature_grid = encoded.second_block_features
+    else:
+        raise ValueError(
+            "feature_source must be either 'second_block_features' or 'patch_grid_features', "
+            f"got {feature_source!r}"
+        )
+    return feature_grid.detach() if detach_features else feature_grid
 
 
 class _IntrinsicForecastChain(nn.Module):
@@ -1557,6 +1667,109 @@ class IntrinsicTrainingConfig:
         )
 
 
+@dataclass(frozen=True)
+class BottleneckCompressorTrainingConfig:
+    batch_size: int = 1
+    num_workers: int = 0
+    gradient_accumulation_steps: int = 1
+    learning_rate: float = 1e-4
+    weight_decay: float = 0.0
+    max_epochs: int = 1
+    device: str = "auto"
+    model_dtype: str = "float32"
+    use_amp: bool = False
+    amp_dtype: str = "float16"
+    gradient_clip_norm: float | None = None
+    output_dir: Path = Path("runs/bottleneck_compressor")
+    checkpoint_name: str = "bottleneck_compressor_last.pt"
+    best_checkpoint_name: str = "bottleneck_compressor_best.pt"
+    resume_checkpoint_path: Path | None = None
+    save_epoch_checkpoint: bool = True
+    save_best_checkpoint: bool = True
+    save_every_train_batches: int | None = None
+    save_every_optimizer_steps: int | None = None
+    main_checkpoint_path: Path | None = None
+    detach_second_block_features: bool = True
+    train_start_time: pd.Timestamp | None = None
+    train_end_time: pd.Timestamp | None = None
+    val_start_time: pd.Timestamp | None = None
+    val_end_time: pd.Timestamp | None = None
+    max_train_batches: int | None = None
+    max_val_batches: int | None = None
+    log_every: int = 10
+    print_model_summary: bool = True
+    summary_depth: int = 3
+    random_smoke_batch_size: int = 1
+    config_path: Path = DEFAULT_MODEL_CONFIG_PATH
+
+    @classmethod
+    def from_yaml(
+        cls,
+        config_path: str | Path = DEFAULT_MODEL_CONFIG_PATH,
+    ) -> "BottleneckCompressorTrainingConfig":
+        resolved_config_path, data = load_config_section("train_bottleneck_compressor", config_path)
+        checkpoint_value = data.get("main_checkpoint_path")
+        checkpoint_path = None
+        if checkpoint_value not in {None, ""}:
+            checkpoint_path = resolve_repo_path(checkpoint_value, config_path=resolved_config_path)
+        return cls(
+            batch_size=int(data.get("batch_size", 1)),
+            num_workers=int(data.get("num_workers", 0)),
+            gradient_accumulation_steps=_to_positive_int(
+                data.get("gradient_accumulation_steps"),
+                default=1,
+                field_name="train_bottleneck_compressor.gradient_accumulation_steps",
+            ),
+            learning_rate=float(data.get("learning_rate", 1e-4)),
+            weight_decay=float(data.get("weight_decay", 0.0)),
+            max_epochs=int(data.get("max_epochs", 1)),
+            device=str(data.get("device", "auto")),
+            model_dtype=str(data.get("model_dtype", "float32")),
+            use_amp=bool(data.get("use_amp", False)),
+            amp_dtype=str(data.get("amp_dtype", "float16")),
+            gradient_clip_norm=_to_optional_float(data.get("gradient_clip_norm")),
+            output_dir=resolve_repo_path(
+                data.get("output_dir", "runs/bottleneck_compressor"),
+                config_path=resolved_config_path,
+            ),
+            checkpoint_name=str(data.get("checkpoint_name", "bottleneck_compressor_last.pt")),
+            best_checkpoint_name=str(data.get("best_checkpoint_name", "bottleneck_compressor_best.pt")),
+            resume_checkpoint_path=(
+                None
+                if data.get("resume_checkpoint_path") in {None, ""}
+                else resolve_repo_path(data.get("resume_checkpoint_path"), config_path=resolved_config_path)
+            ),
+            save_epoch_checkpoint=bool(data.get("save_epoch_checkpoint", True)),
+            save_best_checkpoint=bool(data.get("save_best_checkpoint", True)),
+            save_every_train_batches=_to_optional_positive_int(
+                data.get("save_every_train_batches"),
+                field_name="train_bottleneck_compressor.save_every_train_batches",
+            ),
+            save_every_optimizer_steps=_to_optional_positive_int(
+                data.get("save_every_optimizer_steps"),
+                field_name="train_bottleneck_compressor.save_every_optimizer_steps",
+            ),
+            main_checkpoint_path=checkpoint_path,
+            detach_second_block_features=bool(
+                data.get(
+                    "detach_second_block_features",
+                    data.get("detach_encoder_features", True),
+                )
+            ),
+            train_start_time=_to_optional_timestamp(data.get("train_start_time")),
+            train_end_time=_to_optional_timestamp(data.get("train_end_time")),
+            val_start_time=_to_optional_timestamp(data.get("val_start_time")),
+            val_end_time=_to_optional_timestamp(data.get("val_end_time")),
+            max_train_batches=_to_optional_int(data.get("max_train_batches")),
+            max_val_batches=_to_optional_int(data.get("max_val_batches")),
+            log_every=int(data.get("log_every", 10)),
+            print_model_summary=bool(data.get("print_model_summary", True)),
+            summary_depth=int(data.get("summary_depth", 3)),
+            random_smoke_batch_size=int(data.get("random_smoke_batch_size", 1)),
+            config_path=resolved_config_path,
+        )
+
+
 def _build_main_training_objects(
     config_path: str | Path,
 ) -> tuple[
@@ -1631,6 +1844,53 @@ def _build_intrinsic_training_objects(
     return train_config, encoder_config, intrinsic_config, data_config, runtime, model_dtype, amp_dtype
 
 
+def _build_bottleneck_compressor_training_objects(
+    config_path: str | Path,
+) -> tuple[
+    BottleneckCompressorTrainingConfig,
+    FuXiLowerResConfig,
+    FuXiBottleneckCompressorConfig,
+    ArcoEra5FuXiDataConfig,
+    DistributedRuntime,
+    torch.dtype,
+    torch.dtype | None,
+]:
+    train_config = BottleneckCompressorTrainingConfig.from_yaml(config_path)
+    runtime = _resolve_distributed_runtime(train_config.device)
+    model_dtype = resolve_torch_dtype(train_config.model_dtype) or torch.float32
+    amp_dtype = resolve_torch_dtype(train_config.amp_dtype)
+    _validate_training_precision_config(
+        section_name="train_bottleneck_compressor",
+        use_amp=train_config.use_amp,
+        model_dtype=model_dtype,
+        amp_dtype=amp_dtype,
+    )
+
+    encoder_config = replace(
+        FuXiLowerResConfig.from_yaml(config_path),
+        device=runtime.device,
+        dtype=model_dtype,
+    )
+    loaded_compressor_config = FuXiBottleneckCompressorConfig.from_yaml(config_path)
+    spatial_size = (
+        encoder_config.patch_grid
+        if loaded_compressor_config.feature_source == "patch_grid_features"
+        else encoder_config.latent_grid
+    )
+    compressor_config = replace(
+        loaded_compressor_config,
+        device=runtime.device,
+        dtype=model_dtype,
+        input_channels=encoder_config.embed_dim,
+        spatial_size=spatial_size,
+    )
+    data_config = replace(
+        ArcoEra5FuXiDataConfig.from_yaml(config_path),
+        forecast_steps=encoder_config.forecast_steps,
+    )
+    return train_config, encoder_config, compressor_config, data_config, runtime, model_dtype, amp_dtype
+
+
 def _build_split_dataloaders(
     data_config: ArcoEra5FuXiDataConfig,
     *,
@@ -1683,18 +1943,12 @@ def _build_eval_dataloader(
     end_time: pd.Timestamp | None,
     pin_memory: bool,
 ) -> tuple[DataLoader[dict[str, Any]], Sampler[Any] | None]:
-    dataset = ArcoEra5FuXiDataset(
-        replace(
-            data_config,
-            start_time=start_time,
-            end_time=end_time,
-        )
+    dataset = _build_eval_dataset(
+        data_config,
+        runtime=runtime,
+        start_time=start_time,
+        end_time=end_time,
     )
-    if data_config.apply_normalization:
-        if runtime.is_primary:
-            dataset.ensure_normalization_stats()
-        if runtime.enabled:
-            dist.barrier()
     sampler: Sampler[Any] | None = None
     if runtime.enabled:
         sampler = ContiguousDistributedSampler(
@@ -1711,6 +1965,61 @@ def _build_eval_dataloader(
         sampler=sampler,
     )
     return loader, sampler
+
+
+class _FixedIndexShardSampler(Sampler[int]):
+    """Shard an explicit index list across ranks without padding or duplication."""
+
+    def __init__(
+        self,
+        indices: Sequence[int],
+        *,
+        num_replicas: int,
+        rank: int,
+    ) -> None:
+        if num_replicas <= 0:
+            raise ValueError(f"num_replicas must be positive, got {num_replicas}")
+        if rank < 0 or rank >= num_replicas:
+            raise ValueError(f"rank must be in [0, {num_replicas}), got {rank}")
+
+        self.indices = [int(index) for index in indices]
+        self.num_replicas = int(num_replicas)
+        self.rank = int(rank)
+
+        total = len(self.indices)
+        base = total // self.num_replicas
+        remainder = total % self.num_replicas
+        start = self.rank * base + min(self.rank, remainder)
+        count = base + (1 if self.rank < remainder else 0)
+        self.local_indices = self.indices[start : start + count]
+
+    def __iter__(self):
+        return iter(self.local_indices)
+
+    def __len__(self) -> int:
+        return len(self.local_indices)
+
+
+def _build_eval_dataset(
+    data_config: ArcoEra5FuXiDataConfig,
+    *,
+    runtime: DistributedRuntime,
+    start_time: pd.Timestamp | None,
+    end_time: pd.Timestamp | None,
+) -> ArcoEra5FuXiDataset:
+    dataset = ArcoEra5FuXiDataset(
+        replace(
+            data_config,
+            start_time=start_time,
+            end_time=end_time,
+        )
+    )
+    if data_config.apply_normalization:
+        if runtime.is_primary:
+            dataset.ensure_normalization_stats()
+        if runtime.enabled:
+            _distributed_barrier(runtime)
+    return dataset
 
 
 def _save_checkpoint(path: Path, payload: dict[str, Any]) -> None:
@@ -1773,6 +2082,26 @@ def _load_intrinsic_checkpoint(model: FuXiIntrinsic, checkpoint_path: Path) -> d
         state_dict = checkpoint
     else:
         raise ValueError(f"Unsupported intrinsic checkpoint format at {checkpoint_path}")
+    model.load_state_dict(state_dict, strict=True)
+    return checkpoint if isinstance(checkpoint, dict) else None
+
+
+def _load_bottleneck_compressor_checkpoint(
+    model: FuXiBottleneckCompressor,
+    checkpoint_path: Path,
+) -> dict[str, Any] | None:
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    state_dict: dict[str, Tensor]
+    if isinstance(checkpoint, dict) and "compressor_state_dict" in checkpoint:
+        state_dict = checkpoint["compressor_state_dict"]
+    elif isinstance(checkpoint, dict) and "bottleneck_compressor_state_dict" in checkpoint:
+        state_dict = checkpoint["bottleneck_compressor_state_dict"]
+    elif isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+    elif isinstance(checkpoint, dict) and all(isinstance(value, Tensor) for value in checkpoint.values()):
+        state_dict = checkpoint
+    else:
+        raise ValueError(f"Unsupported bottleneck compressor checkpoint format at {checkpoint_path}")
     model.load_state_dict(state_dict, strict=True)
     return checkpoint if isinstance(checkpoint, dict) else None
 
@@ -2230,25 +2559,48 @@ def _extract_main_model_latent_batch(
     return encoded.second_block_features
 
 
-def _estimate_levina_bickel_dimension(
+def _compute_pairwise_distance_matrix(
     samples: np.ndarray,
     *,
-    k1: int,
-    k2: int,
-    bias_correction: bool = False,
     n_jobs: int | None = None,
-) -> dict[str, Any]:
+) -> tuple[np.ndarray, int]:
     try:
-        from sklearn.neighbors import NearestNeighbors
+        from sklearn.metrics import pairwise_distances
     except ImportError as exc:  # pragma: no cover - depends on optional env dependency
         raise ImportError(
-            "Levina-Bickel estimation requires scikit-learn. Install it in the active environment."
+            "Intrinsic-dimension estimation requires scikit-learn. Install it in the active environment."
         ) from exc
 
     array = np.asarray(samples, dtype=np.float32)
     if array.ndim != 2:
         raise ValueError(f"Expected samples shaped [N, D], got {tuple(array.shape)}")
     sample_count, feature_dim = array.shape
+    if sample_count < 2:
+        raise ValueError(
+            "Intrinsic-dimension estimation requires at least 2 samples, "
+            f"got {sample_count}"
+        )
+
+    distance_matrix = pairwise_distances(array, metric="euclidean", n_jobs=n_jobs)
+    distance_matrix = np.asarray(distance_matrix, dtype=np.float64)
+    np.fill_diagonal(distance_matrix, np.inf)
+    return distance_matrix, int(feature_dim)
+
+
+def _estimate_levina_bickel_dimension_from_distances(
+    distance_matrix: np.ndarray,
+    *,
+    k1: int,
+    k2: int,
+    bias_correction: bool = False,
+    feature_dim: int | None = None,
+) -> dict[str, Any]:
+    pairwise = np.asarray(distance_matrix, dtype=np.float64)
+    if pairwise.ndim != 2 or pairwise.shape[0] != pairwise.shape[1]:
+        raise ValueError(
+            f"Expected a square pairwise distance matrix, got shape {tuple(pairwise.shape)}"
+        )
+    sample_count = int(pairwise.shape[0])
     if sample_count < 4:
         raise ValueError(
             "Levina-Bickel estimation requires at least 4 samples, "
@@ -2263,18 +2615,9 @@ def _estimate_levina_bickel_dimension(
             f"Need more samples than k2 for Levina-Bickel, got sample_count={sample_count}, k2={k2}"
         )
 
-    neighbors = NearestNeighbors(
-        n_neighbors=int(k2) + 1,
-        algorithm="brute",
-        metric="euclidean",
-        n_jobs=n_jobs,
-    )
-    neighbors.fit(array)
-    distances, _indices = neighbors.kneighbors(array)
-    neighbor_distances = np.maximum(
-        distances[:, 1:].astype(np.float64, copy=False),
-        np.finfo(np.float64).tiny,
-    )
+    neighbor_distances = np.partition(pairwise, kth=int(k2) - 1, axis=1)[:, : int(k2)]
+    neighbor_distances.sort(axis=1)
+    neighbor_distances = np.maximum(neighbor_distances, np.finfo(np.float64).tiny)
 
     estimates_by_k: dict[str, float] = {}
     stderr_by_k: dict[str, float] = {}
@@ -2307,7 +2650,7 @@ def _estimate_levina_bickel_dimension(
 
     return {
         "sample_count": int(sample_count),
-        "feature_dim": int(feature_dim),
+        "feature_dim": None if feature_dim is None else int(feature_dim),
         "k1": int(k1),
         "k2": int(k2),
         "bias_correction": bool(bias_correction),
@@ -2317,6 +2660,450 @@ def _estimate_levina_bickel_dimension(
         "estimates_by_k": estimates_by_k,
         "stderr_by_k": stderr_by_k,
     }
+
+
+def _estimate_levina_bickel_dimension(
+    samples: np.ndarray,
+    *,
+    k1: int,
+    k2: int,
+    bias_correction: bool = False,
+    n_jobs: int | None = None,
+) -> dict[str, Any]:
+    distance_matrix, feature_dim = _compute_pairwise_distance_matrix(samples, n_jobs=n_jobs)
+    return _estimate_levina_bickel_dimension_from_distances(
+        distance_matrix,
+        k1=k1,
+        k2=k2,
+        bias_correction=bias_correction,
+        feature_dim=feature_dim,
+    )
+
+
+def _estimate_two_nn_dimension_from_distances(
+    distance_matrix: np.ndarray,
+    *,
+    discard_fraction: float = 0.1,
+    feature_dim: int | None = None,
+) -> dict[str, Any]:
+    pairwise = np.asarray(distance_matrix, dtype=np.float64)
+    if pairwise.ndim != 2 or pairwise.shape[0] != pairwise.shape[1]:
+        raise ValueError(
+            f"Expected a square pairwise distance matrix, got shape {tuple(pairwise.shape)}"
+        )
+    sample_count = int(pairwise.shape[0])
+    if sample_count < 3:
+        raise ValueError(
+            "Two-NN intrinsic-dimension estimation requires at least 3 samples, "
+            f"got {sample_count}"
+        )
+    if not 0.0 <= float(discard_fraction) < 1.0:
+        raise ValueError(
+            f"discard_fraction must be in the half-open interval [0, 1), got {discard_fraction}"
+        )
+
+    nearest_distances = np.partition(pairwise, kth=1, axis=1)[:, :2]
+    nearest_distances.sort(axis=1)
+    first_neighbor = nearest_distances[:, 0]
+    second_neighbor = nearest_distances[:, 1]
+
+    ratio_mask = (
+        np.isfinite(first_neighbor)
+        & np.isfinite(second_neighbor)
+        & (first_neighbor > 0.0)
+        & (second_neighbor > first_neighbor)
+    )
+    if not np.any(ratio_mask):
+        raise ValueError(
+            "Two-NN could not find any valid nearest-neighbor ratios. "
+            "This usually means the latent samples contain duplicates or degenerate distances."
+        )
+
+    mu = np.sort(second_neighbor[ratio_mask] / first_neighbor[ratio_mask])
+    valid_ratio_count = int(mu.size)
+    if valid_ratio_count < 3:
+        raise ValueError(
+            "Two-NN requires at least 3 valid nearest-neighbor ratios after filtering, "
+            f"got {valid_ratio_count}"
+        )
+
+    retained_ratio_count = max(2, int(np.floor((1.0 - float(discard_fraction)) * valid_ratio_count)))
+    retained_ratio_count = min(retained_ratio_count, valid_ratio_count)
+    retained_mu = mu[:retained_ratio_count]
+    empirical_cdf = np.arange(1, retained_ratio_count + 1, dtype=np.float64) / float(valid_ratio_count)
+
+    regression_mask = empirical_cdf < 1.0
+    regression_mask &= retained_mu > 1.0
+    x = np.log(retained_mu[regression_mask])
+    y = -np.log1p(-empirical_cdf[regression_mask])
+    if x.size < 2:
+        raise ValueError(
+            "Two-NN could not build a stable regression set after filtering. "
+            "Try increasing max_samples or lowering discard_fraction."
+        )
+
+    denominator = float(np.dot(x, x))
+    if denominator <= np.finfo(np.float64).tiny:
+        raise ValueError(
+            "Two-NN regression denominator is numerically zero. "
+            "The nearest-neighbor ratios are too degenerate to estimate intrinsic dimension."
+        )
+
+    dimension_estimate = float(np.dot(x, y) / denominator)
+    rounded_estimate = int(np.rint(dimension_estimate))
+    fitted_y = dimension_estimate * x
+    residual_sum_squares = float(np.square(y - fitted_y).sum())
+    total_sum_squares = float(np.square(y).sum())
+    origin_fit_r2 = (
+        None
+        if total_sum_squares <= np.finfo(np.float64).tiny
+        else float(1.0 - residual_sum_squares / total_sum_squares)
+    )
+
+    return {
+        "sample_count": int(sample_count),
+        "feature_dim": None if feature_dim is None else int(feature_dim),
+        "discard_fraction": float(discard_fraction),
+        "valid_ratio_count": valid_ratio_count,
+        "retained_ratio_count": int(retained_ratio_count),
+        "used_ratio_count": int(x.size),
+        "fit_intercept": False,
+        "dimension_estimate": dimension_estimate,
+        "rounded_dimension_estimate": rounded_estimate,
+        "origin_fit_r2": origin_fit_r2,
+    }
+
+
+def _estimate_two_nn_dimension(
+    samples: np.ndarray,
+    *,
+    discard_fraction: float = 0.1,
+    n_jobs: int | None = None,
+) -> dict[str, Any]:
+    distance_matrix, feature_dim = _compute_pairwise_distance_matrix(samples, n_jobs=n_jobs)
+    return _estimate_two_nn_dimension_from_distances(
+        distance_matrix,
+        discard_fraction=discard_fraction,
+        feature_dim=feature_dim,
+    )
+
+
+def _build_intrinsic_dimension_estimator(
+    *,
+    method: str,
+    k1: int,
+    k2: int,
+    bias_correction: bool,
+    two_nn_discard_fraction: float,
+) -> Callable[[np.ndarray, int | None], dict[str, Any]]:
+    normalized_method = method.strip().lower()
+    if normalized_method == "two_nn":
+        return lambda distance_matrix, feature_dim=None: _estimate_two_nn_dimension_from_distances(
+            distance_matrix,
+            discard_fraction=two_nn_discard_fraction,
+            feature_dim=feature_dim,
+        )
+    if normalized_method == "levina_bickel":
+        return lambda distance_matrix, feature_dim=None: _estimate_levina_bickel_dimension_from_distances(
+            distance_matrix,
+            k1=k1,
+            k2=k2,
+            bias_correction=bias_correction,
+            feature_dim=feature_dim,
+        )
+    raise ValueError(f"Unsupported intrinsic-dimension method {method!r}")
+
+
+def _round_up_to_power_of_two(value: int) -> int:
+    if value <= 1:
+        return 1
+    return 1 << (int(value) - 1).bit_length()
+
+
+def _default_plateau_sample_sizes(
+    *,
+    max_samples: int,
+    min_samples: int,
+) -> list[int]:
+    if max_samples <= 0:
+        raise ValueError(f"max_samples must be positive, got {max_samples}")
+    if min_samples <= 0:
+        raise ValueError(f"min_samples must be positive, got {min_samples}")
+
+    if max_samples <= min_samples:
+        return [int(max_samples)]
+
+    sample_sizes: list[int] = []
+    current = _round_up_to_power_of_two(min_samples)
+    while current < max_samples:
+        sample_sizes.append(int(current))
+        current *= 2
+    if not sample_sizes or sample_sizes[-1] != int(max_samples):
+        sample_sizes.append(int(max_samples))
+    return sample_sizes
+
+
+def _resolve_plateau_sample_sizes(
+    *,
+    max_samples: int,
+    custom_sample_sizes: Sequence[int] | None,
+    min_samples: int,
+    required_min_samples: int,
+) -> list[int]:
+    if custom_sample_sizes:
+        sample_sizes = sorted({int(value) for value in custom_sample_sizes})
+    else:
+        sample_sizes = _default_plateau_sample_sizes(
+            max_samples=max_samples,
+            min_samples=max(min_samples, required_min_samples),
+        )
+
+    resolved = [int(size) for size in sample_sizes if required_min_samples <= int(size) <= max_samples]
+    if not resolved:
+        raise ValueError(
+            "No valid plateau sample sizes remain after applying constraints. "
+            f"Need sample sizes in [{required_min_samples}, {max_samples}]."
+        )
+    return resolved
+
+
+def _detect_intrinsic_dimension_plateau(
+    curve: Sequence[dict[str, Any]],
+    *,
+    relative_tolerance: float,
+    min_plateau_points: int,
+) -> dict[str, Any]:
+    if not 0.0 <= float(relative_tolerance):
+        raise ValueError(f"relative_tolerance must be non-negative, got {relative_tolerance}")
+    if min_plateau_points <= 0:
+        raise ValueError(f"min_plateau_points must be positive, got {min_plateau_points}")
+
+    if len(curve) < min_plateau_points:
+        return {
+            "found": False,
+            "reason": "not_enough_curve_points",
+            "min_plateau_points": int(min_plateau_points),
+            "curve_point_count": int(len(curve)),
+        }
+
+    best_window: tuple[int, int] | None = None
+    best_window_length = -1
+    best_relative_range = float("inf")
+    best_start_sample_size = float("inf")
+
+    for start_index in range(len(curve)):
+        for end_index in range(start_index + min_plateau_points - 1, len(curve)):
+            window = curve[start_index : end_index + 1]
+            window_means = np.asarray(
+                [float(point["mean_dimension_estimate"]) for point in window],
+                dtype=np.float64,
+            )
+            center = float(np.median(window_means))
+            if center <= np.finfo(np.float64).tiny:
+                continue
+            relative_range = float((window_means.max() - window_means.min()) / center)
+            if relative_range > float(relative_tolerance):
+                continue
+
+            window_length = len(window)
+            start_sample_size = int(window[0]["sample_size"])
+            should_replace = False
+            if window_length > best_window_length:
+                should_replace = True
+            elif window_length == best_window_length and relative_range < best_relative_range:
+                should_replace = True
+            elif (
+                window_length == best_window_length
+                and np.isclose(relative_range, best_relative_range)
+                and start_sample_size < best_start_sample_size
+            ):
+                should_replace = True
+
+            if should_replace:
+                best_window = (start_index, end_index)
+                best_window_length = window_length
+                best_relative_range = relative_range
+                best_start_sample_size = start_sample_size
+
+    if best_window is None:
+        return {
+            "found": False,
+            "reason": "no_window_within_tolerance",
+            "relative_tolerance": float(relative_tolerance),
+            "min_plateau_points": int(min_plateau_points),
+        }
+
+    start_index, end_index = best_window
+    selected_window = curve[start_index : end_index + 1]
+    selected_means = np.asarray(
+        [float(point["mean_dimension_estimate"]) for point in selected_window],
+        dtype=np.float64,
+    )
+    selected_stderrs = np.asarray(
+        [float(point["stderr_dimension_estimate"]) for point in selected_window],
+        dtype=np.float64,
+    )
+    return {
+        "found": True,
+        "selection_rule": (
+            "longest contiguous window whose mean estimates stay within the requested "
+            "relative tolerance; ties break toward lower relative range and earlier sample size"
+        ),
+        "relative_tolerance": float(relative_tolerance),
+        "min_plateau_points": int(min_plateau_points),
+        "start_index": int(start_index),
+        "end_index": int(end_index),
+        "start_sample_size": int(selected_window[0]["sample_size"]),
+        "end_sample_size": int(selected_window[-1]["sample_size"]),
+        "sample_sizes": [int(point["sample_size"]) for point in selected_window],
+        "point_count": int(len(selected_window)),
+        "dimension_estimate": float(np.median(selected_means)),
+        "mean_dimension_estimate": float(selected_means.mean()),
+        "max_minus_min": float(selected_means.max() - selected_means.min()),
+        "relative_range": float(best_relative_range),
+        "mean_stderr": float(selected_stderrs.mean()),
+    }
+
+
+def _run_intrinsic_dimension_plateau_search(
+    full_distance_matrix: np.ndarray,
+    *,
+    estimator: Callable[[np.ndarray, int | None], dict[str, Any]],
+    feature_dim: int,
+    sample_sizes: Sequence[int],
+    repeats: int,
+    seed: int,
+    relative_tolerance: float,
+    min_plateau_points: int,
+) -> dict[str, Any]:
+    if repeats <= 0:
+        raise ValueError(f"plateau_search repeats must be positive, got {repeats}")
+
+    pool_size = int(full_distance_matrix.shape[0])
+    rng = np.random.default_rng(seed)
+    estimates_by_size: dict[int, list[float]] = {int(size): [] for size in sample_sizes}
+
+    for _repeat_index in range(int(repeats)):
+        permutation = rng.permutation(pool_size)
+        for sample_size in sample_sizes:
+            sample_size = int(sample_size)
+            subset_indices = permutation[:sample_size]
+            subset_distance_matrix = np.asarray(
+                full_distance_matrix[np.ix_(subset_indices, subset_indices)],
+                dtype=np.float64,
+            )
+            estimation = estimator(subset_distance_matrix, feature_dim)
+            estimates_by_size[sample_size].append(float(estimation["dimension_estimate"]))
+
+    curve: list[dict[str, Any]] = []
+    for sample_size in sample_sizes:
+        values = np.asarray(estimates_by_size[int(sample_size)], dtype=np.float64)
+        std_estimate = float(0.0 if values.size <= 1 else values.std(ddof=1))
+        stderr_estimate = float(std_estimate / np.sqrt(values.size)) if values.size > 0 else float("nan")
+        curve.append(
+            {
+                "sample_size": int(sample_size),
+                "repeat_count": int(values.size),
+                "mean_dimension_estimate": float(values.mean()),
+                "std_dimension_estimate": std_estimate,
+                "stderr_dimension_estimate": stderr_estimate,
+                "min_dimension_estimate": float(values.min()),
+                "max_dimension_estimate": float(values.max()),
+                "dimension_estimates": values.tolist(),
+            }
+        )
+
+    plateau = _detect_intrinsic_dimension_plateau(
+        curve,
+        relative_tolerance=relative_tolerance,
+        min_plateau_points=min_plateau_points,
+    )
+    return {
+        "latent_pool_sample_count": int(pool_size),
+        "sampling_strategy": (
+            "single_cached_latent_pool_with_random_prefix_subsets_from_a_fresh_permutation_per_repeat"
+        ),
+        "repeats": int(repeats),
+        "seed": int(seed),
+        "sample_sizes": [int(size) for size in sample_sizes],
+        "curve": curve,
+        "plateau": plateau,
+    }
+
+
+def _distributed_shard_directory(runtime: DistributedRuntime) -> Path | None:
+    if not runtime.enabled:
+        return None
+
+    directory: Path | None = None
+    payload: list[str | None] = [None]
+    if runtime.is_primary:
+        directory = Path(mkdtemp(prefix="wsv_intrinsic_dimension_", dir="/tmp"))
+        payload[0] = str(directory)
+    dist.broadcast_object_list(payload, src=0)
+    resolved = payload[0]
+    if resolved is None:
+        raise RuntimeError("Failed to broadcast the distributed intrinsic-dimension shard directory.")
+    return Path(resolved)
+
+
+def _load_distributed_latent_pool(
+    shard_directory: Path,
+    *,
+    world_size: int,
+    max_samples: int,
+) -> tuple[np.ndarray, tuple[int, ...] | None]:
+    sample_indices_list: list[np.ndarray] = []
+    latent_list: list[np.ndarray] = []
+    latent_shape: tuple[int, ...] | None = None
+
+    for rank in range(int(world_size)):
+        shard_path = shard_directory / f"rank_{rank:05d}.npz"
+        if not shard_path.exists():
+            continue
+        with np.load(shard_path, allow_pickle=False) as shard:
+            sample_indices = np.asarray(shard["sample_indices"], dtype=np.int64)
+            latents = np.asarray(shard["latents"], dtype=np.float32)
+            shape_array = np.asarray(shard["latent_shape"], dtype=np.int64)
+        if shape_array.size > 0 and latent_shape is None:
+            latent_shape = tuple(int(value) for value in shape_array.tolist())
+        if latents.shape[0] != sample_indices.shape[0]:
+            raise ValueError(
+                f"Distributed intrinsic-dimension shard {shard_path} is inconsistent: "
+                f"{latents.shape[0]} latent rows for {sample_indices.shape[0]} sample indices."
+            )
+        if sample_indices.size == 0:
+            continue
+        sample_indices_list.append(sample_indices)
+        latent_list.append(np.ascontiguousarray(latents))
+
+    if not latent_list:
+        raise ValueError("No latent samples were gathered from the distributed intrinsic-dimension shards.")
+
+    sample_indices = np.concatenate(sample_indices_list, axis=0)
+    latent_matrix = np.concatenate(latent_list, axis=0)
+    order = np.argsort(sample_indices, kind="stable")
+    sample_indices = sample_indices[order]
+    latent_matrix = latent_matrix[order]
+
+    unique_mask = np.ones(sample_indices.shape[0], dtype=bool)
+    unique_mask[1:] = sample_indices[1:] != sample_indices[:-1]
+    sample_indices = sample_indices[unique_mask]
+    latent_matrix = latent_matrix[unique_mask]
+
+    if sample_indices.shape[0] > int(max_samples):
+        sample_indices = sample_indices[: int(max_samples)]
+        latent_matrix = latent_matrix[: int(max_samples)]
+    return latent_matrix, latent_shape
+
+
+def _cleanup_distributed_latent_shards(shard_directory: Path, *, world_size: int) -> None:
+    for rank in range(int(world_size)):
+        shard_path = shard_directory / f"rank_{rank:05d}.npz"
+        if shard_path.exists():
+            shard_path.unlink()
+    if shard_directory.exists():
+        shard_directory.rmdir()
 
 
 def _accumulation_divisor(total_batches: int, batch_index: int, accumulation_steps: int) -> int:
@@ -3181,24 +3968,33 @@ def estimate_main_model_intrinsic_dimension(
     start_time: str | pd.Timestamp | None = None,
     end_time: str | pd.Timestamp | None = None,
     latent_source: str = "second_block_features",
+    method: str = "two_nn",
     k1: int = 10,
     k2: int = 20,
     bias_correction: bool = False,
+    two_nn_discard_fraction: float = 0.1,
+    plateau_search: bool = False,
+    plateau_sample_sizes: Sequence[int] | None = None,
+    plateau_min_samples: int = 128,
+    plateau_repeats: int = 8,
+    plateau_seed: int = 0,
+    plateau_relative_tolerance: float = 0.1,
+    plateau_min_points: int = 2,
+    show_progress: bool = True,
     print_model_summary: bool = False,
     n_jobs: int | None = None,
     print_result: bool = True,
 ) -> dict[str, Any]:
     train_config, model_config, data_config, runtime, _model_dtype, amp_dtype = _build_main_training_objects(config_path)
     try:
-        if runtime.enabled:
-            raise ValueError(
-                "Intrinsic-dimension estimation currently supports single-process execution only. "
-                "Run it without distributed launch environment variables."
-            )
-
         normalized_split = split.strip().lower()
         if normalized_split not in {"train", "val"}:
             raise ValueError(f"split must be 'train' or 'val', got {split!r}")
+        normalized_method = method.strip().lower()
+        if normalized_method not in {"two_nn", "levina_bickel"}:
+            raise ValueError(
+                f"method must be 'two_nn' or 'levina_bickel', got {method!r}"
+            )
         if max_samples <= 0:
             raise ValueError(f"max_samples must be positive, got {max_samples}")
 
@@ -3245,80 +4041,257 @@ def estimate_main_model_intrinsic_dimension(
         model.eval()
 
         pin_memory = runtime.device.type == "cuda"
-        eval_loader, _eval_sampler = _build_eval_dataloader(
+        eval_dataset = _build_eval_dataset(
             data_config,
-            batch_size=resolved_batch_size,
-            num_workers=resolved_num_workers,
             runtime=runtime,
             start_time=resolved_start_time,
             end_time=resolved_end_time,
-            pin_memory=pin_memory,
         )
+        selected_pool_size = min(int(max_samples), len(eval_dataset))
+        selected_indices = list(range(selected_pool_size))
+        sampler = _FixedIndexShardSampler(
+            selected_indices,
+            num_replicas=runtime.world_size,
+            rank=runtime.rank,
+        )
+        eval_loader = build_arco_era5_dataloader(
+            eval_dataset,
+            batch_size=resolved_batch_size,
+            shuffle=False,
+            num_workers=resolved_num_workers,
+            pin_memory=pin_memory,
+            sampler=sampler,
+        )
+        effective_batch_size = int(resolved_batch_size) * int(runtime.world_size)
+        if runtime.is_primary:
+            _print_if_primary(
+                runtime,
+                f"[main][intrinsic-dimension] batch_size_per_gpu={resolved_batch_size} "
+                f"world_size={runtime.world_size} effective_batch_size={effective_batch_size} "
+                f"requested_max_samples={max_samples}",
+            )
 
         latent_vectors: list[np.ndarray] = []
         latent_shape: tuple[int, ...] | None = None
-        collected_samples = 0
+        local_sample_indices: list[int] = []
+        sampler_offset = 0
+        local_sampler_indices = list(sampler.local_indices)
+        local_batch_count = (
+            0
+            if resolved_batch_size <= 0
+            else (len(local_sampler_indices) + int(resolved_batch_size) - 1) // int(resolved_batch_size)
+        )
+        max_batch_count_tensor = torch.tensor(
+            [local_batch_count],
+            device=runtime.device,
+            dtype=torch.int64,
+        )
+        if runtime.enabled:
+            dist.all_reduce(max_batch_count_tensor, op=dist.ReduceOp.MAX)
+        max_batch_count = int(max_batch_count_tensor.item())
+        progress_bar = None
+        if runtime.is_primary and show_progress and selected_pool_size > 0:
+            if tqdm is not None:
+                progress_bar = tqdm(
+                    total=selected_pool_size,
+                    desc="[main][intrinsic-dimension] latent samples",
+                    unit="sample",
+                    leave=True,
+                )
+            else:
+                _print_if_primary(
+                    runtime,
+                    "[main][intrinsic-dimension] tqdm is not installed; continuing without a progress bar.",
+                )
 
         with torch.no_grad():
-            for _batch_index, batch in _iter_prefetched_batches(eval_loader, runtime=runtime, max_batches=None):
-                with _amp_autocast_context(train_config.use_amp, runtime.device, amp_dtype):
-                    latent_batch = _extract_main_model_latent_batch(
-                        model,
-                        batch,
-                        latent_source=latent_source,
-                    )
-                if latent_shape is None:
-                    latent_shape = tuple(int(value) for value in latent_batch.shape[1:])
-                flat_batch = latent_batch.reshape(latent_batch.shape[0], -1).detach().cpu().float().numpy()
-                remaining = int(max_samples) - collected_samples
-                if remaining <= 0:
-                    break
-                if flat_batch.shape[0] > remaining:
-                    flat_batch = flat_batch[:remaining]
-                latent_vectors.append(np.ascontiguousarray(flat_batch))
-                collected_samples += int(flat_batch.shape[0])
-                if collected_samples >= int(max_samples):
-                    break
+            batch_iterator = iter(_iter_prefetched_batches(eval_loader, runtime=runtime, max_batches=None))
+            for _loop_index in range(max_batch_count):
+                local_generated_count = 0
+                try:
+                    _batch_index, batch = next(batch_iterator)
+                except StopIteration:
+                    batch = None
 
-        if not latent_vectors:
-            raise ValueError("No latent samples were collected for intrinsic-dimension estimation.")
-        latent_matrix = np.concatenate(latent_vectors, axis=0)
-        estimation = _estimate_levina_bickel_dimension(
-            latent_matrix,
-            k1=int(k1),
-            k2=int(k2),
-            bias_correction=bool(bias_correction),
-            n_jobs=n_jobs,
+                if batch is not None:
+                    with _amp_autocast_context(train_config.use_amp, runtime.device, amp_dtype):
+                        latent_batch = _extract_main_model_latent_batch(
+                            model,
+                            batch,
+                            latent_source=latent_source,
+                        )
+                    if latent_shape is None:
+                        latent_shape = tuple(int(value) for value in latent_batch.shape[1:])
+                    flat_batch = latent_batch.reshape(latent_batch.shape[0], -1).detach().cpu().float().numpy()
+                    latent_vectors.append(np.ascontiguousarray(flat_batch))
+                    local_generated_count = int(flat_batch.shape[0])
+                    batch_sample_indices = local_sampler_indices[
+                        sampler_offset : sampler_offset + local_generated_count
+                    ]
+                    if len(batch_sample_indices) != local_generated_count:
+                        raise RuntimeError(
+                            "Intrinsic-dimension sampler bookkeeping drifted from the dataloader batches."
+                        )
+                    local_sample_indices.extend(int(index) for index in batch_sample_indices)
+                    sampler_offset += local_generated_count
+
+                step_generated_tensor = torch.tensor(
+                    [local_generated_count],
+                    device=runtime.device,
+                    dtype=torch.int64,
+                )
+                if runtime.enabled:
+                    dist.all_reduce(step_generated_tensor, op=dist.ReduceOp.SUM)
+                if progress_bar is not None:
+                    progress_bar.update(int(step_generated_tensor.item()))
+        if progress_bar is not None:
+            progress_bar.close()
+
+        local_latent_matrix = (
+            np.concatenate(latent_vectors, axis=0)
+            if latent_vectors
+            else np.empty((0, 0), dtype=np.float32)
         )
-
-        result = {
-            "checkpoint_path": str(resolved_checkpoint_path),
-            "checkpoint_epoch": None if checkpoint_metadata is None else checkpoint_metadata.get("epoch"),
-            "checkpoint_optimizer_step": (
-                None if checkpoint_metadata is None else checkpoint_metadata.get("optimizer_step")
-            ),
-            "checkpoint_global_batch_step": (
-                None if checkpoint_metadata is None else checkpoint_metadata.get("global_batch_step")
-            ),
-            "split": normalized_split,
-            "start_time": resolved_start_time,
-            "end_time": resolved_end_time,
-            "batch_size": resolved_batch_size,
-            "num_workers": resolved_num_workers,
-            "max_samples": int(max_samples),
-            "latent_source": latent_source,
-            "latent_shape": None if latent_shape is None else list(latent_shape),
-            "flattened_latent_dim": int(latent_matrix.shape[1]),
-            "levina_bickel": estimation,
-        }
-        if runtime.is_primary and print_result:
-            _print_if_primary(
-                runtime,
-                f"[main][intrinsic-dimension] split={normalized_split} latent_source={latent_source} "
-                f"samples={estimation['sample_count']} estimate={estimation['dimension_estimate']:.4f} "
-                f"rounded={estimation['rounded_dimension_estimate']}",
+        local_sample_index_array = np.asarray(local_sample_indices, dtype=np.int64)
+        if local_latent_matrix.shape[0] != local_sample_index_array.shape[0]:
+            raise RuntimeError(
+                "Intrinsic-dimension local latent collection produced mismatched sample indices and latent rows."
             )
-            _print_json_block("main_intrinsic_dimension_result", result)
+
+        result: dict[str, Any] | None = None
+        if runtime.enabled:
+            shard_directory = _distributed_shard_directory(runtime)
+            if shard_directory is None:
+                raise RuntimeError("Distributed intrinsic-dimension shard directory was not initialized.")
+            shard_path = shard_directory / f"rank_{runtime.rank:05d}.npz"
+            np.savez(
+                shard_path,
+                sample_indices=local_sample_index_array,
+                latents=local_latent_matrix,
+                latent_shape=np.asarray(
+                    ()
+                    if latent_shape is None
+                    else latent_shape,
+                    dtype=np.int64,
+                ),
+            )
+            _distributed_barrier(runtime)
+            if runtime.is_primary:
+                latent_matrix, gathered_latent_shape = _load_distributed_latent_pool(
+                    shard_directory,
+                    world_size=runtime.world_size,
+                    max_samples=int(max_samples),
+                )
+                if latent_shape is None:
+                    latent_shape = gathered_latent_shape
+            _distributed_barrier(runtime)
+            if runtime.is_primary:
+                _cleanup_distributed_latent_shards(shard_directory, world_size=runtime.world_size)
+            _distributed_barrier(runtime)
+        else:
+            if not latent_vectors:
+                raise ValueError("No latent samples were collected for intrinsic-dimension estimation.")
+            latent_matrix = local_latent_matrix
+
+        if runtime.is_primary:
+            if latent_matrix.shape[0] == 0:
+                raise ValueError("No latent samples were collected for intrinsic-dimension estimation.")
+            estimator = _build_intrinsic_dimension_estimator(
+                method=normalized_method,
+                k1=int(k1),
+                k2=int(k2),
+                bias_correction=bool(bias_correction),
+                two_nn_discard_fraction=float(two_nn_discard_fraction),
+            )
+            full_distance_matrix, feature_dim = _compute_pairwise_distance_matrix(
+                latent_matrix,
+                n_jobs=n_jobs,
+            )
+            estimation = estimator(full_distance_matrix, feature_dim)
+
+            resolved_plateau_search: dict[str, Any] | None = None
+            if plateau_search:
+                required_min_samples = 3 if normalized_method == "two_nn" else max(int(k2) + 1, 4)
+                resolved_sample_sizes = _resolve_plateau_sample_sizes(
+                    max_samples=int(latent_matrix.shape[0]),
+                    custom_sample_sizes=plateau_sample_sizes,
+                    min_samples=int(plateau_min_samples),
+                    required_min_samples=required_min_samples,
+                )
+                resolved_plateau_search = _run_intrinsic_dimension_plateau_search(
+                    full_distance_matrix,
+                    estimator=estimator,
+                    feature_dim=feature_dim,
+                    sample_sizes=resolved_sample_sizes,
+                    repeats=int(plateau_repeats),
+                    seed=int(plateau_seed),
+                    relative_tolerance=float(plateau_relative_tolerance),
+                    min_plateau_points=int(plateau_min_points),
+                )
+
+            result = {
+                "checkpoint_path": str(resolved_checkpoint_path),
+                "checkpoint_epoch": None if checkpoint_metadata is None else checkpoint_metadata.get("epoch"),
+                "checkpoint_optimizer_step": (
+                    None if checkpoint_metadata is None else checkpoint_metadata.get("optimizer_step")
+                ),
+                "checkpoint_global_batch_step": (
+                    None if checkpoint_metadata is None else checkpoint_metadata.get("global_batch_step")
+                ),
+                "split": normalized_split,
+                "start_time": resolved_start_time,
+                "end_time": resolved_end_time,
+                "batch_size": resolved_batch_size,
+                "batch_size_per_gpu": int(resolved_batch_size),
+                "effective_batch_size": int(effective_batch_size),
+                "num_workers": resolved_num_workers,
+                "max_samples": int(max_samples),
+                "latent_pool_sample_count": int(latent_matrix.shape[0]),
+                "latent_source": latent_source,
+                "method": normalized_method,
+                "distributed": runtime.enabled,
+                "world_size": int(runtime.world_size),
+                "latent_shape": None if latent_shape is None else list(latent_shape),
+                "flattened_latent_dim": int(latent_matrix.shape[1]),
+                "estimation": estimation,
+            }
+            if normalized_method == "two_nn":
+                result["two_nn"] = estimation
+            else:
+                result["levina_bickel"] = estimation
+            if resolved_plateau_search is not None:
+                plateau = resolved_plateau_search["plateau"]
+                result["plateau_search"] = resolved_plateau_search
+                result["recommended_effective_dimension"] = (
+                    plateau["dimension_estimate"]
+                    if plateau.get("found")
+                    else estimation["dimension_estimate"]
+                )
+            else:
+                result["recommended_effective_dimension"] = estimation["dimension_estimate"]
+            if print_result:
+                plateau_suffix = ""
+                if resolved_plateau_search is not None and resolved_plateau_search["plateau"].get("found"):
+                    plateau_info = resolved_plateau_search["plateau"]
+                    plateau_suffix = (
+                        f" recommended_effective={plateau_info['dimension_estimate']:.4f}"
+                        f" plateau={plateau_info['start_sample_size']}-{plateau_info['end_sample_size']}"
+                    )
+                _print_if_primary(
+                    runtime,
+                    f"[main][intrinsic-dimension] split={normalized_split} latent_source={latent_source} "
+                    f"method={normalized_method} "
+                    f"samples={estimation['sample_count']} estimate={estimation['dimension_estimate']:.4f} "
+                    f"rounded={estimation['rounded_dimension_estimate']}"
+                    f"{plateau_suffix}",
+                )
+                _print_json_block("main_intrinsic_dimension_result", result)
+        if runtime.enabled:
+            object_list: list[dict[str, Any] | None] = [result if runtime.is_primary else None]
+            dist.broadcast_object_list(object_list, src=0)
+            result = object_list[0]
+        if result is None:
+            raise RuntimeError("Intrinsic-dimension estimation did not produce a result.")
         return result
     finally:
         _cleanup_distributed_runtime(runtime)
@@ -3614,6 +4587,482 @@ def validate_intrinsic_model(
             if rollout_report is not None:
                 _print_json_block("intrinsic_chain_validation_rollout_plots", rollout_report)
             _print_json_block("intrinsic_validation_result", result)
+        return result
+    finally:
+        _cleanup_distributed_runtime(runtime)
+
+
+def train_bottleneck_compressor_model(
+    config_path: str | Path = DEFAULT_MODEL_CONFIG_PATH,
+    *,
+    smoke_only: bool = False,
+    resume_checkpoint_path: str | Path | None = None,
+) -> dict[str, Any]:
+    (
+        train_config,
+        encoder_config,
+        compressor_config,
+        data_config,
+        runtime,
+        _model_dtype,
+        amp_dtype,
+    ) = _build_bottleneck_compressor_training_objects(config_path)
+    try:
+        encoder = FuXiLowerResEncoder(encoder_config).to(runtime.device)
+        if train_config.main_checkpoint_path is not None:
+            _load_encoder_checkpoint(encoder, train_config.main_checkpoint_path)
+        elif not smoke_only:
+            raise FileNotFoundError(
+                "train_bottleneck_compressor.main_checkpoint_path is required for compressor training "
+                "after the main model."
+            )
+        encoder.eval()
+        for parameter in encoder.parameters():
+            parameter.requires_grad_(False)
+
+        compressor_model = FuXiBottleneckCompressor(compressor_config).to(runtime.device)
+        resolved_resume_checkpoint_path = (
+            train_config.resume_checkpoint_path
+            if resume_checkpoint_path is None
+            else resolve_repo_path(resume_checkpoint_path, config_path=train_config.config_path)
+        )
+        resume_checkpoint: dict[str, Any] | None = None
+        smoke_report: dict[str, Any] | None = None
+
+        if runtime.is_primary:
+            smoke_inputs = _make_main_random_inputs(
+                encoder_config,
+                batch_size=train_config.random_smoke_batch_size,
+                device=runtime.device,
+            )
+            _print_model_and_summary(
+                "Frozen Forecast Encoder",
+                encoder,
+                input_data=smoke_inputs,
+                depth=train_config.summary_depth,
+                print_summary=train_config.print_model_summary,
+            )
+            compressor_smoke_input = (
+                _make_bottleneck_compressor_random_inputs(
+                    compressor_config,
+                    batch_size=train_config.random_smoke_batch_size,
+                    device=runtime.device,
+                ),
+            )
+            _print_model_and_summary(
+                "Bottleneck Compressor",
+                compressor_model,
+                input_data=compressor_smoke_input,
+                depth=train_config.summary_depth,
+                print_summary=train_config.print_model_summary,
+            )
+            smoke_report = run_bottleneck_compressor_smoke_test(
+                encoder,
+                compressor_model,
+                batch_size=train_config.random_smoke_batch_size,
+                print_outputs=True,
+            )
+        if smoke_only:
+            return {"smoke_only": True, "smoke_report": smoke_report}
+        if resolved_resume_checkpoint_path is not None:
+            if not resolved_resume_checkpoint_path.exists():
+                raise FileNotFoundError(f"Resume checkpoint not found at {resolved_resume_checkpoint_path}")
+            resume_checkpoint = _load_bottleneck_compressor_checkpoint(
+                compressor_model,
+                resolved_resume_checkpoint_path,
+            )
+
+        compressor_model = _wrap_for_distributed_training(compressor_model, runtime)
+        pin_memory = runtime.device.type == "cuda"
+        train_loader, val_loader, train_sampler, val_sampler = _build_split_dataloaders(
+            data_config,
+            batch_size=train_config.batch_size,
+            num_workers=train_config.num_workers,
+            runtime=runtime,
+            train_start_time=train_config.train_start_time,
+            train_end_time=train_config.train_end_time,
+            val_start_time=train_config.val_start_time,
+            val_end_time=train_config.val_end_time,
+            pin_memory=pin_memory,
+        )
+
+        optimizer = AdamW(
+            compressor_model.parameters(),
+            lr=train_config.learning_rate,
+            weight_decay=train_config.weight_decay,
+        )
+        scaler = _build_grad_scaler(train_config.use_amp, runtime.device)
+        criterion = nn.MSELoss()
+
+        output_dir = train_config.output_dir
+        if runtime.is_primary:
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+        effective_batch_size = (
+            train_config.batch_size * runtime.world_size * train_config.gradient_accumulation_steps
+        )
+        _print_if_primary(
+            runtime,
+            (
+                f"[bottleneck-compressor] device={runtime.device} world_size={runtime.world_size} "
+                f"feature_source={compressor_config.feature_source} "
+                f"gradient_accumulation_steps={train_config.gradient_accumulation_steps} "
+                f"effective_batch_size={effective_batch_size}"
+            ),
+        )
+
+        total_train_batches = _limited_length(train_loader, train_config.max_train_batches)
+        total_val_batches = 0 if val_loader is None else _limited_length(val_loader, train_config.max_val_batches)
+        resume_state = (
+            None
+            if resume_checkpoint is None
+            else _build_resume_state(
+                resume_checkpoint,
+                checkpoint_path=resolved_resume_checkpoint_path,
+                total_train_batches=total_train_batches,
+                accumulation_steps=train_config.gradient_accumulation_steps,
+            )
+        )
+        if resume_checkpoint is not None:
+            resume_warnings = _validate_resume_compatibility(
+                resume_checkpoint,
+                checkpoint_path=resolved_resume_checkpoint_path,
+                section_name="train_bottleneck_compressor",
+                current_batch_size=train_config.batch_size,
+                current_accumulation_steps=train_config.gradient_accumulation_steps,
+                resume_state=resume_state,
+            )
+            if "optimizer_state_dict" not in resume_checkpoint:
+                raise ValueError(
+                    f"Resume checkpoint {resolved_resume_checkpoint_path} does not contain optimizer_state_dict."
+                )
+            optimizer.load_state_dict(resume_checkpoint["optimizer_state_dict"])
+            _apply_optimizer_hyperparameter_overrides(
+                optimizer,
+                learning_rate=train_config.learning_rate,
+                weight_decay=train_config.weight_decay,
+            )
+            if "scaler_state_dict" in resume_checkpoint and scaler.is_enabled():
+                scaler.load_state_dict(resume_checkpoint["scaler_state_dict"])
+            for message in resume_warnings + _resume_optimizer_override_messages(
+                resume_checkpoint,
+                learning_rate=train_config.learning_rate,
+                weight_decay=train_config.weight_decay,
+                section_name="train_bottleneck_compressor",
+            ):
+                _print_if_primary(runtime, f"[bottleneck-compressor][resume] {message}")
+
+        history: list[dict[str, float]] = [] if resume_state is None else list(resume_state.history)
+        best_val_loss = float("inf") if resume_state is None else resume_state.best_val_loss
+        optimizer_steps = 0 if resume_state is None else resume_state.optimizer_steps
+        global_batch_steps = 0 if resume_state is None else resume_state.global_batch_steps
+        start_epoch = 1 if resume_state is None else resume_state.start_epoch
+        if resume_state is not None:
+            _print_if_primary(
+                runtime,
+                f"[bottleneck-compressor] resuming from {resume_state.checkpoint_path} "
+                f"checkpoint_epoch={resume_state.checkpoint_epoch} start_epoch={resume_state.start_epoch} "
+                f"resume_batch={resume_state.resume_batch_index} optimizer_steps={resume_state.optimizer_steps} "
+                f"global_batch_steps={resume_state.global_batch_steps}",
+            )
+            if start_epoch > train_config.max_epochs:
+                raise ValueError(
+                    f"Resume checkpoint {resume_state.checkpoint_path} would continue at epoch {start_epoch}, "
+                    "but train_bottleneck_compressor.max_epochs="
+                    f"{train_config.max_epochs}. Increase max_epochs to continue training."
+                )
+
+        def checkpoint_payload(
+            *,
+            epoch: int,
+            batch_index_within_epoch: int | None = None,
+            checkpoint_best_val_loss: float | None = None,
+        ) -> dict[str, Any]:
+            payload = {
+                "epoch": epoch,
+                "global_batch_step": int(global_batch_steps),
+                "optimizer_step": int(optimizer_steps),
+                "compressor_state_dict": _unwrap_model(compressor_model).state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scaler_state_dict": scaler.state_dict(),
+                "history": history,
+                "best_val_loss": (
+                    best_val_loss if checkpoint_best_val_loss is None else checkpoint_best_val_loss
+                ),
+                "train_config": _to_plain_data(asdict(train_config)),
+                "encoder_config": _to_plain_data(asdict(encoder_config)),
+                "bottleneck_compressor_config": _to_plain_data(asdict(compressor_config)),
+                "data_config": _to_plain_data(asdict(data_config)),
+                "main_checkpoint_path": str(train_config.main_checkpoint_path) if train_config.main_checkpoint_path else None,
+                "distributed_runtime": {
+                    "enabled": runtime.enabled,
+                    "backend": runtime.backend,
+                    "world_size": runtime.world_size,
+                },
+                "effective_batch_size": effective_batch_size,
+                "gradient_accumulation_steps": train_config.gradient_accumulation_steps,
+            }
+            if batch_index_within_epoch is not None:
+                payload["batch_index_within_epoch"] = int(batch_index_within_epoch)
+            return payload
+
+        for epoch in range(start_epoch, train_config.max_epochs + 1):
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
+            if val_sampler is not None:
+                val_sampler.set_epoch(epoch)
+
+            compressor_model.train()
+            optimizer.zero_grad(set_to_none=True)
+            running_loss = 0.0
+            train_steps = 0
+            resume_batch_index = (
+                0
+                if resume_state is None or resume_state.resume_epoch != epoch
+                else resume_state.resume_batch_index
+            )
+            replay_start_batch_index = (
+                0
+                if resume_state is None or resume_state.resume_epoch != epoch
+                else resume_state.replay_start_batch_index
+            )
+            if resume_batch_index > 0:
+                replay_from = replay_start_batch_index + 1
+                replay_to = resume_batch_index
+                if replay_start_batch_index < resume_batch_index:
+                    _print_if_primary(
+                        runtime,
+                        f"[bottleneck-compressor][epoch {epoch}] rebuilding accumulated gradients from batches "
+                        f"{replay_from}-{replay_to} before resuming at batch {resume_batch_index + 1}",
+                    )
+                else:
+                    _print_if_primary(
+                        runtime,
+                        f"[bottleneck-compressor][epoch {epoch}] skipping directly to batch "
+                        f"{resume_batch_index + 1}",
+                    )
+
+            for batch_index, batch in _iter_prefetched_batches(
+                train_loader,
+                runtime=runtime,
+                max_batches=train_config.max_train_batches,
+            ):
+                if batch_index < resume_batch_index:
+                    if batch_index < replay_start_batch_index:
+                        continue
+                    should_step = _should_optimizer_step(
+                        total_train_batches,
+                        batch_index,
+                        train_config.gradient_accumulation_steps,
+                    )
+                    if should_step:
+                        raise RuntimeError(
+                            "Resume replay encountered an optimizer-step batch. "
+                            "This indicates the checkpoint resume window was computed incorrectly."
+                        )
+                    loss_divisor = float(
+                        _accumulation_divisor(
+                            total_train_batches,
+                            batch_index,
+                            train_config.gradient_accumulation_steps,
+                        )
+                    )
+                    sync_context = nullcontext()
+                    if runtime.enabled and isinstance(compressor_model, DistributedDataParallel):
+                        sync_context = compressor_model.no_sync()
+                    feature_grid = _encode_features_for_bottleneck_compressor(
+                        encoder,
+                        batch,
+                        feature_source=compressor_config.feature_source,
+                        detach_features=train_config.detach_second_block_features,
+                        clear_encoder_grads=False,
+                    )
+                    with sync_context:
+                        with _amp_autocast_context(train_config.use_amp, runtime.device, amp_dtype):
+                            outputs = compressor_model(feature_grid)
+                            scaled_loss = criterion(
+                                outputs["feature_grid_recon"],
+                                feature_grid,
+                            ) / loss_divisor
+                        if scaler.is_enabled():
+                            scaler.scale(scaled_loss).backward()
+                        else:
+                            scaled_loss.backward()
+                    continue
+
+                should_step = _should_optimizer_step(
+                    total_train_batches,
+                    batch_index,
+                    train_config.gradient_accumulation_steps,
+                )
+                global_batch_steps += 1
+                loss_divisor = float(
+                    _accumulation_divisor(
+                        total_train_batches,
+                        batch_index,
+                        train_config.gradient_accumulation_steps,
+                    )
+                )
+                sync_context = nullcontext()
+                if runtime.enabled and isinstance(compressor_model, DistributedDataParallel) and not should_step:
+                    sync_context = compressor_model.no_sync()
+
+                feature_grid = _encode_features_for_bottleneck_compressor(
+                    encoder,
+                    batch,
+                    feature_source=compressor_config.feature_source,
+                    detach_features=train_config.detach_second_block_features,
+                    clear_encoder_grads=False,
+                )
+
+                with sync_context:
+                    with _amp_autocast_context(train_config.use_amp, runtime.device, amp_dtype):
+                        outputs = compressor_model(feature_grid)
+                        loss = criterion(
+                            outputs["feature_grid_recon"],
+                            feature_grid,
+                        )
+                        scaled_loss = loss / loss_divisor
+
+                    if scaler.is_enabled():
+                        scaler.scale(scaled_loss).backward()
+                    else:
+                        scaled_loss.backward()
+
+                if should_step:
+                    if train_config.gradient_clip_norm is not None:
+                        if scaler.is_enabled():
+                            scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(
+                            _unwrap_model(compressor_model).parameters(),
+                            train_config.gradient_clip_norm,
+                        )
+
+                    if scaler.is_enabled():
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    optimizer_steps += 1
+
+                    if (
+                        runtime.is_primary
+                        and train_config.save_every_optimizer_steps is not None
+                        and int(optimizer_steps) % train_config.save_every_optimizer_steps == 0
+                    ):
+                        _save_checkpoint(
+                            _step_checkpoint_path(output_dir, train_config.checkpoint_name, int(optimizer_steps)),
+                            checkpoint_payload(
+                                epoch=epoch,
+                                batch_index_within_epoch=batch_index + 1,
+                            ),
+                        )
+
+                if (
+                    runtime.is_primary
+                    and train_config.save_every_train_batches is not None
+                    and int(global_batch_steps) % train_config.save_every_train_batches == 0
+                ):
+                    _save_checkpoint(
+                        _step_checkpoint_path(output_dir, train_config.checkpoint_name, int(global_batch_steps)),
+                        checkpoint_payload(
+                            epoch=epoch,
+                            batch_index_within_epoch=batch_index + 1,
+                        ),
+                    )
+
+                running_loss += float(loss.item())
+                train_steps += 1
+                if (batch_index + 1) % max(train_config.log_every, 1) == 0:
+                    display_loss = _reduced_mean_scalar(float(loss.item()), runtime)
+                    _print_if_primary(
+                        runtime,
+                        f"[bottleneck-compressor][epoch {epoch}] batch {batch_index + 1} "
+                        f"loss={display_loss:.6f}",
+                    )
+
+            train_loss_sum, global_train_steps = _reduced_sum_and_count(running_loss, train_steps, runtime)
+            train_loss = train_loss_sum / max(global_train_steps, 1)
+            val_loss: float | None = None
+
+            if val_loader is not None:
+                compressor_model.eval()
+                val_running_loss = 0.0
+                val_steps = 0
+                with torch.no_grad():
+                    for _batch_index, batch in _iter_prefetched_batches(
+                        val_loader,
+                        runtime=runtime,
+                        max_batches=train_config.max_val_batches,
+                    ):
+                        feature_grid = _encode_features_for_bottleneck_compressor(
+                            encoder,
+                            batch,
+                            feature_source=compressor_config.feature_source,
+                            detach_features=True,
+                            clear_encoder_grads=False,
+                        )
+                        with _amp_autocast_context(train_config.use_amp, runtime.device, amp_dtype):
+                            outputs = compressor_model(feature_grid)
+                            loss = criterion(
+                                outputs["feature_grid_recon"],
+                                feature_grid,
+                            )
+                        val_running_loss += float(loss.item())
+                        val_steps += 1
+
+                val_loss_sum, global_val_steps = _reduced_sum_and_count(val_running_loss, val_steps, runtime)
+                val_loss = val_loss_sum / max(global_val_steps, 1)
+
+            epoch_record = {
+                "epoch": float(epoch),
+                "train_loss": train_loss,
+                "optimizer_steps": float(optimizer_steps),
+                "global_batch_steps": float(global_batch_steps),
+            }
+            if val_loss is not None:
+                epoch_record["val_loss"] = val_loss
+            history.append(epoch_record)
+            _print_if_primary(
+                runtime,
+                f"[bottleneck-compressor][epoch {epoch}] train_loss={train_loss:.6f}"
+                + (f" val_loss={val_loss:.6f}" if val_loss is not None else ""),
+            )
+
+            if runtime.is_primary and train_config.save_epoch_checkpoint:
+                checkpoint_best_val_loss = (
+                    min(best_val_loss, float(val_loss)) if val_loss is not None else best_val_loss
+                )
+                epoch_checkpoint_payload = checkpoint_payload(
+                    epoch=epoch,
+                    checkpoint_best_val_loss=checkpoint_best_val_loss,
+                )
+                _save_checkpoint(output_dir / train_config.checkpoint_name, epoch_checkpoint_payload)
+
+                if train_config.save_best_checkpoint and val_loss is not None and val_loss < best_val_loss:
+                    best_val_loss = checkpoint_best_val_loss
+                    _save_checkpoint(output_dir / train_config.best_checkpoint_name, epoch_checkpoint_payload)
+
+        result = {
+            "smoke_report": smoke_report,
+            "history": history,
+            "checkpoint_path": str(output_dir / train_config.checkpoint_name),
+            "best_checkpoint_path": str(output_dir / train_config.best_checkpoint_name),
+            "resumed_from_checkpoint": None if resume_state is None else str(resume_state.checkpoint_path),
+            "distributed": runtime.enabled,
+            "world_size": runtime.world_size,
+            "effective_batch_size": effective_batch_size,
+            "gradient_accumulation_steps": train_config.gradient_accumulation_steps,
+            "optimizer_steps": int(history[-1]["optimizer_steps"]) if history else 0,
+            "global_batch_steps": int(history[-1]["global_batch_steps"]) if history else 0,
+            "train_batches": total_train_batches,
+            "val_batches": total_val_batches,
+            "feature_source": compressor_config.feature_source,
+            "bottleneck_shape": list(compressor_config.bottleneck_shape),
+        }
+        if runtime.is_primary:
+            _print_json_block("bottleneck_compressor_training_result", result)
         return result
     finally:
         _cleanup_distributed_runtime(runtime)
@@ -4105,13 +5554,16 @@ def train_intrinsic_model(
 
 
 __all__ = [
+    "BottleneckCompressorTrainingConfig",
     "estimate_main_model_intrinsic_dimension",
     "IntrinsicTrainingConfig",
     "LatitudeWeightedCharbonnierLoss",
     "MainTrainingConfig",
     "rollout_main_model",
+    "run_bottleneck_compressor_smoke_test",
     "run_intrinsic_model_smoke_test",
     "run_main_model_smoke_test",
+    "train_bottleneck_compressor_model",
     "train_intrinsic_model",
     "train_main_model",
     "validate_intrinsic_model",

@@ -4,6 +4,8 @@ import torch
 
 from weather_state_variables.models import (
     FuXiEncoderOutput,
+    FuXiBottleneckCompressor,
+    FuXiBottleneckCompressorConfig,
     FuXiIntrinsic,
     FuXiIntrinsicConfig,
     FuXiLowerRes,
@@ -245,6 +247,60 @@ class TestFuXiIntrinsic(unittest.TestCase):
 
         self.assertEqual(outputs["z_intrinsic"].shape, (2, 3))
         self.assertEqual(outputs["patch_grid_features_recon"].shape, (2, 24, 8, 16))
+
+
+class TestFuXiBottleneckCompressor(unittest.TestCase):
+    def test_default_recipe_uses_meta_to_avoid_oom(self) -> None:
+        model = FuXiBottleneckCompressor()
+        summary = model.summary()
+        config = model.config
+
+        self.assertEqual(summary["input_channels"], config.resolved_input_channels)
+        self.assertEqual(summary["output_channels"], config.resolved_input_channels)
+        self.assertEqual(summary["spatial_size"], list(config.spatial_size))
+        self.assertEqual(summary["bottleneck_channels"], config.bottleneck_channels)
+        self.assertEqual(summary["bottleneck_shape"], list(config.bottleneck_shape))
+        self.assertEqual(summary["architecture"], "transformer_grid_bottleneck_autoencoder")
+        self.assertEqual(summary["transformer_type"], "torch.nn.TransformerEncoder")
+        self.assertTrue(summary["uses_positional_embeddings"])
+        self.assertFalse(summary["uses_skip_connections"])
+        self.assertEqual(summary["feature_source"], "second_block_features")
+        self.assertEqual(summary["parameter_device"], "meta")
+
+    def test_tiny_config_runs_forward(self) -> None:
+        config = FuXiBottleneckCompressorConfig(
+            input_channels=16,
+            spatial_size=(2, 4),
+            model_dim=16,
+            bottleneck_channels=1,
+            num_heads=4,
+            encoder_depth=1,
+            decoder_depth=1,
+            mlp_hidden_dim=32,
+            dropout=0.0,
+            positional_embedding="learned_2d",
+            feature_source="second_block_features",
+            device="cpu",
+            dtype=torch.float32,
+        )
+        model = FuXiBottleneckCompressor(config)
+        second_block_features = torch.randn(2, 16, 2, 4)
+
+        outputs = model(second_block_features)
+
+        self.assertEqual(
+            set(outputs.keys()),
+            {
+                "z_bottleneck",
+                "bottleneck_features",
+                "second_block_features_recon",
+                "feature_grid_recon",
+            },
+        )
+        self.assertEqual(outputs["z_bottleneck"].shape, (2, 1, 2, 4))
+        self.assertEqual(outputs["bottleneck_features"].shape, (2, 1, 2, 4))
+        self.assertEqual(outputs["second_block_features_recon"].shape, (2, 16, 2, 4))
+        self.assertEqual(outputs["feature_grid_recon"].shape, (2, 16, 2, 4))
 
 
 if __name__ == "__main__":

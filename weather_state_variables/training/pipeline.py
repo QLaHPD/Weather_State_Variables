@@ -16,7 +16,7 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel
 from torch.optim import AdamW, Optimizer
-from torch.utils.data import DataLoader, Sampler
+from torch.utils.data import DataLoader, Dataset, Sampler
 try:
     from torchinfo import summary as torchinfo_summary
 except ImportError:
@@ -47,6 +47,8 @@ from ..models import (
     FuXiLowerRes,
     FuXiLowerResConfig,
     FuXiLowerResEncoder,
+    LatentDynamicsConfig,
+    NeuralLatentDynamics,
 )
 
 
@@ -188,6 +190,15 @@ def _to_optional_positive_int(value: Any, *, field_name: str) -> int | None:
     parsed = int(value)
     if parsed <= 0:
         raise ValueError(f"{field_name} must be positive when set, got {parsed}")
+    return parsed
+
+
+def _to_non_negative_int(value: Any, *, default: int = 0, field_name: str) -> int:
+    if value in {None, ""}:
+        return default
+    parsed = int(value)
+    if parsed < 0:
+        raise ValueError(f"{field_name} must be non-negative, got {parsed}")
     return parsed
 
 
@@ -426,6 +437,25 @@ def _make_bottleneck_compressor_random_inputs(
     )
 
 
+def _make_latent_dynamics_random_inputs(
+    latent_dynamics_config: LatentDynamicsConfig,
+    *,
+    batch_size: int,
+    trajectory_length: int,
+    device: torch.device,
+) -> Tensor:
+    if trajectory_length <= 1:
+        raise ValueError(f"trajectory_length must be at least 2, got {trajectory_length}")
+    dtype = latent_dynamics_config.dtype or torch.float32
+    return torch.randn(
+        batch_size,
+        trajectory_length,
+        latent_dynamics_config.resolved_latent_dim,
+        device=device,
+        dtype=dtype,
+    )
+
+
 def run_main_model_smoke_test(
     model: FuXiLowerRes,
     *,
@@ -487,6 +517,50 @@ def run_bottleneck_compressor_smoke_test(
     }
     if print_outputs:
         _print_json_block("bottleneck_compressor_smoke_test", report)
+    return report
+
+
+def run_latent_dynamics_smoke_test(
+    model: NeuralLatentDynamics,
+    *,
+    batch_size: int,
+    trajectory_length: int,
+    dt_hours: float,
+    integration_method: str = "rk4",
+    print_outputs: bool = True,
+) -> dict[str, Any]:
+    device = next(model.parameters()).device
+    latent_trajectory = _make_latent_dynamics_random_inputs(
+        model.config,
+        batch_size=batch_size,
+        trajectory_length=trajectory_length,
+        device=device,
+    )
+    with torch.no_grad():
+        derivative = model(latent_trajectory[:, 0])
+        rollout = _integrate_latent_dynamics_rollout(
+            model,
+            latent_trajectory[:, 0],
+            horizon=trajectory_length - 1,
+            dt_hours=float(dt_hours),
+            method=integration_method,
+        )
+    report = {
+        "input": {
+            "latent_trajectory": {
+                "shape": list(latent_trajectory.shape),
+                "dtype": str(latent_trajectory.dtype),
+            }
+        },
+        "output": {
+            "derivative": {"shape": list(derivative.shape), "dtype": str(derivative.dtype)},
+            "rollout": {"shape": list(rollout.shape), "dtype": str(rollout.dtype)},
+        },
+        "integration_method": integration_method,
+        "dt_hours": float(dt_hours),
+    }
+    if print_outputs:
+        _print_json_block("latent_dynamics_smoke_test", report)
     return report
 
 
@@ -1606,6 +1680,17 @@ class IntrinsicTrainingConfig:
     save_every_optimizer_steps: int | None = None
     main_checkpoint_path: Path | None = None
     detach_second_block_features: bool = False
+    smoothness_weight: float = 0.0
+    smoothness_l0: float = 0.5
+    smoothness_eta: float = 1.0
+    smoothness_use_tanh_projection: bool = True
+    space_filling_weight: float = 0.0
+    space_filling_sinkhorn_epsilon: float = 0.1
+    space_filling_sinkhorn_iters: int = 50
+    space_filling_reference_sample_count: int | None = None
+    space_filling_use_tanh_projection: bool = True
+    space_filling_beta_ramp_optimizer_steps: int = 0
+    space_filling_beta_hold_optimizer_steps: int = 0
     train_start_time: pd.Timestamp | None = None
     train_end_time: pd.Timestamp | None = None
     val_start_time: pd.Timestamp | None = None
@@ -1665,6 +1750,36 @@ class IntrinsicTrainingConfig:
                     "detach_second_block_features",
                     data.get("detach_z_high", False),
                 )
+            ),
+            smoothness_weight=float(data.get("smoothness_weight", 0.0)),
+            smoothness_l0=float(data.get("smoothness_l0", 0.5)),
+            smoothness_eta=float(data.get("smoothness_eta", 1.0)),
+            smoothness_use_tanh_projection=bool(
+                data.get("smoothness_use_tanh_projection", True)
+            ),
+            space_filling_weight=float(data.get("space_filling_weight", 0.0)),
+            space_filling_sinkhorn_epsilon=float(data.get("space_filling_sinkhorn_epsilon", 0.1)),
+            space_filling_sinkhorn_iters=_to_positive_int(
+                data.get("space_filling_sinkhorn_iters"),
+                default=50,
+                field_name="train_intrinsic.space_filling_sinkhorn_iters",
+            ),
+            space_filling_reference_sample_count=_to_optional_positive_int(
+                data.get("space_filling_reference_sample_count"),
+                field_name="train_intrinsic.space_filling_reference_sample_count",
+            ),
+            space_filling_use_tanh_projection=bool(
+                data.get("space_filling_use_tanh_projection", True)
+            ),
+            space_filling_beta_ramp_optimizer_steps=_to_non_negative_int(
+                data.get("space_filling_beta_ramp_optimizer_steps"),
+                default=0,
+                field_name="train_intrinsic.space_filling_beta_ramp_optimizer_steps",
+            ),
+            space_filling_beta_hold_optimizer_steps=_to_non_negative_int(
+                data.get("space_filling_beta_hold_optimizer_steps"),
+                default=0,
+                field_name="train_intrinsic.space_filling_beta_hold_optimizer_steps",
             ),
             train_start_time=_to_optional_timestamp(data.get("train_start_time")),
             train_end_time=_to_optional_timestamp(data.get("train_end_time")),
@@ -1779,6 +1894,153 @@ class BottleneckCompressorTrainingConfig:
             print_model_summary=bool(data.get("print_model_summary", True)),
             summary_depth=int(data.get("summary_depth", 3)),
             random_smoke_batch_size=int(data.get("random_smoke_batch_size", 1)),
+            config_path=resolved_config_path,
+        )
+
+
+@dataclass(frozen=True)
+class LatentDynamicsTrainingConfig:
+    batch_size: int = 128
+    num_workers: int = 0
+    gradient_accumulation_steps: int = 1
+    learning_rate: float = 1e-3
+    weight_decay: float = 1e-4
+    max_epochs: int = 1
+    device: str = "auto"
+    model_dtype: str = "float32"
+    use_amp: bool = False
+    amp_dtype: str = "float16"
+    gradient_clip_norm: float | None = None
+    output_dir: Path = Path("runs/latent_dynamics")
+    checkpoint_name: str = "latent_dynamics_last.pt"
+    best_checkpoint_name: str = "latent_dynamics_best.pt"
+    resume_checkpoint_path: Path | None = None
+    save_epoch_checkpoint: bool = True
+    save_best_checkpoint: bool = True
+    save_every_train_batches: int | None = None
+    save_every_optimizer_steps: int | None = None
+    main_checkpoint_path: Path | None = None
+    intrinsic_checkpoint_path: Path | None = None
+    encoding_batch_size: int = 4
+    encoding_num_workers: int = 0
+    trajectory_length: int = 8
+    trajectory_stride_hours: int | None = None
+    max_train_trajectories: int | None = None
+    max_val_trajectories: int | None = None
+    latent_jump_filter_percentile: float = 99.0
+    filter_latent_trajectory_jumps: bool = True
+    loss_discount_rho_min: float = 0.1
+    loss_discount_rho_max: float = 0.9
+    rho_cycle_optimizer_steps: int = 1000
+    integration_method: str = "rk4"
+    train_start_time: pd.Timestamp | None = None
+    train_end_time: pd.Timestamp | None = None
+    val_start_time: pd.Timestamp | None = None
+    val_end_time: pd.Timestamp | None = None
+    log_every: int = 10
+    print_model_summary: bool = True
+    summary_depth: int = 3
+    random_smoke_batch_size: int = 4
+    config_path: Path = DEFAULT_MODEL_CONFIG_PATH
+
+    @classmethod
+    def from_yaml(
+        cls,
+        config_path: str | Path = DEFAULT_MODEL_CONFIG_PATH,
+    ) -> "LatentDynamicsTrainingConfig":
+        resolved_config_path, data = load_config_section("train_latent_dynamics", config_path)
+        main_checkpoint_path = None
+        intrinsic_checkpoint_path = None
+        if data.get("main_checkpoint_path") not in {None, ""}:
+            main_checkpoint_path = resolve_repo_path(
+                data.get("main_checkpoint_path"),
+                config_path=resolved_config_path,
+            )
+        if data.get("intrinsic_checkpoint_path") not in {None, ""}:
+            intrinsic_checkpoint_path = resolve_repo_path(
+                data.get("intrinsic_checkpoint_path"),
+                config_path=resolved_config_path,
+            )
+        return cls(
+            batch_size=int(data.get("batch_size", 128)),
+            num_workers=int(data.get("num_workers", 0)),
+            gradient_accumulation_steps=_to_positive_int(
+                data.get("gradient_accumulation_steps"),
+                default=1,
+                field_name="train_latent_dynamics.gradient_accumulation_steps",
+            ),
+            learning_rate=float(data.get("learning_rate", 1e-3)),
+            weight_decay=float(data.get("weight_decay", 1e-4)),
+            max_epochs=int(data.get("max_epochs", 1)),
+            device=str(data.get("device", "auto")),
+            model_dtype=str(data.get("model_dtype", "float32")),
+            use_amp=bool(data.get("use_amp", False)),
+            amp_dtype=str(data.get("amp_dtype", "float16")),
+            gradient_clip_norm=_to_optional_float(data.get("gradient_clip_norm")),
+            output_dir=resolve_repo_path(
+                data.get("output_dir", "runs/latent_dynamics"),
+                config_path=resolved_config_path,
+            ),
+            checkpoint_name=str(data.get("checkpoint_name", "latent_dynamics_last.pt")),
+            best_checkpoint_name=str(data.get("best_checkpoint_name", "latent_dynamics_best.pt")),
+            resume_checkpoint_path=(
+                None
+                if data.get("resume_checkpoint_path") in {None, ""}
+                else resolve_repo_path(data.get("resume_checkpoint_path"), config_path=resolved_config_path)
+            ),
+            save_epoch_checkpoint=bool(data.get("save_epoch_checkpoint", True)),
+            save_best_checkpoint=bool(data.get("save_best_checkpoint", True)),
+            save_every_train_batches=_to_optional_positive_int(
+                data.get("save_every_train_batches"),
+                field_name="train_latent_dynamics.save_every_train_batches",
+            ),
+            save_every_optimizer_steps=_to_optional_positive_int(
+                data.get("save_every_optimizer_steps"),
+                field_name="train_latent_dynamics.save_every_optimizer_steps",
+            ),
+            main_checkpoint_path=main_checkpoint_path,
+            intrinsic_checkpoint_path=intrinsic_checkpoint_path,
+            encoding_batch_size=_to_positive_int(
+                data.get("encoding_batch_size"),
+                default=4,
+                field_name="train_latent_dynamics.encoding_batch_size",
+            ),
+            encoding_num_workers=int(data.get("encoding_num_workers", 0)),
+            trajectory_length=_to_positive_int(
+                data.get("trajectory_length"),
+                default=8,
+                field_name="train_latent_dynamics.trajectory_length",
+            ),
+            trajectory_stride_hours=_to_optional_positive_int(
+                data.get("trajectory_stride_hours"),
+                field_name="train_latent_dynamics.trajectory_stride_hours",
+            ),
+            max_train_trajectories=_to_optional_positive_int(
+                data.get("max_train_trajectories"),
+                field_name="train_latent_dynamics.max_train_trajectories",
+            ),
+            max_val_trajectories=_to_optional_positive_int(
+                data.get("max_val_trajectories"),
+                field_name="train_latent_dynamics.max_val_trajectories",
+            ),
+            latent_jump_filter_percentile=float(data.get("latent_jump_filter_percentile", 99.0)),
+            filter_latent_trajectory_jumps=bool(data.get("filter_latent_trajectory_jumps", True)),
+            loss_discount_rho_min=float(data.get("loss_discount_rho_min", 0.1)),
+            loss_discount_rho_max=float(data.get("loss_discount_rho_max", 0.9)),
+            rho_cycle_optimizer_steps=_to_positive_int(
+                data.get("rho_cycle_optimizer_steps"),
+                default=1000,
+                field_name="train_latent_dynamics.rho_cycle_optimizer_steps",
+            ),
+            integration_method=str(data.get("integration_method", "rk4")),
+            train_start_time=_to_optional_timestamp(data.get("train_start_time")),
+            train_end_time=_to_optional_timestamp(data.get("train_end_time")),
+            val_start_time=_to_optional_timestamp(data.get("val_start_time")),
+            val_end_time=_to_optional_timestamp(data.get("val_end_time")),
+            log_every=int(data.get("log_every", 10)),
+            print_model_summary=bool(data.get("print_model_summary", True)),
+            summary_depth=int(data.get("summary_depth", 3)),
+            random_smoke_batch_size=int(data.get("random_smoke_batch_size", 4)),
             config_path=resolved_config_path,
         )
 
@@ -1904,6 +2166,69 @@ def _build_bottleneck_compressor_training_objects(
     return train_config, encoder_config, compressor_config, data_config, runtime, model_dtype, amp_dtype
 
 
+def _build_latent_dynamics_training_objects(
+    config_path: str | Path,
+) -> tuple[
+    LatentDynamicsTrainingConfig,
+    FuXiLowerResConfig,
+    FuXiIntrinsicConfig,
+    LatentDynamicsConfig,
+    ArcoEra5FuXiDataConfig,
+    DistributedRuntime,
+    torch.dtype,
+    torch.dtype | None,
+]:
+    train_config = LatentDynamicsTrainingConfig.from_yaml(config_path)
+    runtime = _resolve_distributed_runtime(train_config.device)
+    model_dtype = resolve_torch_dtype(train_config.model_dtype) or torch.float32
+    amp_dtype = resolve_torch_dtype(train_config.amp_dtype)
+    _validate_training_precision_config(
+        section_name="train_latent_dynamics",
+        use_amp=train_config.use_amp,
+        model_dtype=model_dtype,
+        amp_dtype=amp_dtype,
+    )
+
+    encoder_config = replace(
+        FuXiLowerResConfig.from_yaml(config_path),
+        device=runtime.device,
+        dtype=model_dtype,
+    )
+    intrinsic_config = replace(
+        FuXiIntrinsicConfig.from_yaml(config_path),
+        device=runtime.device,
+        dtype=model_dtype,
+        input_channels=encoder_config.embed_dim,
+        spatial_size=encoder_config.latent_grid,
+    )
+    latent_dynamics_config = replace(
+        LatentDynamicsConfig.from_yaml(config_path),
+        device=runtime.device,
+        dtype=model_dtype,
+        latent_dim=intrinsic_config.d_intrinsic,
+    )
+    if latent_dynamics_config.resolved_latent_dim != intrinsic_config.d_intrinsic:
+        raise ValueError(
+            "latent_dynamics_model.latent_dim must match intrinsic_model.d_intrinsic. "
+            f"Got latent_dim={latent_dynamics_config.resolved_latent_dim} and "
+            f"d_intrinsic={intrinsic_config.d_intrinsic}."
+        )
+    data_config = replace(
+        ArcoEra5FuXiDataConfig.from_yaml(config_path),
+        forecast_steps=encoder_config.forecast_steps,
+    )
+    return (
+        train_config,
+        encoder_config,
+        intrinsic_config,
+        latent_dynamics_config,
+        data_config,
+        runtime,
+        model_dtype,
+        amp_dtype,
+    )
+
+
 def _build_split_dataloaders(
     data_config: ArcoEra5FuXiDataConfig,
     *,
@@ -2013,6 +2338,77 @@ class _FixedIndexShardSampler(Sampler[int]):
         return len(self.local_indices)
 
 
+class _EpochShardedSampler(Sampler[int]):
+    """Epoch-aware distributed sampler with deterministic padding for DDP-safe lengths."""
+
+    def __init__(
+        self,
+        dataset: Dataset[Any],
+        *,
+        num_replicas: int,
+        rank: int,
+        shuffle: bool,
+        seed: int = 0,
+    ) -> None:
+        if num_replicas <= 0:
+            raise ValueError(f"num_replicas must be positive, got {num_replicas}")
+        if rank < 0 or rank >= num_replicas:
+            raise ValueError(f"rank must be in [0, {num_replicas}), got {rank}")
+        self.dataset = dataset
+        self.num_replicas = int(num_replicas)
+        self.rank = int(rank)
+        self.shuffle = bool(shuffle)
+        self.seed = int(seed)
+        self.epoch = 0
+        dataset_length = len(dataset)
+        self.num_samples = int(np.ceil(dataset_length / self.num_replicas)) if dataset_length > 0 else 0
+        self.total_size = self.num_samples * self.num_replicas
+
+    def __iter__(self):
+        dataset_length = len(self.dataset)
+        if dataset_length <= 0:
+            return iter(())
+
+        if self.shuffle:
+            generator = torch.Generator()
+            generator.manual_seed(self.seed + self.epoch)
+            ordered_indices = torch.randperm(dataset_length, generator=generator).tolist()
+        else:
+            ordered_indices = list(range(dataset_length))
+
+        ordered_indices.extend([ordered_indices[-1]] * (self.total_size - dataset_length))
+        start = self.rank * self.num_samples
+        return iter(ordered_indices[start : start + self.num_samples])
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+
+class _LatentTrajectoryDataset(Dataset[dict[str, Tensor]]):
+    def __init__(self, latent_matrix: Tensor, trajectory_positions: Tensor) -> None:
+        if latent_matrix.ndim != 2:
+            raise ValueError(
+                f"Expected latent_matrix shaped [T, D], got {tuple(latent_matrix.shape)}"
+            )
+        if trajectory_positions.ndim != 2:
+            raise ValueError(
+                "Expected trajectory_positions shaped [M, N], "
+                f"got {tuple(trajectory_positions.shape)}"
+            )
+        self.latent_matrix = latent_matrix.contiguous()
+        self.trajectory_positions = trajectory_positions.to(dtype=torch.long).contiguous()
+
+    def __len__(self) -> int:
+        return int(self.trajectory_positions.shape[0])
+
+    def __getitem__(self, index: int) -> dict[str, Tensor]:
+        positions = self.trajectory_positions[int(index)]
+        return {"trajectory": self.latent_matrix.index_select(0, positions)}
+
+
 def _build_eval_dataset(
     data_config: ArcoEra5FuXiDataConfig,
     *,
@@ -2115,6 +2511,24 @@ def _load_bottleneck_compressor_checkpoint(
         state_dict = checkpoint
     else:
         raise ValueError(f"Unsupported bottleneck compressor checkpoint format at {checkpoint_path}")
+    model.load_state_dict(state_dict, strict=True)
+    return checkpoint if isinstance(checkpoint, dict) else None
+
+
+def _load_latent_dynamics_checkpoint(
+    model: NeuralLatentDynamics,
+    checkpoint_path: Path,
+) -> dict[str, Any] | None:
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    state_dict: dict[str, Tensor]
+    if isinstance(checkpoint, dict) and "latent_dynamics_state_dict" in checkpoint:
+        state_dict = checkpoint["latent_dynamics_state_dict"]
+    elif isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+    elif isinstance(checkpoint, dict) and all(isinstance(value, Tensor) for value in checkpoint.values()):
+        state_dict = checkpoint
+    else:
+        raise ValueError(f"Unsupported latent dynamics checkpoint format at {checkpoint_path}")
     model.load_state_dict(state_dict, strict=True)
     return checkpoint if isinstance(checkpoint, dict) else None
 
@@ -3088,12 +3502,11 @@ def _distributed_shard_directory(runtime: DistributedRuntime) -> Path | None:
     return Path(resolved)
 
 
-def _load_distributed_latent_pool(
+def _load_distributed_latent_table(
     shard_directory: Path,
     *,
     world_size: int,
-    max_samples: int,
-) -> tuple[np.ndarray, tuple[int, ...] | None]:
+) -> tuple[np.ndarray, np.ndarray, tuple[int, ...] | None]:
     sample_indices_list: list[np.ndarray] = []
     latent_list: list[np.ndarray] = []
     latent_shape: tuple[int, ...] | None = None
@@ -3110,7 +3523,7 @@ def _load_distributed_latent_pool(
             latent_shape = tuple(int(value) for value in shape_array.tolist())
         if latents.shape[0] != sample_indices.shape[0]:
             raise ValueError(
-                f"Distributed intrinsic-dimension shard {shard_path} is inconsistent: "
+                f"Distributed latent shard {shard_path} is inconsistent: "
                 f"{latents.shape[0]} latent rows for {sample_indices.shape[0]} sample indices."
             )
         if sample_indices.size == 0:
@@ -3119,7 +3532,7 @@ def _load_distributed_latent_pool(
         latent_list.append(np.ascontiguousarray(latents))
 
     if not latent_list:
-        raise ValueError("No latent samples were gathered from the distributed intrinsic-dimension shards.")
+        raise ValueError("No latent samples were gathered from the distributed latent shards.")
 
     sample_indices = np.concatenate(sample_indices_list, axis=0)
     latent_matrix = np.concatenate(latent_list, axis=0)
@@ -3131,6 +3544,19 @@ def _load_distributed_latent_pool(
     unique_mask[1:] = sample_indices[1:] != sample_indices[:-1]
     sample_indices = sample_indices[unique_mask]
     latent_matrix = latent_matrix[unique_mask]
+    return sample_indices, latent_matrix, latent_shape
+
+
+def _load_distributed_latent_pool(
+    shard_directory: Path,
+    *,
+    world_size: int,
+    max_samples: int,
+) -> tuple[np.ndarray, tuple[int, ...] | None]:
+    sample_indices, latent_matrix, latent_shape = _load_distributed_latent_table(
+        shard_directory,
+        world_size=world_size,
+    )
 
     if sample_indices.shape[0] > int(max_samples):
         sample_indices = sample_indices[: int(max_samples)]
@@ -3145,6 +3571,741 @@ def _cleanup_distributed_latent_shards(shard_directory: Path, *, world_size: int
             shard_path.unlink()
     if shard_directory.exists():
         shard_directory.rmdir()
+
+
+def _resolve_latent_dynamics_dt_hours(
+    train_config: LatentDynamicsTrainingConfig,
+    data_config: ArcoEra5FuXiDataConfig,
+) -> float:
+    resolved = (
+        data_config.lead_time_hours
+        if train_config.trajectory_stride_hours is None
+        else train_config.trajectory_stride_hours
+    )
+    if int(resolved) <= 0:
+        raise ValueError(f"trajectory stride must be positive, got {resolved}")
+    return float(resolved)
+
+
+def _integrate_latent_dynamics_step(
+    model: NeuralLatentDynamics,
+    z: Tensor,
+    *,
+    dt_hours: float,
+    method: str,
+) -> Tensor:
+    normalized_method = method.strip().lower()
+    dt = float(dt_hours)
+    if normalized_method == "euler":
+        return z + dt * model(z)
+    if normalized_method == "rk4":
+        k1 = model(z)
+        k2 = model(z + 0.5 * dt * k1)
+        k3 = model(z + 0.5 * dt * k2)
+        k4 = model(z + dt * k3)
+        return z + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+    raise ValueError(f"Unsupported latent dynamics integration_method {method!r}")
+
+
+def _integrate_latent_dynamics_rollout(
+    model: NeuralLatentDynamics,
+    z0: Tensor,
+    *,
+    horizon: int,
+    dt_hours: float,
+    method: str,
+) -> Tensor:
+    if horizon < 0:
+        raise ValueError(f"horizon must be non-negative, got {horizon}")
+    if horizon == 0:
+        return z0.new_empty((z0.shape[0], 0, z0.shape[-1]))
+
+    current = z0
+    predictions: list[Tensor] = []
+    for _step in range(int(horizon)):
+        current = _integrate_latent_dynamics_step(
+            model,
+            current,
+            dt_hours=dt_hours,
+            method=method,
+        )
+        predictions.append(current)
+    return torch.stack(predictions, dim=1)
+
+
+def _latent_dynamics_discount_rho(
+    *,
+    optimizer_step: int,
+    rho_min: float,
+    rho_max: float,
+    cycle_steps: int,
+) -> float:
+    if cycle_steps <= 1 or np.isclose(rho_min, rho_max):
+        return float(rho_max)
+    phase = float(optimizer_step % cycle_steps) / float(cycle_steps - 1)
+    return float(rho_min + phase * (rho_max - rho_min))
+
+
+def _latent_dynamics_trajectory_loss(
+    model: NeuralLatentDynamics,
+    trajectories: Tensor,
+    *,
+    dt_hours: float,
+    method: str,
+    rho: float,
+) -> Tensor:
+    if trajectories.ndim != 3:
+        raise ValueError(
+            f"Expected trajectories shaped [B, N, D], got {tuple(trajectories.shape)}"
+        )
+    if trajectories.shape[1] < 2:
+        raise ValueError(
+            f"Expected trajectories with length at least 2, got {trajectories.shape[1]}"
+        )
+
+    total_loss = trajectories.new_zeros(())
+    start_count = int(trajectories.shape[1] - 1)
+    for start_index in range(start_count):
+        target = trajectories[:, start_index + 1 :]
+        prediction = _integrate_latent_dynamics_rollout(
+            model,
+            trajectories[:, start_index],
+            horizon=int(target.shape[1]),
+            dt_hours=dt_hours,
+            method=method,
+        )
+        step_losses = torch.mean((prediction - target) ** 2, dim=-1)
+        weights = torch.pow(
+            trajectories.new_full((step_losses.shape[1],), float(rho)),
+            torch.arange(step_losses.shape[1], device=trajectories.device, dtype=trajectories.dtype),
+        )
+        weighted_loss = (step_losses * weights.unsqueeze(0)).sum(dim=1) / weights.sum().clamp_min(
+            torch.finfo(step_losses.dtype).eps
+        )
+        total_loss = total_loss + weighted_loss.mean()
+    return total_loss / float(start_count)
+
+
+def _subsample_trajectory_positions(
+    trajectory_positions: np.ndarray,
+    *,
+    max_trajectories: int | None,
+) -> np.ndarray:
+    if max_trajectories is None or trajectory_positions.shape[0] <= int(max_trajectories):
+        return trajectory_positions
+    if int(max_trajectories) <= 0:
+        raise ValueError(f"max_trajectories must be positive when set, got {max_trajectories}")
+    selection = np.rint(
+        np.linspace(0, trajectory_positions.shape[0] - 1, num=int(max_trajectories))
+    ).astype(np.int64)
+    return np.ascontiguousarray(trajectory_positions[selection])
+
+
+def _build_latent_trajectory_positions(
+    anchor_indices: np.ndarray,
+    latent_matrix: np.ndarray,
+    *,
+    trajectory_length: int,
+    stride_steps: int,
+    filter_percentile: float,
+    filter_large_jumps: bool,
+) -> dict[str, Any]:
+    if trajectory_length <= 1:
+        raise ValueError(f"trajectory_length must be at least 2, got {trajectory_length}")
+    if stride_steps <= 0:
+        raise ValueError(f"stride_steps must be positive, got {stride_steps}")
+
+    sorted_anchor_indices = np.asarray(anchor_indices, dtype=np.int64)
+    sorted_latent_matrix = np.asarray(latent_matrix, dtype=np.float32)
+    if sorted_anchor_indices.ndim != 1:
+        raise ValueError(
+            f"Expected anchor_indices shaped [T], got {tuple(sorted_anchor_indices.shape)}"
+        )
+    if sorted_latent_matrix.ndim != 2:
+        raise ValueError(
+            f"Expected latent_matrix shaped [T, D], got {tuple(sorted_latent_matrix.shape)}"
+        )
+    if sorted_anchor_indices.shape[0] != sorted_latent_matrix.shape[0]:
+        raise ValueError(
+            "anchor_indices and latent_matrix must agree on sample count, got "
+            f"{sorted_anchor_indices.shape[0]} and {sorted_latent_matrix.shape[0]}"
+        )
+
+    anchor_to_position = {
+        int(anchor_index): int(position)
+        for position, anchor_index in enumerate(sorted_anchor_indices.tolist())
+    }
+    transition_next = np.full(sorted_anchor_indices.shape[0], -1, dtype=np.int64)
+    transition_norm = np.full(sorted_anchor_indices.shape[0], np.nan, dtype=np.float32)
+    valid_transition_norms: list[float] = []
+    for position, anchor_index in enumerate(sorted_anchor_indices.tolist()):
+        next_position = anchor_to_position.get(int(anchor_index) + int(stride_steps))
+        if next_position is None:
+            continue
+        transition_next[position] = int(next_position)
+        jump_norm = float(
+            np.linalg.norm(sorted_latent_matrix[int(next_position)] - sorted_latent_matrix[position])
+        )
+        transition_norm[position] = jump_norm
+        valid_transition_norms.append(jump_norm)
+
+    if not valid_transition_norms:
+        raise ValueError(
+            "No valid one-step latent transitions were found for the requested trajectory stride."
+        )
+
+    jump_threshold = (
+        float(np.percentile(np.asarray(valid_transition_norms, dtype=np.float32), float(filter_percentile)))
+        if filter_large_jumps
+        else None
+    )
+
+    candidate_positions: list[list[int]] = []
+    retained_positions: list[list[int]] = []
+    for start_position in range(sorted_anchor_indices.shape[0]):
+        positions = [int(start_position)]
+        current_position = int(start_position)
+        valid = True
+        retained = True
+        for _step in range(trajectory_length - 1):
+            next_position = int(transition_next[current_position])
+            if next_position < 0:
+                valid = False
+                break
+            if jump_threshold is not None and float(transition_norm[current_position]) > float(jump_threshold):
+                retained = False
+            positions.append(next_position)
+            current_position = next_position
+        if not valid:
+            continue
+        candidate_positions.append(positions)
+        if retained:
+            retained_positions.append(positions)
+
+    final_positions = retained_positions if filter_large_jumps else candidate_positions
+    if not final_positions:
+        raise ValueError(
+            "No latent trajectories remain after filtering. "
+            "Lower trajectory_length, reduce trajectory_stride_hours, or disable filtering."
+        )
+
+    return {
+        "trajectory_positions": np.asarray(final_positions, dtype=np.int64),
+        "candidate_trajectory_count": int(len(candidate_positions)),
+        "retained_trajectory_count": int(len(final_positions)),
+        "transition_count": int(len(valid_transition_norms)),
+        "jump_threshold": jump_threshold,
+        "jump_norm_mean": float(np.mean(valid_transition_norms)),
+        "jump_norm_std": float(np.std(valid_transition_norms)),
+    }
+
+
+def _encode_intrinsic_latent_split(
+    *,
+    encoder: FuXiLowerResEncoder,
+    intrinsic_model: FuXiIntrinsic,
+    data_config: ArcoEra5FuXiDataConfig,
+    runtime: DistributedRuntime,
+    batch_size: int,
+    num_workers: int,
+    use_amp: bool,
+    amp_dtype: torch.dtype | None,
+    start_time: pd.Timestamp | None,
+    end_time: pd.Timestamp | None,
+    split_name: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    dataset = _build_eval_dataset(
+        data_config,
+        runtime=runtime,
+        start_time=start_time,
+        end_time=end_time,
+    )
+    valid_anchor_indices = np.asarray(dataset._build_valid_anchor_indices(), dtype=np.int64)
+    dataset_indices = list(range(len(dataset)))
+    sampler = _FixedIndexShardSampler(
+        dataset_indices,
+        num_replicas=runtime.world_size,
+        rank=runtime.rank,
+    )
+    loader = build_arco_era5_dataloader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=runtime.device.type == "cuda",
+        sampler=sampler,
+    )
+
+    local_latents: list[np.ndarray] = []
+    local_anchor_indices: list[int] = []
+    sampler_offset = 0
+    local_sampler_indices = list(sampler.local_indices)
+    progress_bar = None
+    if runtime.is_primary and tqdm is not None:
+        progress_bar = tqdm(
+            total=len(dataset),
+            desc=f"[latent-dynamics][{split_name}] latent samples",
+            unit="sample",
+            leave=True,
+        )
+
+    with torch.no_grad():
+        batch_iterator = iter(_iter_prefetched_batches(loader, runtime=runtime, max_batches=None))
+        local_batch_count = (
+            0
+            if batch_size <= 0
+            else (len(local_sampler_indices) + int(batch_size) - 1) // int(batch_size)
+        )
+        max_batch_count_tensor = torch.tensor(
+            [local_batch_count],
+            device=runtime.device,
+            dtype=torch.int64,
+        )
+        if runtime.enabled:
+            dist.all_reduce(max_batch_count_tensor, op=dist.ReduceOp.MAX)
+        for _loop_index in range(int(max_batch_count_tensor.item())):
+            local_generated_count = 0
+            try:
+                _batch_index, batch = next(batch_iterator)
+            except StopIteration:
+                batch = None
+
+            if batch is not None:
+                with _amp_autocast_context(use_amp, runtime.device, amp_dtype):
+                    encoded = encoder(
+                        batch["x"],
+                        batch["temb"],
+                        static_features=batch["static_features"],
+                    )
+                    latent_batch = intrinsic_model.encode(encoded.second_block_features)
+                latent_array = latent_batch.detach().cpu().float().numpy()
+                local_latents.append(np.ascontiguousarray(latent_array))
+                local_generated_count = int(latent_array.shape[0])
+                batch_dataset_indices = local_sampler_indices[
+                    sampler_offset : sampler_offset + local_generated_count
+                ]
+                if len(batch_dataset_indices) != local_generated_count:
+                    raise RuntimeError(
+                        "Latent pre-encoding sampler bookkeeping drifted from the dataloader batches."
+                    )
+                local_anchor_indices.extend(
+                    int(valid_anchor_indices[index]) for index in batch_dataset_indices
+                )
+                sampler_offset += local_generated_count
+
+            generated_tensor = torch.tensor(
+                [local_generated_count],
+                device=runtime.device,
+                dtype=torch.int64,
+            )
+            if runtime.enabled:
+                dist.all_reduce(generated_tensor, op=dist.ReduceOp.SUM)
+            if progress_bar is not None:
+                progress_bar.update(int(generated_tensor.item()))
+
+    if progress_bar is not None:
+        progress_bar.close()
+
+    local_latent_matrix = (
+        np.concatenate(local_latents, axis=0)
+        if local_latents
+        else np.empty((0, intrinsic_model.config.d_intrinsic), dtype=np.float32)
+    )
+    local_anchor_index_array = np.asarray(local_anchor_indices, dtype=np.int64)
+    if local_latent_matrix.shape[0] != local_anchor_index_array.shape[0]:
+        raise RuntimeError(
+            "Latent pre-encoding produced mismatched anchor indices and latent rows."
+        )
+
+    if runtime.enabled:
+        shard_directory = _distributed_shard_directory(runtime)
+        if shard_directory is None:
+            raise RuntimeError("Distributed latent shard directory was not initialized.")
+        shard_path = shard_directory / f"rank_{runtime.rank:05d}.npz"
+        np.savez(
+            shard_path,
+            sample_indices=local_anchor_index_array,
+            latents=local_latent_matrix,
+            latent_shape=np.asarray((intrinsic_model.config.d_intrinsic,), dtype=np.int64),
+        )
+        _distributed_barrier(runtime)
+        if runtime.is_primary:
+            gathered_anchor_indices, gathered_latent_matrix, _latent_shape = _load_distributed_latent_table(
+                shard_directory,
+                world_size=runtime.world_size,
+            )
+        else:
+            gathered_anchor_indices = np.empty((0,), dtype=np.int64)
+            gathered_latent_matrix = np.empty((0, intrinsic_model.config.d_intrinsic), dtype=np.float32)
+        _distributed_barrier(runtime)
+        if runtime.is_primary:
+            _cleanup_distributed_latent_shards(shard_directory, world_size=runtime.world_size)
+        _distributed_barrier(runtime)
+        return gathered_anchor_indices, gathered_latent_matrix
+
+    return local_anchor_index_array, local_latent_matrix
+
+
+def _prepare_latent_trajectory_split(
+    *,
+    encoder: FuXiLowerResEncoder,
+    intrinsic_model: FuXiIntrinsic,
+    data_config: ArcoEra5FuXiDataConfig,
+    train_config: LatentDynamicsTrainingConfig,
+    runtime: DistributedRuntime,
+    use_amp: bool,
+    amp_dtype: torch.dtype | None,
+    split_name: str,
+    start_time: pd.Timestamp | None,
+    end_time: pd.Timestamp | None,
+    max_trajectories: int | None,
+) -> dict[str, Any] | None:
+    anchor_indices, latent_matrix = _encode_intrinsic_latent_split(
+        encoder=encoder,
+        intrinsic_model=intrinsic_model,
+        data_config=data_config,
+        runtime=runtime,
+        batch_size=train_config.encoding_batch_size,
+        num_workers=train_config.encoding_num_workers,
+        use_amp=use_amp,
+        amp_dtype=amp_dtype,
+        start_time=start_time,
+        end_time=end_time,
+        split_name=split_name,
+    )
+    if not runtime.is_primary:
+        return None
+
+    stride_hours = _resolve_latent_dynamics_dt_hours(train_config, data_config)
+    dataset_for_stride = ArcoEra5FuXiDataset(
+        replace(
+            data_config,
+            start_time=start_time,
+            end_time=end_time,
+        )
+    )
+    stride_steps = dataset_for_stride._step_count(int(stride_hours))
+    trajectory_info = _build_latent_trajectory_positions(
+        anchor_indices,
+        latent_matrix,
+        trajectory_length=train_config.trajectory_length,
+        stride_steps=stride_steps,
+        filter_percentile=train_config.latent_jump_filter_percentile,
+        filter_large_jumps=train_config.filter_latent_trajectory_jumps,
+    )
+    trajectory_positions = _subsample_trajectory_positions(
+        trajectory_info["trajectory_positions"],
+        max_trajectories=max_trajectories,
+    )
+    return {
+        "latents": torch.from_numpy(np.ascontiguousarray(latent_matrix)).float(),
+        "trajectory_positions": torch.from_numpy(trajectory_positions).long(),
+        "trajectory_count": int(trajectory_positions.shape[0]),
+        "candidate_trajectory_count": int(trajectory_info["candidate_trajectory_count"]),
+        "retained_trajectory_count": int(trajectory_info["retained_trajectory_count"]),
+        "transition_count": int(trajectory_info["transition_count"]),
+        "jump_threshold": trajectory_info["jump_threshold"],
+        "jump_norm_mean": float(trajectory_info["jump_norm_mean"]),
+        "jump_norm_std": float(trajectory_info["jump_norm_std"]),
+        "stride_hours": float(stride_hours),
+        "stride_steps": int(stride_steps),
+    }
+
+
+def _save_latent_dynamics_split_cache(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, path)
+
+
+def _load_latent_dynamics_split_cache(path: Path) -> dict[str, Any]:
+    cache = torch.load(path, map_location="cpu")
+    if not isinstance(cache, dict):
+        raise ValueError(f"Invalid latent dynamics split cache at {path}")
+    if "latents" not in cache or "trajectory_positions" not in cache:
+        raise ValueError(f"Latent dynamics split cache at {path} is missing required tensors.")
+    return cache
+
+
+def _evaluate_latent_dynamics_model(
+    model: nn.Module,
+    loader: DataLoader[dict[str, Tensor]],
+    *,
+    runtime: DistributedRuntime,
+    use_amp: bool,
+    amp_dtype: torch.dtype | None,
+    max_batches: int | None,
+    dt_hours: float,
+    method: str,
+    rho: float,
+) -> dict[str, Any]:
+    model.eval()
+    running_loss = 0.0
+    steps = 0
+
+    with torch.no_grad():
+        for _batch_index, batch in _iter_prefetched_batches(
+            loader,
+            runtime=runtime,
+            max_batches=max_batches,
+        ):
+            trajectories = batch["trajectory"]
+            with _amp_autocast_context(use_amp, runtime.device, amp_dtype):
+                loss = _latent_dynamics_trajectory_loss(
+                    model,
+                    trajectories,
+                    dt_hours=dt_hours,
+                    method=method,
+                    rho=rho,
+                )
+            running_loss += float(loss.item())
+            steps += 1
+
+    loss_sum, global_steps = _reduced_sum_and_count(running_loss, steps, runtime)
+    return {
+        "loss": loss_sum / max(global_steps, 1),
+        "batches": global_steps,
+    }
+
+
+def _intrinsic_regularizer_beta(
+    *,
+    optimizer_step: int,
+    ramp_steps: int,
+    hold_steps: int,
+) -> float:
+    if ramp_steps <= 0 and hold_steps <= 0:
+        return 1.0
+    cycle_steps = int(ramp_steps) + int(hold_steps)
+    if cycle_steps <= 0:
+        return 1.0
+    position = int(optimizer_step) % cycle_steps
+    if ramp_steps <= 0:
+        return 1.0
+    if position >= int(ramp_steps):
+        return 1.0
+    return float(position) / float(max(int(ramp_steps), 1))
+
+
+def _project_intrinsic_latents_for_regularizer(
+    z_intrinsic: Tensor,
+    *,
+    use_tanh_projection: bool,
+) -> Tensor:
+    return torch.tanh(z_intrinsic) if use_tanh_projection else z_intrinsic
+
+
+def _intrinsic_smoothness_loss(
+    z_intrinsic: Tensor,
+    *,
+    threshold_l0: float,
+    eta: float,
+    use_tanh_projection: bool,
+) -> Tensor:
+    if z_intrinsic.ndim != 2:
+        raise ValueError(
+            f"Expected z_intrinsic shaped [B, D], got {tuple(z_intrinsic.shape)}"
+        )
+    if float(threshold_l0) <= 0.0:
+        raise ValueError(f"smoothness threshold_l0 must be positive, got {threshold_l0}")
+    if not 0.0 <= float(eta) <= 1.0:
+        raise ValueError(f"smoothness eta must lie in [0, 1], got {eta}")
+
+    points = _project_intrinsic_latents_for_regularizer(
+        z_intrinsic,
+        use_tanh_projection=use_tanh_projection,
+    )
+    smoothness_loss = points.new_zeros(())
+
+    if float(eta) > 0.0 and points.shape[0] >= 2:
+        one_step_distances = torch.linalg.vector_norm(points[1:] - points[:-1], dim=1)
+        smoothness_loss = smoothness_loss + float(eta) * F.relu(
+            one_step_distances - float(threshold_l0)
+        ).mean()
+
+    if points.shape[0] >= 3:
+        two_step_distances = torch.linalg.vector_norm(points[2:] - points[:-2], dim=1)
+        smoothness_loss = smoothness_loss + F.relu(
+            two_step_distances - 2.0 * float(threshold_l0)
+        ).mean()
+
+    return smoothness_loss
+
+
+def _gather_latent_points_for_regularizer(z_intrinsic: Tensor, runtime: DistributedRuntime) -> Tensor:
+    if not runtime.enabled:
+        return z_intrinsic
+    gathered = [torch.zeros_like(z_intrinsic) for _ in range(runtime.world_size)]
+    dist.all_gather(gathered, z_intrinsic.detach())
+    gathered[runtime.rank] = z_intrinsic
+    return torch.cat(gathered, dim=0)
+
+
+def _sinkhorn_transport_cost(
+    source_points: Tensor,
+    target_points: Tensor,
+    *,
+    epsilon: float,
+    iterations: int,
+) -> Tensor:
+    if source_points.ndim != 2 or target_points.ndim != 2:
+        raise ValueError(
+            "Sinkhorn transport expects point clouds shaped [N, D] and [M, D], got "
+            f"{tuple(source_points.shape)} and {tuple(target_points.shape)}"
+        )
+    if source_points.shape[0] <= 0 or target_points.shape[0] <= 0:
+        raise ValueError("Sinkhorn transport requires non-empty point clouds.")
+
+    x = source_points.to(dtype=torch.float32)
+    y = target_points.to(dtype=torch.float32)
+    cost = torch.cdist(x, y, p=2).square()
+    regularization = max(float(epsilon), 1.0e-6)
+    kernel = torch.exp(-cost / regularization).clamp_min(torch.finfo(cost.dtype).tiny)
+
+    source_weights = torch.full(
+        (x.shape[0],),
+        1.0 / float(x.shape[0]),
+        device=x.device,
+        dtype=cost.dtype,
+    )
+    target_weights = torch.full(
+        (y.shape[0],),
+        1.0 / float(y.shape[0]),
+        device=y.device,
+        dtype=cost.dtype,
+    )
+    u = torch.ones_like(source_weights)
+    v = torch.ones_like(target_weights)
+    tiny = torch.finfo(cost.dtype).tiny
+    for _iteration in range(int(iterations)):
+        u = source_weights / (kernel @ v).clamp_min(tiny)
+        v = target_weights / (kernel.transpose(0, 1) @ u).clamp_min(tiny)
+
+    transport_plan = u[:, None] * kernel * v[None, :]
+    return (transport_plan * cost).sum()
+
+
+def _intrinsic_space_filling_loss(
+    z_intrinsic: Tensor,
+    *,
+    runtime: DistributedRuntime,
+    epsilon: float,
+    iterations: int,
+    reference_sample_count: int | None,
+    use_tanh_projection: bool,
+    seed: int | None = None,
+) -> Tensor:
+    if z_intrinsic.ndim != 2:
+        raise ValueError(
+            f"Expected z_intrinsic shaped [B, D], got {tuple(z_intrinsic.shape)}"
+        )
+    points = _project_intrinsic_latents_for_regularizer(
+        z_intrinsic,
+        use_tanh_projection=use_tanh_projection,
+    )
+    points = _gather_latent_points_for_regularizer(points, runtime)
+
+    resolved_reference_count = int(points.shape[0]) if reference_sample_count is None else int(reference_sample_count)
+    if resolved_reference_count <= 0:
+        raise ValueError(
+            f"reference_sample_count must be positive when set, got {resolved_reference_count}"
+        )
+
+    if seed is None:
+        reference_points = 2.0 * torch.rand(
+            resolved_reference_count,
+            points.shape[1],
+            device=points.device,
+            dtype=torch.float32,
+        ) - 1.0
+    else:
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(int(seed))
+        reference_points = 2.0 * torch.rand(
+            resolved_reference_count,
+            points.shape[1],
+            generator=generator,
+            dtype=torch.float32,
+        ) - 1.0
+        reference_points = reference_points.to(device=points.device)
+
+    return _sinkhorn_transport_cost(
+        points,
+        reference_points,
+        epsilon=epsilon,
+        iterations=iterations,
+    ).to(dtype=z_intrinsic.dtype)
+
+
+def _intrinsic_loss_terms(
+    outputs: dict[str, Tensor],
+    second_block_features: Tensor,
+    *,
+    runtime: DistributedRuntime,
+    train_config: IntrinsicTrainingConfig,
+    optimizer_step: int,
+    space_filling_seed: int | None,
+    beta_override: float | None = None,
+) -> dict[str, Tensor]:
+    reconstruction_loss = F.mse_loss(
+        outputs["second_block_features_recon"],
+        second_block_features,
+    )
+    regularizers_enabled = (
+        train_config.smoothness_weight > 0.0 or train_config.space_filling_weight > 0.0
+    )
+    if not regularizers_enabled:
+        beta = reconstruction_loss.new_tensor(0.0)
+        smoothness_loss = reconstruction_loss.new_zeros(())
+        space_filling_loss = reconstruction_loss.new_zeros(())
+    else:
+        beta = reconstruction_loss.new_tensor(
+            float(
+                _intrinsic_regularizer_beta(
+                    optimizer_step=int(optimizer_step),
+                    ramp_steps=int(train_config.space_filling_beta_ramp_optimizer_steps),
+                    hold_steps=int(train_config.space_filling_beta_hold_optimizer_steps),
+                )
+                if beta_override is None
+                else float(beta_override)
+            )
+        )
+        smoothness_loss = (
+            reconstruction_loss.new_zeros(())
+            if train_config.smoothness_weight <= 0.0
+            else _intrinsic_smoothness_loss(
+                outputs["z_intrinsic"],
+                threshold_l0=float(train_config.smoothness_l0),
+                eta=float(train_config.smoothness_eta),
+                use_tanh_projection=bool(train_config.smoothness_use_tanh_projection),
+            )
+        )
+        space_filling_loss = (
+            reconstruction_loss.new_zeros(())
+            if train_config.space_filling_weight <= 0.0
+            else _intrinsic_space_filling_loss(
+                outputs["z_intrinsic"],
+                runtime=runtime,
+                epsilon=float(train_config.space_filling_sinkhorn_epsilon),
+                iterations=int(train_config.space_filling_sinkhorn_iters),
+                reference_sample_count=train_config.space_filling_reference_sample_count,
+                use_tanh_projection=bool(train_config.space_filling_use_tanh_projection),
+                seed=space_filling_seed,
+            )
+        )
+    total_loss = reconstruction_loss + (
+        beta
+        * (
+            reconstruction_loss.new_tensor(float(train_config.smoothness_weight)) * smoothness_loss
+            + reconstruction_loss.new_tensor(float(train_config.space_filling_weight)) * space_filling_loss
+        )
+    )
+    return {
+        "reconstruction_loss": reconstruction_loss,
+        "smoothness_loss": smoothness_loss,
+        "space_filling_loss": space_filling_loss,
+        "beta": beta,
+        "total_loss": total_loss,
+    }
 
 
 def _accumulation_divisor(total_batches: int, batch_index: int, accumulation_steps: int) -> int:
@@ -5196,6 +6357,623 @@ def train_bottleneck_compressor_model(
         _cleanup_distributed_runtime(runtime)
 
 
+def train_latent_dynamics_model(
+    config_path: str | Path = DEFAULT_MODEL_CONFIG_PATH,
+    *,
+    smoke_only: bool = False,
+    resume_checkpoint_path: str | Path | None = None,
+) -> dict[str, Any]:
+    (
+        train_config,
+        encoder_config,
+        intrinsic_config,
+        latent_dynamics_config,
+        data_config,
+        runtime,
+        _model_dtype,
+        amp_dtype,
+    ) = _build_latent_dynamics_training_objects(config_path)
+    try:
+        dt_hours = _resolve_latent_dynamics_dt_hours(train_config, data_config)
+        latent_dynamics_model = NeuralLatentDynamics(latent_dynamics_config).to(runtime.device)
+        resolved_resume_checkpoint_path = (
+            train_config.resume_checkpoint_path
+            if resume_checkpoint_path is None
+            else resolve_repo_path(resume_checkpoint_path, config_path=train_config.config_path)
+        )
+        resume_checkpoint: dict[str, Any] | None = None
+        smoke_report: dict[str, Any] | None = None
+
+        if runtime.is_primary:
+            latent_smoke_input = (
+                _make_latent_dynamics_random_inputs(
+                    latent_dynamics_config,
+                    batch_size=train_config.random_smoke_batch_size,
+                    trajectory_length=train_config.trajectory_length,
+                    device=runtime.device,
+                ),
+            )
+            _print_model_and_summary(
+                "Latent Dynamics Model",
+                latent_dynamics_model,
+                input_data=latent_smoke_input,
+                depth=train_config.summary_depth,
+                print_summary=train_config.print_model_summary,
+            )
+            smoke_report = run_latent_dynamics_smoke_test(
+                latent_dynamics_model,
+                batch_size=train_config.random_smoke_batch_size,
+                trajectory_length=train_config.trajectory_length,
+                dt_hours=dt_hours,
+                integration_method=train_config.integration_method,
+                print_outputs=True,
+            )
+        if smoke_only:
+            return {"smoke_only": True, "smoke_report": smoke_report}
+
+        if train_config.main_checkpoint_path is None:
+            raise FileNotFoundError(
+                "train_latent_dynamics.main_checkpoint_path is required for latent dynamics training."
+            )
+        if train_config.intrinsic_checkpoint_path is None:
+            raise FileNotFoundError(
+                "train_latent_dynamics.intrinsic_checkpoint_path is required for latent dynamics training."
+            )
+
+        encoder = FuXiLowerResEncoder(encoder_config).to(runtime.device)
+        intrinsic_model = FuXiIntrinsic(intrinsic_config).to(runtime.device)
+        _load_encoder_checkpoint(encoder, train_config.main_checkpoint_path)
+        _load_intrinsic_checkpoint(intrinsic_model, train_config.intrinsic_checkpoint_path)
+        encoder.eval()
+        intrinsic_model.eval()
+        encoder.requires_grad_(False)
+        intrinsic_model.requires_grad_(False)
+
+        if runtime.is_primary:
+            main_smoke_inputs = _make_main_random_inputs(
+                encoder_config,
+                batch_size=train_config.random_smoke_batch_size,
+                device=runtime.device,
+            )
+            _print_model_and_summary(
+                "Frozen Forecast Encoder",
+                encoder,
+                input_data=main_smoke_inputs,
+                depth=train_config.summary_depth,
+                print_summary=train_config.print_model_summary,
+            )
+            intrinsic_smoke_input = (
+                _make_intrinsic_random_inputs(
+                    intrinsic_config,
+                    batch_size=train_config.random_smoke_batch_size,
+                    device=runtime.device,
+                ),
+            )
+            _print_model_and_summary(
+                "Frozen Intrinsic Model",
+                intrinsic_model,
+                input_data=intrinsic_smoke_input,
+                depth=train_config.summary_depth,
+                print_summary=train_config.print_model_summary,
+            )
+
+        if resolved_resume_checkpoint_path is not None:
+            if not resolved_resume_checkpoint_path.exists():
+                raise FileNotFoundError(f"Resume checkpoint not found at {resolved_resume_checkpoint_path}")
+            resume_checkpoint = _load_latent_dynamics_checkpoint(
+                latent_dynamics_model,
+                resolved_resume_checkpoint_path,
+            )
+
+        output_dir = train_config.output_dir
+        if runtime.is_primary:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        _distributed_barrier(runtime)
+
+        _print_if_primary(
+            runtime,
+            (
+                f"[latent-dynamics] encoding latent trajectories with device={runtime.device} "
+                f"world_size={runtime.world_size} trajectory_length={train_config.trajectory_length} "
+                f"trajectory_stride_hours={dt_hours:g}"
+            ),
+        )
+        train_split_cache = _prepare_latent_trajectory_split(
+            encoder=encoder,
+            intrinsic_model=intrinsic_model,
+            data_config=data_config,
+            train_config=train_config,
+            runtime=runtime,
+            use_amp=train_config.use_amp,
+            amp_dtype=amp_dtype,
+            split_name="train",
+            start_time=train_config.train_start_time,
+            end_time=train_config.train_end_time,
+            max_trajectories=train_config.max_train_trajectories,
+        )
+        val_split_cache = (
+            None
+            if train_config.val_start_time is None and train_config.val_end_time is None
+            else _prepare_latent_trajectory_split(
+                encoder=encoder,
+                intrinsic_model=intrinsic_model,
+                data_config=data_config,
+                train_config=train_config,
+                runtime=runtime,
+                use_amp=train_config.use_amp,
+                amp_dtype=amp_dtype,
+                split_name="val",
+                start_time=train_config.val_start_time,
+                end_time=train_config.val_end_time,
+                max_trajectories=train_config.max_val_trajectories,
+            )
+        )
+
+        train_cache_path = output_dir / "latent_dynamics_train_split.pt"
+        val_cache_path = output_dir / "latent_dynamics_val_split.pt"
+        if runtime.is_primary:
+            if train_split_cache is None:
+                raise RuntimeError("Primary rank did not receive the prepared train latent trajectories.")
+            _save_latent_dynamics_split_cache(train_cache_path, train_split_cache)
+            if val_split_cache is not None:
+                _save_latent_dynamics_split_cache(val_cache_path, val_split_cache)
+            elif val_cache_path.exists():
+                val_cache_path.unlink()
+        _distributed_barrier(runtime)
+
+        train_split_cache = _load_latent_dynamics_split_cache(train_cache_path)
+        val_split_cache = (
+            None
+            if not val_cache_path.exists()
+            else _load_latent_dynamics_split_cache(val_cache_path)
+        )
+        train_dataset = _LatentTrajectoryDataset(
+            train_split_cache["latents"],
+            train_split_cache["trajectory_positions"],
+        )
+        val_dataset = (
+            None
+            if val_split_cache is None
+            else _LatentTrajectoryDataset(
+                val_split_cache["latents"],
+                val_split_cache["trajectory_positions"],
+            )
+        )
+
+        train_sampler: Sampler[Any] | None = None
+        val_sampler: Sampler[Any] | None = None
+        if runtime.enabled:
+            train_sampler = _EpochShardedSampler(
+                train_dataset,
+                num_replicas=runtime.world_size,
+                rank=runtime.rank,
+                shuffle=True,
+            )
+            if val_dataset is not None:
+                val_sampler = _EpochShardedSampler(
+                    val_dataset,
+                    num_replicas=runtime.world_size,
+                    rank=runtime.rank,
+                    shuffle=False,
+                )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=train_config.batch_size,
+            shuffle=train_sampler is None,
+            num_workers=train_config.num_workers,
+            pin_memory=runtime.device.type == "cuda",
+            sampler=train_sampler,
+        )
+        val_loader = (
+            None
+            if val_dataset is None
+            else DataLoader(
+                val_dataset,
+                batch_size=train_config.batch_size,
+                shuffle=False,
+                num_workers=train_config.num_workers,
+                pin_memory=runtime.device.type == "cuda",
+                sampler=val_sampler,
+            )
+        )
+
+        latent_dynamics_model = _wrap_for_distributed_training(latent_dynamics_model, runtime)
+        optimizer = AdamW(
+            latent_dynamics_model.parameters(),
+            lr=train_config.learning_rate,
+            weight_decay=train_config.weight_decay,
+        )
+        scaler = _build_grad_scaler(train_config.use_amp, runtime.device)
+
+        effective_batch_size = (
+            train_config.batch_size * runtime.world_size * train_config.gradient_accumulation_steps
+        )
+        _print_if_primary(
+            runtime,
+            (
+                f"[latent-dynamics] device={runtime.device} world_size={runtime.world_size} "
+                f"gradient_accumulation_steps={train_config.gradient_accumulation_steps} "
+                f"effective_batch_size={effective_batch_size}"
+            ),
+        )
+        if runtime.is_primary:
+            _print_json_block(
+                "latent_dynamics_train_split",
+                {
+                    key: value
+                    for key, value in train_split_cache.items()
+                    if key not in {"latents", "trajectory_positions"}
+                },
+            )
+            if val_split_cache is not None:
+                _print_json_block(
+                    "latent_dynamics_val_split",
+                    {
+                        key: value
+                        for key, value in val_split_cache.items()
+                        if key not in {"latents", "trajectory_positions"}
+                    },
+                )
+
+        total_train_batches = len(train_loader)
+        total_val_batches = 0 if val_loader is None else len(val_loader)
+        resume_state = (
+            None
+            if resume_checkpoint is None
+            else _build_resume_state(
+                resume_checkpoint,
+                checkpoint_path=resolved_resume_checkpoint_path,
+                total_train_batches=total_train_batches,
+                accumulation_steps=train_config.gradient_accumulation_steps,
+            )
+        )
+        if resume_checkpoint is not None:
+            resume_warnings = _validate_resume_compatibility(
+                resume_checkpoint,
+                checkpoint_path=resolved_resume_checkpoint_path,
+                section_name="train_latent_dynamics",
+                current_batch_size=train_config.batch_size,
+                current_accumulation_steps=train_config.gradient_accumulation_steps,
+                resume_state=resume_state,
+            )
+            if "optimizer_state_dict" not in resume_checkpoint:
+                raise ValueError(
+                    f"Resume checkpoint {resolved_resume_checkpoint_path} does not contain optimizer_state_dict."
+                )
+            optimizer.load_state_dict(resume_checkpoint["optimizer_state_dict"])
+            _apply_optimizer_hyperparameter_overrides(
+                optimizer,
+                learning_rate=train_config.learning_rate,
+                weight_decay=train_config.weight_decay,
+            )
+            if "scaler_state_dict" in resume_checkpoint and scaler.is_enabled():
+                scaler.load_state_dict(resume_checkpoint["scaler_state_dict"])
+            for message in resume_warnings + _resume_optimizer_override_messages(
+                resume_checkpoint,
+                learning_rate=train_config.learning_rate,
+                weight_decay=train_config.weight_decay,
+                section_name="train_latent_dynamics",
+            ):
+                _print_if_primary(runtime, f"[latent-dynamics][resume] {message}")
+
+        history: list[dict[str, float]] = [] if resume_state is None else list(resume_state.history)
+        best_val_loss = float("inf") if resume_state is None else resume_state.best_val_loss
+        optimizer_steps = 0 if resume_state is None else resume_state.optimizer_steps
+        global_batch_steps = 0 if resume_state is None else resume_state.global_batch_steps
+        start_epoch = 1 if resume_state is None else resume_state.start_epoch
+        if resume_state is not None:
+            _print_if_primary(
+                runtime,
+                f"[latent-dynamics] resuming from {resume_state.checkpoint_path} "
+                f"checkpoint_epoch={resume_state.checkpoint_epoch} start_epoch={resume_state.start_epoch} "
+                f"resume_batch={resume_state.resume_batch_index} optimizer_steps={resume_state.optimizer_steps} "
+                f"global_batch_steps={resume_state.global_batch_steps}",
+            )
+            if start_epoch > train_config.max_epochs:
+                raise ValueError(
+                    f"Resume checkpoint {resume_state.checkpoint_path} would continue at epoch {start_epoch}, "
+                    f"but train_latent_dynamics.max_epochs={train_config.max_epochs}. Increase max_epochs to continue training."
+                )
+
+        def make_checkpoint_payload(
+            *,
+            epoch: int,
+            batch_index_within_epoch: int | None = None,
+            checkpoint_best_val_loss: float | None = None,
+            current_rho: float | None = None,
+        ) -> dict[str, Any]:
+            payload = {
+                "epoch": epoch,
+                "global_batch_step": int(global_batch_steps),
+                "optimizer_step": int(optimizer_steps),
+                "latent_dynamics_state_dict": _unwrap_model(latent_dynamics_model).state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scaler_state_dict": scaler.state_dict(),
+                "history": history,
+                "best_val_loss": (
+                    best_val_loss if checkpoint_best_val_loss is None else checkpoint_best_val_loss
+                ),
+                "train_config": _to_plain_data(asdict(train_config)),
+                "encoder_config": _to_plain_data(asdict(encoder_config)),
+                "intrinsic_config": _to_plain_data(asdict(intrinsic_config)),
+                "latent_dynamics_config": _to_plain_data(asdict(latent_dynamics_config)),
+                "data_config": _to_plain_data(asdict(data_config)),
+                "main_checkpoint_path": str(train_config.main_checkpoint_path),
+                "intrinsic_checkpoint_path": str(train_config.intrinsic_checkpoint_path),
+                "distributed_runtime": {
+                    "enabled": runtime.enabled,
+                    "backend": runtime.backend,
+                    "world_size": runtime.world_size,
+                },
+                "effective_batch_size": effective_batch_size,
+                "gradient_accumulation_steps": train_config.gradient_accumulation_steps,
+                "trajectory_dt_hours": float(dt_hours),
+                "trajectory_length": int(train_config.trajectory_length),
+                "train_trajectory_count": int(train_split_cache["trajectory_count"]),
+                "val_trajectory_count": (
+                    None if val_split_cache is None else int(val_split_cache["trajectory_count"])
+                ),
+                "current_rho": None if current_rho is None else float(current_rho),
+            }
+            if batch_index_within_epoch is not None:
+                payload["batch_index_within_epoch"] = int(batch_index_within_epoch)
+            return payload
+
+        for epoch in range(start_epoch, train_config.max_epochs + 1):
+            if train_sampler is not None and hasattr(train_sampler, "set_epoch"):
+                train_sampler.set_epoch(epoch)
+            if val_sampler is not None and hasattr(val_sampler, "set_epoch"):
+                val_sampler.set_epoch(epoch)
+
+            latent_dynamics_model.train()
+            optimizer.zero_grad(set_to_none=True)
+            running_loss = 0.0
+            train_steps = 0
+            resume_batch_index = (
+                0
+                if resume_state is None or resume_state.resume_epoch != epoch
+                else resume_state.resume_batch_index
+            )
+            replay_start_batch_index = (
+                0
+                if resume_state is None or resume_state.resume_epoch != epoch
+                else resume_state.replay_start_batch_index
+            )
+            if resume_batch_index > 0:
+                replay_from = replay_start_batch_index + 1
+                replay_to = resume_batch_index
+                if replay_start_batch_index < resume_batch_index:
+                    _print_if_primary(
+                        runtime,
+                        f"[latent-dynamics][epoch {epoch}] rebuilding accumulated gradients from batches "
+                        f"{replay_from}-{replay_to} before resuming at batch {resume_batch_index + 1}",
+                    )
+                else:
+                    _print_if_primary(
+                        runtime,
+                        f"[latent-dynamics][epoch {epoch}] skipping directly to batch "
+                        f"{resume_batch_index + 1}",
+                    )
+
+            for batch_index, batch in _iter_prefetched_batches(
+                train_loader,
+                runtime=runtime,
+                max_batches=None,
+            ):
+                current_rho = _latent_dynamics_discount_rho(
+                    optimizer_step=int(optimizer_steps),
+                    rho_min=float(train_config.loss_discount_rho_min),
+                    rho_max=float(train_config.loss_discount_rho_max),
+                    cycle_steps=int(train_config.rho_cycle_optimizer_steps),
+                )
+                if batch_index < resume_batch_index:
+                    if batch_index < replay_start_batch_index:
+                        continue
+                    should_step = _should_optimizer_step(
+                        total_train_batches,
+                        batch_index,
+                        train_config.gradient_accumulation_steps,
+                    )
+                    if should_step:
+                        raise RuntimeError(
+                            "Resume replay encountered an optimizer-step batch. "
+                            "This indicates the checkpoint resume window was computed incorrectly."
+                        )
+                    loss_divisor = float(
+                        _accumulation_divisor(
+                            total_train_batches,
+                            batch_index,
+                            train_config.gradient_accumulation_steps,
+                        )
+                    )
+                    sync_context = nullcontext()
+                    if runtime.enabled and isinstance(latent_dynamics_model, DistributedDataParallel):
+                        sync_context = latent_dynamics_model.no_sync()
+                    with sync_context:
+                        with _amp_autocast_context(train_config.use_amp, runtime.device, amp_dtype):
+                            scaled_loss = _latent_dynamics_trajectory_loss(
+                                latent_dynamics_model,
+                                batch["trajectory"],
+                                dt_hours=dt_hours,
+                                method=train_config.integration_method,
+                                rho=current_rho,
+                            ) / loss_divisor
+                        if scaler.is_enabled():
+                            scaler.scale(scaled_loss).backward()
+                        else:
+                            scaled_loss.backward()
+                    continue
+
+                should_step = _should_optimizer_step(
+                    total_train_batches,
+                    batch_index,
+                    train_config.gradient_accumulation_steps,
+                )
+                global_batch_steps += 1
+                loss_divisor = float(
+                    _accumulation_divisor(
+                        total_train_batches,
+                        batch_index,
+                        train_config.gradient_accumulation_steps,
+                    )
+                )
+                sync_context = nullcontext()
+                if runtime.enabled and isinstance(latent_dynamics_model, DistributedDataParallel) and not should_step:
+                    sync_context = latent_dynamics_model.no_sync()
+
+                with sync_context:
+                    with _amp_autocast_context(train_config.use_amp, runtime.device, amp_dtype):
+                        loss = _latent_dynamics_trajectory_loss(
+                            latent_dynamics_model,
+                            batch["trajectory"],
+                            dt_hours=dt_hours,
+                            method=train_config.integration_method,
+                            rho=current_rho,
+                        )
+                        scaled_loss = loss / loss_divisor
+                    if scaler.is_enabled():
+                        scaler.scale(scaled_loss).backward()
+                    else:
+                        scaled_loss.backward()
+
+                if should_step:
+                    if train_config.gradient_clip_norm is not None:
+                        if scaler.is_enabled():
+                            scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(
+                            _unwrap_model(latent_dynamics_model).parameters(),
+                            train_config.gradient_clip_norm,
+                        )
+                    if scaler.is_enabled():
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    optimizer_steps += 1
+
+                    if (
+                        runtime.is_primary
+                        and train_config.save_every_optimizer_steps is not None
+                        and int(optimizer_steps) % train_config.save_every_optimizer_steps == 0
+                    ):
+                        _save_checkpoint(
+                            _step_checkpoint_path(output_dir, train_config.checkpoint_name, int(optimizer_steps)),
+                            make_checkpoint_payload(
+                                epoch=epoch,
+                                batch_index_within_epoch=batch_index + 1,
+                                current_rho=current_rho,
+                            ),
+                        )
+
+                if (
+                    runtime.is_primary
+                    and train_config.save_every_train_batches is not None
+                    and int(global_batch_steps) % train_config.save_every_train_batches == 0
+                ):
+                    _save_checkpoint(
+                        _step_checkpoint_path(output_dir, train_config.checkpoint_name, int(global_batch_steps)),
+                        make_checkpoint_payload(
+                            epoch=epoch,
+                            batch_index_within_epoch=batch_index + 1,
+                            current_rho=current_rho,
+                        ),
+                    )
+
+                running_loss += float(loss.item())
+                train_steps += 1
+                if (batch_index + 1) % max(train_config.log_every, 1) == 0:
+                    display_loss = _reduced_mean_scalar(float(loss.item()), runtime)
+                    _print_if_primary(
+                        runtime,
+                        f"[latent-dynamics][epoch {epoch}] batch {batch_index + 1} "
+                        f"loss={display_loss:.6f} rho={current_rho:.4f}",
+                    )
+
+            train_loss_sum, global_train_steps = _reduced_sum_and_count(running_loss, train_steps, runtime)
+            train_loss = train_loss_sum / max(global_train_steps, 1)
+            val_loss: float | None = None
+
+            if val_loader is not None:
+                evaluation = _evaluate_latent_dynamics_model(
+                    latent_dynamics_model,
+                    val_loader,
+                    runtime=runtime,
+                    use_amp=train_config.use_amp,
+                    amp_dtype=amp_dtype,
+                    max_batches=None,
+                    dt_hours=dt_hours,
+                    method=train_config.integration_method,
+                    rho=float(train_config.loss_discount_rho_max),
+                )
+                val_loss = float(evaluation["loss"])
+
+            epoch_record = {
+                "epoch": float(epoch),
+                "train_loss": train_loss,
+                "optimizer_steps": float(optimizer_steps),
+                "global_batch_steps": float(global_batch_steps),
+                "rho": float(
+                    _latent_dynamics_discount_rho(
+                        optimizer_step=int(optimizer_steps),
+                        rho_min=float(train_config.loss_discount_rho_min),
+                        rho_max=float(train_config.loss_discount_rho_max),
+                        cycle_steps=int(train_config.rho_cycle_optimizer_steps),
+                    )
+                ),
+            }
+            if val_loss is not None:
+                epoch_record["val_loss"] = val_loss
+            history.append(epoch_record)
+            _print_if_primary(
+                runtime,
+                f"[latent-dynamics][epoch {epoch}] train_loss={train_loss:.6f}"
+                + (f" val_loss={val_loss:.6f}" if val_loss is not None else ""),
+            )
+
+            if runtime.is_primary and train_config.save_epoch_checkpoint:
+                checkpoint_best_val_loss = (
+                    min(best_val_loss, float(val_loss)) if val_loss is not None else best_val_loss
+                )
+                checkpoint_payload = make_checkpoint_payload(
+                    epoch=epoch,
+                    checkpoint_best_val_loss=checkpoint_best_val_loss,
+                    current_rho=epoch_record["rho"],
+                )
+                _save_checkpoint(output_dir / train_config.checkpoint_name, checkpoint_payload)
+                if train_config.save_best_checkpoint and val_loss is not None and val_loss < best_val_loss:
+                    best_val_loss = checkpoint_best_val_loss
+                    _save_checkpoint(output_dir / train_config.best_checkpoint_name, checkpoint_payload)
+
+        result = {
+            "smoke_report": smoke_report,
+            "history": history,
+            "checkpoint_path": str(output_dir / train_config.checkpoint_name),
+            "best_checkpoint_path": str(output_dir / train_config.best_checkpoint_name),
+            "latent_train_cache_path": str(train_cache_path),
+            "latent_val_cache_path": None if val_split_cache is None else str(val_cache_path),
+            "resumed_from_checkpoint": None if resume_state is None else str(resume_state.checkpoint_path),
+            "distributed": runtime.enabled,
+            "world_size": runtime.world_size,
+            "effective_batch_size": effective_batch_size,
+            "gradient_accumulation_steps": train_config.gradient_accumulation_steps,
+            "optimizer_steps": int(history[-1]["optimizer_steps"]) if history else 0,
+            "global_batch_steps": int(history[-1]["global_batch_steps"]) if history else 0,
+            "train_batches": total_train_batches,
+            "val_batches": total_val_batches,
+            "train_trajectory_count": int(train_split_cache["trajectory_count"]),
+            "val_trajectory_count": (
+                None if val_split_cache is None else int(val_split_cache["trajectory_count"])
+            ),
+            "trajectory_dt_hours": float(dt_hours),
+        }
+        if runtime.is_primary:
+            _print_json_block("latent_dynamics_training_result", result)
+        return result
+    finally:
+        _cleanup_distributed_runtime(runtime)
+
+
 def train_intrinsic_model(
     config_path: str | Path = DEFAULT_MODEL_CONFIG_PATH,
     *,
@@ -5290,7 +7068,6 @@ def train_intrinsic_model(
             weight_decay=train_config.weight_decay,
         )
         scaler = _build_grad_scaler(train_config.use_amp, runtime.device)
-        criterion = nn.MSELoss()
 
         output_dir = train_config.output_dir
         if runtime.is_primary:
@@ -5307,6 +7084,39 @@ def train_intrinsic_model(
                 f"effective_batch_size={effective_batch_size}"
             ),
         )
+        if train_config.space_filling_weight > 0.0 or train_config.smoothness_weight > 0.0:
+            _print_if_primary(
+                runtime,
+                (
+                    f"[intrinsic] regularizer_beta_ramp_steps={train_config.space_filling_beta_ramp_optimizer_steps} "
+                    f"regularizer_beta_hold_steps={train_config.space_filling_beta_hold_optimizer_steps} "
+                    f"space_filling_weight={train_config.space_filling_weight} "
+                    f"sinkhorn_epsilon={train_config.space_filling_sinkhorn_epsilon} "
+                    f"sinkhorn_iters={train_config.space_filling_sinkhorn_iters} "
+                    f"space_fill_tanh_projection={train_config.space_filling_use_tanh_projection}"
+                ),
+            )
+        if train_config.smoothness_weight > 0.0:
+            _print_if_primary(
+                runtime,
+                (
+                    f"[intrinsic] smoothness_weight={train_config.smoothness_weight} "
+                    f"smoothness_l0={train_config.smoothness_l0} "
+                    f"smoothness_eta={train_config.smoothness_eta} "
+                    f"use_tanh_projection={train_config.smoothness_use_tanh_projection}"
+                ),
+            )
+            if train_config.batch_size < 2:
+                _print_if_primary(
+                    runtime,
+                    "[intrinsic] smoothness loss is enabled, but batch_size < 2, so it will be inactive.",
+                )
+            elif train_config.batch_size < 3:
+                _print_if_primary(
+                    runtime,
+                    "[intrinsic] smoothness loss is enabled with batch_size=2, so only the one-step term "
+                    "is active. Increase batch_size to >= 3 to activate the two-step term too.",
+                )
 
         total_train_batches = _limited_length(train_loader, train_config.max_train_batches)
         total_val_batches = 0 if val_loader is None else _limited_length(val_loader, train_config.max_val_batches)
@@ -5377,6 +7187,9 @@ def train_intrinsic_model(
             optimizer.zero_grad(set_to_none=True)
             encoder.zero_grad(set_to_none=True)
             running_loss = 0.0
+            running_reconstruction_loss = 0.0
+            running_smoothness_loss = 0.0
+            running_space_filling_loss = 0.0
             train_steps = 0
             resume_batch_index = (
                 0
@@ -5437,13 +7250,19 @@ def train_intrinsic_model(
                         detach_features=train_config.detach_second_block_features,
                         clear_encoder_grads=True,
                     )
+                    replay_seed = int(epoch) * 1_000_000 + int(batch_index)
                     with sync_context:
                         with _amp_autocast_context(train_config.use_amp, runtime.device, amp_dtype):
                             outputs = intrinsic_model(second_block_features)
-                            scaled_loss = criterion(
-                                outputs["second_block_features_recon"],
+                            loss_terms = _intrinsic_loss_terms(
+                                outputs,
                                 second_block_features,
-                            ) / loss_divisor
+                                runtime=runtime,
+                                train_config=train_config,
+                                optimizer_step=int(optimizer_steps),
+                                space_filling_seed=replay_seed,
+                            )
+                            scaled_loss = loss_terms["total_loss"] / loss_divisor
                         if scaler.is_enabled():
                             scaler.scale(scaled_loss).backward()
                         else:
@@ -5473,14 +7292,20 @@ def train_intrinsic_model(
                     detach_features=train_config.detach_second_block_features,
                     clear_encoder_grads=True,
                 )
+                space_filling_seed = int(epoch) * 1_000_000 + int(batch_index)
 
                 with sync_context:
                     with _amp_autocast_context(train_config.use_amp, runtime.device, amp_dtype):
                         outputs = intrinsic_model(second_block_features)
-                        loss = criterion(
-                            outputs["second_block_features_recon"],
+                        loss_terms = _intrinsic_loss_terms(
+                            outputs,
                             second_block_features,
+                            runtime=runtime,
+                            train_config=train_config,
+                            optimizer_step=int(optimizer_steps),
+                            space_filling_seed=space_filling_seed,
                         )
+                        loss = loss_terms["total_loss"]
                         scaled_loss = loss / loss_divisor
 
                     if scaler.is_enabled():
@@ -5570,26 +7395,69 @@ def train_intrinsic_model(
                         batch_checkpoint_payload,
                     )
 
-                running_loss += float(loss.item())
+                running_loss += float(loss_terms["total_loss"].item())
+                running_reconstruction_loss += float(loss_terms["reconstruction_loss"].item())
+                running_smoothness_loss += float(loss_terms["smoothness_loss"].item())
+                running_space_filling_loss += float(loss_terms["space_filling_loss"].item())
                 train_steps += 1
                 if (batch_index + 1) % max(train_config.log_every, 1) == 0:
-                    display_loss = _reduced_mean_scalar(float(loss.item()), runtime)
+                    display_loss = _reduced_mean_scalar(float(loss_terms["total_loss"].item()), runtime)
+                    display_reconstruction_loss = _reduced_mean_scalar(
+                        float(loss_terms["reconstruction_loss"].item()),
+                        runtime,
+                    )
+                    display_smoothness_loss = _reduced_mean_scalar(
+                        float(loss_terms["smoothness_loss"].item()),
+                        runtime,
+                    )
+                    display_space_filling_loss = _reduced_mean_scalar(
+                        float(loss_terms["space_filling_loss"].item()),
+                        runtime,
+                    )
                     _print_if_primary(
                         runtime,
-                        f"[intrinsic][epoch {epoch}] batch {batch_index + 1} loss={display_loss:.6f}",
+                        f"[intrinsic][epoch {epoch}] batch {batch_index + 1} "
+                        f"loss={display_loss:.6f} recon={display_reconstruction_loss:.6f} "
+                        f"smooth={display_smoothness_loss:.6f} "
+                        f"space={display_space_filling_loss:.6f} "
+                        f"beta={float(loss_terms['beta'].item()):.4f}",
                     )
 
             train_loss_sum, global_train_steps = _reduced_sum_and_count(running_loss, train_steps, runtime)
             train_loss = train_loss_sum / max(global_train_steps, 1)
+            train_recon_sum, _ = _reduced_sum_and_count(
+                running_reconstruction_loss,
+                train_steps,
+                runtime,
+            )
+            train_reconstruction_loss = train_recon_sum / max(global_train_steps, 1)
+            train_smoothness_sum, _ = _reduced_sum_and_count(
+                running_smoothness_loss,
+                train_steps,
+                runtime,
+            )
+            train_smoothness_loss = train_smoothness_sum / max(global_train_steps, 1)
+            train_space_sum, _ = _reduced_sum_and_count(
+                running_space_filling_loss,
+                train_steps,
+                runtime,
+            )
+            train_space_filling_loss = train_space_sum / max(global_train_steps, 1)
             val_loss: float | None = None
+            val_reconstruction_loss: float | None = None
+            val_smoothness_loss: float | None = None
+            val_space_filling_loss: float | None = None
 
             if val_loader is not None:
                 encoder.zero_grad(set_to_none=True)
                 intrinsic_model.eval()
                 val_running_loss = 0.0
+                val_running_reconstruction_loss = 0.0
+                val_running_smoothness_loss = 0.0
+                val_running_space_filling_loss = 0.0
                 val_steps = 0
                 with torch.no_grad():
-                    for _batch_index, batch in _iter_prefetched_batches(
+                    for val_batch_index, batch in _iter_prefetched_batches(
                         val_loader,
                         runtime=runtime,
                         max_batches=train_config.max_val_batches,
@@ -5600,31 +7468,79 @@ def train_intrinsic_model(
                             detach_features=train_config.detach_second_block_features,
                             clear_encoder_grads=False,
                         )
+                        val_space_seed = int(epoch) * 1_000_000 + int(val_batch_index)
                         with _amp_autocast_context(train_config.use_amp, runtime.device, amp_dtype):
                             outputs = intrinsic_model(second_block_features)
-                            loss = criterion(
-                                outputs["second_block_features_recon"],
+                            loss_terms = _intrinsic_loss_terms(
+                                outputs,
                                 second_block_features,
+                                runtime=runtime,
+                                train_config=train_config,
+                                optimizer_step=int(optimizer_steps),
+                                space_filling_seed=val_space_seed,
+                                beta_override=1.0 if train_config.space_filling_weight > 0.0 else 0.0,
                             )
-                        val_running_loss += float(loss.item())
+                        val_running_loss += float(loss_terms["total_loss"].item())
+                        val_running_reconstruction_loss += float(loss_terms["reconstruction_loss"].item())
+                        val_running_smoothness_loss += float(loss_terms["smoothness_loss"].item())
+                        val_running_space_filling_loss += float(loss_terms["space_filling_loss"].item())
                         val_steps += 1
 
                 val_loss_sum, global_val_steps = _reduced_sum_and_count(val_running_loss, val_steps, runtime)
                 val_loss = val_loss_sum / max(global_val_steps, 1)
+                val_reconstruction_sum, _ = _reduced_sum_and_count(
+                    val_running_reconstruction_loss,
+                    val_steps,
+                    runtime,
+                )
+                val_reconstruction_loss = val_reconstruction_sum / max(global_val_steps, 1)
+                val_smoothness_sum, _ = _reduced_sum_and_count(
+                    val_running_smoothness_loss,
+                    val_steps,
+                    runtime,
+                )
+                val_smoothness_loss = val_smoothness_sum / max(global_val_steps, 1)
+                val_space_sum, _ = _reduced_sum_and_count(
+                    val_running_space_filling_loss,
+                    val_steps,
+                    runtime,
+                )
+                val_space_filling_loss = val_space_sum / max(global_val_steps, 1)
 
             epoch_record = {
                 "epoch": float(epoch),
                 "train_loss": train_loss,
+                "train_reconstruction_loss": train_reconstruction_loss,
+                "train_smoothness_loss": train_smoothness_loss,
+                "train_space_filling_loss": train_space_filling_loss,
                 "optimizer_steps": float(optimizer_steps),
                 "global_batch_steps": float(global_batch_steps),
             }
             if val_loss is not None:
                 epoch_record["val_loss"] = val_loss
+            if val_reconstruction_loss is not None:
+                epoch_record["val_reconstruction_loss"] = val_reconstruction_loss
+            if val_smoothness_loss is not None:
+                epoch_record["val_smoothness_loss"] = val_smoothness_loss
+            if val_space_filling_loss is not None:
+                epoch_record["val_space_filling_loss"] = val_space_filling_loss
             history.append(epoch_record)
             _print_if_primary(
                 runtime,
-                f"[intrinsic][epoch {epoch}] train_loss={train_loss:.6f}"
-                + (f" val_loss={val_loss:.6f}" if val_loss is not None else ""),
+                f"[intrinsic][epoch {epoch}] train_loss={train_loss:.6f} "
+                f"train_recon={train_reconstruction_loss:.6f} "
+                f"train_smooth={train_smoothness_loss:.6f} "
+                f"train_space={train_space_filling_loss:.6f}"
+                + (
+                    ""
+                    if val_loss is None
+                    else (
+                        f" val_loss={val_loss:.6f}"
+                        f" val_recon={val_reconstruction_loss:.6f}"
+                        f" val_smooth={val_smoothness_loss:.6f}"
+                        f" val_space={val_space_filling_loss:.6f}"
+                    )
+                ),
             )
 
             if runtime.is_primary and train_config.save_epoch_checkpoint:
@@ -5685,14 +7601,17 @@ __all__ = [
     "BottleneckCompressorTrainingConfig",
     "estimate_main_model_intrinsic_dimension",
     "IntrinsicTrainingConfig",
+    "LatentDynamicsTrainingConfig",
     "LatitudeWeightedCharbonnierLoss",
     "MainTrainingConfig",
     "rollout_main_model",
     "run_bottleneck_compressor_smoke_test",
     "run_intrinsic_model_smoke_test",
+    "run_latent_dynamics_smoke_test",
     "run_main_model_smoke_test",
     "train_bottleneck_compressor_model",
     "train_intrinsic_model",
+    "train_latent_dynamics_model",
     "train_main_model",
     "validate_intrinsic_model",
     "validate_main_model",

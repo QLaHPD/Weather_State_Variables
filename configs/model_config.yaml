@@ -19,8 +19,8 @@ forecast_model:
 
 intrinsic_model:
   feature_channels: 1024
-  resblocks_per_stage: [1, 1, 1]
-  d_intrinsic: 6
+  resblocks_per_stage: [2, 2, 2]
+  d_intrinsic: 2
   num_groups: 32
   apply_tanh: false
   device: meta
@@ -36,6 +36,12 @@ bottleneck_compressor_model:
   mlp_hidden_dim: 2048
   dropout: 0.0
   positional_embedding: learned_2d
+  device: meta
+  dtype: float32
+
+latent_dynamics_model:
+  hidden_dims: null
+  activation: relu
   device: meta
   dtype: float32
 
@@ -98,12 +104,12 @@ train_main:
   random_smoke_batch_size: 1
 
 train_intrinsic:
-  batch_size: 4
+  batch_size: 2
   num_workers: 0
-  gradient_accumulation_steps: 4
-  learning_rate: 1.0e-4
-  weight_decay: 0.05
-  max_epochs: 20
+  gradient_accumulation_steps: 16
+  learning_rate: 1.0e-5
+  weight_decay: 0.005
+  max_epochs: 8
   device: auto
   model_dtype: float32
   use_amp: true
@@ -119,6 +125,17 @@ train_intrinsic:
   save_every_optimizer_steps: null
   main_checkpoint_path: runs/main/main_best.pt
   detach_second_block_features: false
+  smoothness_weight: 0.1
+  smoothness_l0: 0.5
+  smoothness_eta: 1.0
+  smoothness_use_tanh_projection: true
+  space_filling_weight: 1.0
+  space_filling_sinkhorn_epsilon: 0.1
+  space_filling_sinkhorn_iters: 50
+  space_filling_reference_sample_count: null
+  space_filling_use_tanh_projection: true
+  space_filling_beta_ramp_optimizer_steps: 200
+  space_filling_beta_hold_optimizer_steps: 200
   train_start_time: 2000-01-01 00:00:00
   train_end_time: 2011-12-31 23:00:00
   val_start_time: 2012-01-01 00:00:00
@@ -162,3 +179,46 @@ train_bottleneck_compressor:
   print_model_summary: true
   summary_depth: 3
   random_smoke_batch_size: 1
+
+train_latent_dynamics:
+  batch_size: 128
+  num_workers: 0
+  gradient_accumulation_steps: 1
+  learning_rate: 1.0e-3
+  weight_decay: 1.0e-4
+  max_epochs: 100
+  device: auto
+  model_dtype: float32
+  use_amp: true
+  amp_dtype: bfloat16
+  gradient_clip_norm: null
+  output_dir: /media/ramdisk/runs/latent_dynamics
+  checkpoint_name: latent_dynamics_last.pt
+  best_checkpoint_name: latent_dynamics_best.pt
+  resume_checkpoint_path: null
+  save_epoch_checkpoint: true
+  save_best_checkpoint: true
+  save_every_train_batches: null
+  save_every_optimizer_steps: null
+  main_checkpoint_path: runs/main/main_best.pt
+  intrinsic_checkpoint_path: /media/ramdisk/runs/intrinsic/intrinsic_best.pt
+  encoding_batch_size: 4
+  encoding_num_workers: 0
+  trajectory_length: 8
+  trajectory_stride_hours: 3
+  max_train_trajectories: null
+  max_val_trajectories: null
+  latent_jump_filter_percentile: 99.0
+  filter_latent_trajectory_jumps: true
+  loss_discount_rho_min: 0.1
+  loss_discount_rho_max: 0.9
+  rho_cycle_optimizer_steps: 1000
+  integration_method: rk4
+  train_start_time: 2000-01-01 00:00:00
+  train_end_time: 2011-12-31 23:00:00
+  val_start_time: 2012-01-01 00:00:00
+  val_end_time: 2012-12-31 23:00:00
+  log_every: 10
+  print_model_summary: true
+  summary_depth: 3
+  random_smoke_batch_size: 4

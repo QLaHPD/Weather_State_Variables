@@ -12,6 +12,8 @@ from weather_state_variables.models import (
     FuXiLowerResConfig,
     FuXiLowerResDecoder,
     FuXiLowerResEncoder,
+    LatentDynamicsConfig,
+    NeuralLatentDynamics,
 )
 
 
@@ -303,6 +305,32 @@ class TestFuXiBottleneckCompressor(unittest.TestCase):
         self.assertEqual(outputs["bottleneck_features"].shape, (2, 1, 2, 4))
         self.assertEqual(outputs["second_block_features_recon"].shape, (2, 16, 2, 4))
         self.assertEqual(outputs["feature_grid_recon"].shape, (2, 16, 2, 4))
+
+
+class TestLatentDynamics(unittest.TestCase):
+    def test_default_recipe_uses_meta_to_avoid_oom(self) -> None:
+        model = NeuralLatentDynamics()
+        summary = model.summary()
+
+        self.assertEqual(summary["activation"], "relu")
+        self.assertEqual(summary["layer_count"], len(summary["hidden_dims"]) + 1)
+        self.assertEqual(summary["parameter_device"], "meta")
+
+    def test_tiny_config_runs_forward(self) -> None:
+        config = LatentDynamicsConfig(
+            latent_dim=3,
+            hidden_dims=(8, 16, 8),
+            activation="relu",
+            device="cpu",
+            dtype=torch.float32,
+        )
+        model = NeuralLatentDynamics(config)
+        z = torch.randn(4, 3)
+
+        derivative = model(z)
+
+        self.assertEqual(derivative.shape, (4, 3))
+        self.assertEqual(derivative.dtype, torch.float32)
 
 
 if __name__ == "__main__":

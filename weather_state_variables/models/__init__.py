@@ -8,6 +8,7 @@ from ..config import DEFAULT_MODEL_CONFIG_PATH
 
 _INTRINSIC_MODULE = f"{__name__}.fuxi_intrinsic"
 _BOTTLENECK_COMPRESSOR_MODULE = f"{__name__}.bottleneck_compressor"
+_LATENT_DYNAMICS_MODULE = f"{__name__}.latent_dynamics"
 _LOWER_RES_MODULE = f"{__name__}.fuxi_lower_res"
 _SHORT_MODULE = f"{__name__}.fuxi_short"
 
@@ -25,6 +26,8 @@ _LAZY_IMPORTS = {
     "FuXiLowerResConfig": (_LOWER_RES_MODULE, "FuXiLowerResConfig"),
     "FuXiLowerResDecoder": (_LOWER_RES_MODULE, "FuXiLowerResDecoder"),
     "FuXiLowerResEncoder": (_LOWER_RES_MODULE, "FuXiLowerResEncoder"),
+    "LatentDynamicsConfig": (_LATENT_DYNAMICS_MODULE, "LatentDynamicsConfig"),
+    "NeuralLatentDynamics": (_LATENT_DYNAMICS_MODULE, "NeuralLatentDynamics"),
     "FuXiShort": (_SHORT_MODULE, "FuXiShort"),
     "FuXiShortConfig": (_SHORT_MODULE, "FuXiShortConfig"),
     "build_exact_fuxi_short_graph": (_SHORT_MODULE, "build_exact_fuxi_short_graph"),

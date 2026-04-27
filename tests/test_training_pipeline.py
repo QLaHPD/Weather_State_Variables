@@ -17,14 +17,18 @@ from weather_state_variables.models import (
     FuXiLowerRes,
     FuXiLowerResConfig,
     FuXiLowerResEncoder,
+    LatentDynamicsConfig,
+    NeuralLatentDynamics,
 )
 from weather_state_variables.training import (
     BottleneckCompressorTrainingConfig,
     IntrinsicTrainingConfig,
+    LatentDynamicsTrainingConfig,
     LatitudeWeightedCharbonnierLoss,
     MainTrainingConfig,
     run_bottleneck_compressor_smoke_test,
     run_intrinsic_model_smoke_test,
+    run_latent_dynamics_smoke_test,
     run_main_model_smoke_test,
 )
 import weather_state_variables.training.pipeline as training_pipeline
@@ -79,9 +83,11 @@ class TestTrainingSmoke(unittest.TestCase):
         main_config = MainTrainingConfig.from_yaml()
         intrinsic_config = IntrinsicTrainingConfig.from_yaml()
         compressor_config = BottleneckCompressorTrainingConfig.from_yaml()
+        latent_dynamics_config = LatentDynamicsTrainingConfig.from_yaml()
         _, main_yaml = load_config_section("train_main")
         _, intrinsic_yaml = load_config_section("train_intrinsic")
         _, compressor_yaml = load_config_section("train_bottleneck_compressor")
+        _, latent_yaml = load_config_section("train_latent_dynamics")
 
         self.assertGreaterEqual(main_config.gradient_accumulation_steps, 1)
         self.assertEqual(main_config.forecast_loss, "charbonnier")
@@ -113,6 +119,42 @@ class TestTrainingSmoke(unittest.TestCase):
             intrinsic_config.save_every_optimizer_steps,
             intrinsic_yaml.get("save_every_optimizer_steps"),
         )
+        self.assertEqual(
+            intrinsic_config.smoothness_weight,
+            float(intrinsic_yaml.get("smoothness_weight", 0.0)),
+        )
+        self.assertEqual(
+            intrinsic_config.smoothness_l0,
+            float(intrinsic_yaml.get("smoothness_l0", 0.5)),
+        )
+        self.assertEqual(
+            intrinsic_config.smoothness_eta,
+            float(intrinsic_yaml.get("smoothness_eta", 1.0)),
+        )
+        self.assertEqual(
+            intrinsic_config.smoothness_use_tanh_projection,
+            bool(intrinsic_yaml.get("smoothness_use_tanh_projection", True)),
+        )
+        self.assertEqual(
+            intrinsic_config.space_filling_weight,
+            float(intrinsic_yaml.get("space_filling_weight", 0.0)),
+        )
+        self.assertEqual(
+            intrinsic_config.space_filling_sinkhorn_epsilon,
+            float(intrinsic_yaml.get("space_filling_sinkhorn_epsilon", 0.1)),
+        )
+        self.assertEqual(
+            intrinsic_config.space_filling_sinkhorn_iters,
+            int(intrinsic_yaml.get("space_filling_sinkhorn_iters", 50)),
+        )
+        self.assertEqual(
+            intrinsic_config.space_filling_reference_sample_count,
+            intrinsic_yaml.get("space_filling_reference_sample_count"),
+        )
+        self.assertEqual(
+            intrinsic_config.space_filling_use_tanh_projection,
+            bool(intrinsic_yaml.get("space_filling_use_tanh_projection", True)),
+        )
         self.assertGreaterEqual(compressor_config.gradient_accumulation_steps, 1)
         self.assertEqual(
             compressor_config.save_epoch_checkpoint,
@@ -139,6 +181,24 @@ class TestTrainingSmoke(unittest.TestCase):
         self.assertEqual(
             compressor_config.save_every_optimizer_steps,
             compressor_yaml.get("save_every_optimizer_steps"),
+        )
+        self.assertGreaterEqual(latent_dynamics_config.gradient_accumulation_steps, 1)
+        self.assertEqual(
+            latent_dynamics_config.save_epoch_checkpoint,
+            bool(latent_yaml.get("save_epoch_checkpoint", True)),
+        )
+        self.assertEqual(
+            latent_dynamics_config.save_best_checkpoint,
+            bool(latent_yaml.get("save_best_checkpoint", True)),
+        )
+        self.assertIsNone(latent_dynamics_config.resume_checkpoint_path)
+        self.assertEqual(
+            latent_dynamics_config.save_every_train_batches,
+            latent_yaml.get("save_every_train_batches"),
+        )
+        self.assertEqual(
+            latent_dynamics_config.save_every_optimizer_steps,
+            latent_yaml.get("save_every_optimizer_steps"),
         )
 
     def test_build_intrinsic_training_objects_preserves_intrinsic_feature_controls(self) -> None:
@@ -183,6 +243,137 @@ class TestTrainingSmoke(unittest.TestCase):
             self.assertEqual(compressor_config.positional_embedding, "learned_2d")
         finally:
             training_pipeline._cleanup_distributed_runtime(runtime)
+
+    def test_build_latent_dynamics_training_objects_match_intrinsic_dimension(self) -> None:
+        config_path, _latent_yaml = load_config_section("latent_dynamics_model")
+        (
+            _train_config,
+            encoder_config,
+            intrinsic_config,
+            latent_config,
+            _data_config,
+            runtime,
+            _model_dtype,
+            _amp_dtype,
+        ) = training_pipeline._build_latent_dynamics_training_objects(config_path)
+
+        try:
+            self.assertEqual(intrinsic_config.input_channels, encoder_config.embed_dim)
+            self.assertEqual(intrinsic_config.spatial_size, encoder_config.latent_grid)
+            self.assertEqual(latent_config.resolved_latent_dim, intrinsic_config.d_intrinsic)
+            self.assertEqual(latent_config.activation, "relu")
+        finally:
+            training_pipeline._cleanup_distributed_runtime(runtime)
+
+    def test_latent_dynamics_smoke_test_runs_rollout(self) -> None:
+        model = NeuralLatentDynamics(
+            LatentDynamicsConfig(
+                latent_dim=3,
+                hidden_dims=(8, 16, 8),
+                activation="relu",
+                device="cpu",
+                dtype=torch.float32,
+            )
+        )
+
+        report = run_latent_dynamics_smoke_test(
+            model,
+            batch_size=2,
+            trajectory_length=4,
+            dt_hours=3.0,
+            integration_method="rk4",
+            print_outputs=False,
+        )
+
+        self.assertEqual(report["input"]["latent_trajectory"]["shape"], [2, 4, 3])
+        self.assertEqual(report["output"]["derivative"]["shape"], [2, 3])
+        self.assertEqual(report["output"]["rollout"]["shape"], [2, 3, 3])
+
+    def test_latent_dynamics_discount_rho_anneals_within_cycle(self) -> None:
+        rho0 = training_pipeline._latent_dynamics_discount_rho(
+            optimizer_step=0,
+            rho_min=0.1,
+            rho_max=0.9,
+            cycle_steps=10,
+        )
+        rho5 = training_pipeline._latent_dynamics_discount_rho(
+            optimizer_step=5,
+            rho_min=0.1,
+            rho_max=0.9,
+            cycle_steps=10,
+        )
+
+        self.assertAlmostEqual(rho0, 0.1)
+        self.assertGreater(rho5, rho0)
+
+    def test_intrinsic_regularizer_beta_ramps_and_holds(self) -> None:
+        self.assertAlmostEqual(
+            training_pipeline._intrinsic_regularizer_beta(
+                optimizer_step=0,
+                ramp_steps=4,
+                hold_steps=2,
+            ),
+            0.0,
+        )
+        self.assertAlmostEqual(
+            training_pipeline._intrinsic_regularizer_beta(
+                optimizer_step=2,
+                ramp_steps=4,
+                hold_steps=2,
+            ),
+            0.5,
+        )
+        self.assertAlmostEqual(
+            training_pipeline._intrinsic_regularizer_beta(
+                optimizer_step=4,
+                ramp_steps=4,
+                hold_steps=2,
+            ),
+            1.0,
+        )
+
+    def test_intrinsic_space_filling_loss_is_finite(self) -> None:
+        runtime = training_pipeline.DistributedRuntime(
+            enabled=False,
+            backend=None,
+            rank=0,
+            local_rank=0,
+            world_size=1,
+            device=torch.device("cpu"),
+        )
+        z_intrinsic = torch.tensor(
+            [[-0.5, 0.2], [0.3, -0.1], [0.8, 0.6]],
+            dtype=torch.float32,
+        )
+
+        loss = training_pipeline._intrinsic_space_filling_loss(
+            z_intrinsic,
+            runtime=runtime,
+            epsilon=0.1,
+            iterations=20,
+            reference_sample_count=4,
+            use_tanh_projection=True,
+            seed=0,
+        )
+
+        self.assertTrue(torch.isfinite(loss))
+        self.assertGreaterEqual(float(loss.item()), 0.0)
+
+    def test_intrinsic_smoothness_loss_is_finite(self) -> None:
+        z_intrinsic = torch.tensor(
+            [[-0.5, 0.2], [0.3, -0.1], [0.8, 0.6]],
+            dtype=torch.float32,
+        )
+
+        loss = training_pipeline._intrinsic_smoothness_loss(
+            z_intrinsic,
+            threshold_l0=0.5,
+            eta=1.0,
+            use_tanh_projection=True,
+        )
+
+        self.assertTrue(torch.isfinite(loss))
+        self.assertGreaterEqual(float(loss.item()), 0.0)
 
     def test_step_checkpoint_path_includes_zero_padded_optimizer_step(self) -> None:
         path = training_pipeline._step_checkpoint_path(Path("runs/main"), "main_last.pt", 12)

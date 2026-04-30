@@ -8,7 +8,7 @@ import torch
 from torch import Tensor, nn
 
 from ..config import DEFAULT_MODEL_CONFIG_PATH, load_config_section, resolve_torch_dtype
-from .fuxi_lower_res import FuXiLowerResConfig, ResBlock
+from .fuxi_lower_res import FuXiLowerResConfig
 
 
 def _to_int_tuple(values: Sequence[int]) -> tuple[int, ...]:
@@ -41,8 +41,91 @@ def _conv_transpose_output_padding(
     return tuple(padding)
 
 
-class IntrinsicConvStage(nn.Module):
-    """Stack of unconditioned convolutional residual blocks at a fixed spatial grid."""
+def _resolve_group_count(channels: int, requested_groups: int) -> int:
+    groups = min(int(channels), int(requested_groups))
+    while int(channels) % groups != 0:
+        groups -= 1
+    return max(groups, 1)
+
+
+class SineActivation(nn.Module):
+    """Elementwise sine activation with configurable frequency scaling."""
+
+    def __init__(self, omega_0: float = 1.0) -> None:
+        super().__init__()
+        if float(omega_0) <= 0.0:
+            raise ValueError(f"omega_0 must be positive, got {omega_0}")
+        self.omega_0 = float(omega_0)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return torch.sin(float(self.omega_0) * x)
+
+
+class IntrinsicSineConvBlock(nn.Module):
+    """Convolution or transpose-convolution followed by group norm and sine activation."""
+
+    def __init__(
+        self,
+        conv: nn.Module,
+        *,
+        out_channels: int,
+        num_groups: int,
+        omega_0: float,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        super().__init__()
+        self.conv = conv
+        self.norm = nn.GroupNorm(
+            _resolve_group_count(out_channels, num_groups),
+            out_channels,
+            device=device,
+            dtype=dtype,
+        )
+        self.act = SineActivation(omega_0)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.act(self.norm(self.conv(x)))
+
+
+class IntrinsicSineResBlock(nn.Module):
+    """Residual block whose hidden path and residual output both use sine activations."""
+
+    def __init__(
+        self,
+        *,
+        in_channels: int,
+        out_channels: int,
+        num_groups: int,
+        omega_0: float,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        dd = {"device": device, "dtype": dtype}
+        super().__init__()
+        in_groups = _resolve_group_count(in_channels, num_groups)
+        out_groups = _resolve_group_count(out_channels, num_groups)
+        self.norm1 = nn.GroupNorm(in_groups, in_channels, **dd)
+        self.act1 = SineActivation(omega_0)
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, **dd)
+        self.norm2 = nn.GroupNorm(out_groups, out_channels, **dd)
+        self.act2 = SineActivation(omega_0)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, **dd)
+        self.out_act = SineActivation(omega_0)
+        if int(in_channels) == int(out_channels):
+            self.skip = nn.Identity()
+        else:
+            self.skip = nn.Conv2d(in_channels, out_channels, kernel_size=1, **dd)
+
+    def forward(self, x: Tensor) -> Tensor:
+        residual = self.skip(x)
+        h = self.conv1(self.act1(self.norm1(x)))
+        h = self.conv2(self.act2(self.norm2(h)))
+        return self.out_act(h + residual)
+
+
+class IntrinsicSineStage(nn.Module):
+    """Stack of sine-activated convolutional residual blocks at a fixed spatial grid."""
 
     def __init__(
         self,
@@ -50,16 +133,18 @@ class IntrinsicConvStage(nn.Module):
         channels: int,
         depth: int,
         num_groups: int,
+        omega_0: float,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
         super().__init__()
         self.blocks = nn.ModuleList(
             [
-                ResBlock(
+                IntrinsicSineResBlock(
                     in_channels=channels,
                     out_channels=channels,
                     num_groups=num_groups,
+                    omega_0=omega_0,
                     device=device,
                     dtype=dtype,
                 )
@@ -85,6 +170,7 @@ class FuXiIntrinsicConfig:
     num_heads: int = 16
     num_groups: int = 32
     mlp_hidden_dim: int = 2048
+    sine_omega_0: float = 1.0
     apply_tanh: bool = True
     config_path: Path = DEFAULT_MODEL_CONFIG_PATH
     device: str | torch.device | None = "meta"
@@ -110,6 +196,8 @@ class FuXiIntrinsicConfig:
             raise ValueError(f"Intrinsic stage depths must be positive, got {self.depths}")
         if self.num_groups <= 0:
             raise ValueError(f"num_groups must be positive, got {self.num_groups}")
+        if float(self.sine_omega_0) <= 0.0:
+            raise ValueError(f"sine_omega_0 must be positive, got {self.sine_omega_0}")
 
     @classmethod
     def from_yaml(
@@ -152,6 +240,7 @@ class FuXiIntrinsicConfig:
             mlp_hidden_dim=int(
                 intrinsic_data.get("mlp_hidden_dim", forecast_config.mlp_hidden_dim)
             ),
+            sine_omega_0=float(intrinsic_data.get("sine_omega_0", 1.0)),
             apply_tanh=bool(intrinsic_data.get("apply_tanh", True)),
             config_path=resolved_config_path,
             device=intrinsic_data.get("device", forecast_config.device),
@@ -214,7 +303,7 @@ class FuXiIntrinsicConfig:
 
 
 class FuXiIntrinsic(nn.Module):
-    """Three-level convolutional intrinsic autoencoder over main encoder bottleneck features."""
+    """Three-level convolutional intrinsic autoencoder with sine-activated hidden layers."""
 
     def __init__(self, config: FuXiIntrinsicConfig | None = None) -> None:
         super().__init__()
@@ -233,55 +322,77 @@ class FuXiIntrinsic(nn.Module):
                 **dd,
             )
 
-        self.input_resblock = ResBlock(
+        self.input_resblock = IntrinsicSineResBlock(
             in_channels=self.config.feature_channels,
             out_channels=self.config.feature_channels,
             num_groups=self.config.num_groups,
+            omega_0=self.config.sine_omega_0,
             **dd,
         )
 
-        self.downsample1 = nn.Conv2d(
-            self.config.feature_channels,
-            self.config.feature_channels,
-            kernel_size=3,
-            stride=2,
-            padding=1,
+        self.downsample1 = IntrinsicSineConvBlock(
+            nn.Conv2d(
+                self.config.feature_channels,
+                self.config.feature_channels,
+                kernel_size=3,
+                stride=2,
+                padding=1,
+                **dd,
+            ),
+            out_channels=self.config.feature_channels,
+            num_groups=self.config.num_groups,
+            omega_0=self.config.sine_omega_0,
             **dd,
         )
-        self.encoder_stage1 = IntrinsicConvStage(
+        self.encoder_stage1 = IntrinsicSineStage(
             channels=self.config.feature_channels,
             depth=stage_depths[0],
             num_groups=self.config.num_groups,
+            omega_0=self.config.sine_omega_0,
             **dd,
         )
 
-        self.downsample2 = nn.Conv2d(
-            self.config.feature_channels,
-            self.config.feature_channels,
-            kernel_size=3,
-            stride=2,
-            padding=1,
+        self.downsample2 = IntrinsicSineConvBlock(
+            nn.Conv2d(
+                self.config.feature_channels,
+                self.config.feature_channels,
+                kernel_size=3,
+                stride=2,
+                padding=1,
+                **dd,
+            ),
+            out_channels=self.config.feature_channels,
+            num_groups=self.config.num_groups,
+            omega_0=self.config.sine_omega_0,
             **dd,
         )
-        self.encoder_stage2 = IntrinsicConvStage(
+        self.encoder_stage2 = IntrinsicSineStage(
             channels=self.config.feature_channels,
             depth=stage_depths[1],
             num_groups=self.config.num_groups,
+            omega_0=self.config.sine_omega_0,
             **dd,
         )
 
-        self.downsample3 = nn.Conv2d(
-            self.config.feature_channels,
-            self.config.feature_channels,
-            kernel_size=3,
-            stride=2,
-            padding=1,
+        self.downsample3 = IntrinsicSineConvBlock(
+            nn.Conv2d(
+                self.config.feature_channels,
+                self.config.feature_channels,
+                kernel_size=3,
+                stride=2,
+                padding=1,
+                **dd,
+            ),
+            out_channels=self.config.feature_channels,
+            num_groups=self.config.num_groups,
+            omega_0=self.config.sine_omega_0,
             **dd,
         )
-        self.encoder_stage3 = IntrinsicConvStage(
+        self.encoder_stage3 = IntrinsicSineStage(
             channels=self.config.feature_channels,
             depth=stage_depths[2],
             num_groups=self.config.num_groups,
+            omega_0=self.config.sine_omega_0,
             **dd,
         )
 
@@ -294,67 +405,96 @@ class FuXiIntrinsic(nn.Module):
             padding=0,
             **dd,
         )
-        self.from_intrinsic = nn.ConvTranspose2d(
-            self.config.d_intrinsic,
-            self.config.feature_channels,
-            kernel_size=self.config.bottleneck_kernel_size,
-            stride=1,
-            padding=0,
+        self.latent_activation = SineActivation(self.config.sine_omega_0)
+        self.from_intrinsic = IntrinsicSineConvBlock(
+            nn.ConvTranspose2d(
+                self.config.d_intrinsic,
+                self.config.feature_channels,
+                kernel_size=self.config.bottleneck_kernel_size,
+                stride=1,
+                padding=0,
+                **dd,
+            ),
+            out_channels=self.config.feature_channels,
+            num_groups=self.config.num_groups,
+            omega_0=self.config.sine_omega_0,
             **dd,
         )
 
-        self.decoder_stage3 = IntrinsicConvStage(
+        self.decoder_stage3 = IntrinsicSineStage(
             channels=self.config.feature_channels,
             depth=stage_depths[2],
             num_groups=self.config.num_groups,
+            omega_0=self.config.sine_omega_0,
             **dd,
         )
-        self.upsample3 = nn.ConvTranspose2d(
-            self.config.feature_channels,
-            self.config.feature_channels,
-            kernel_size=3,
-            stride=2,
-            padding=1,
-            output_padding=self.config.decoder_stage3_output_padding,
+        self.upsample3 = IntrinsicSineConvBlock(
+            nn.ConvTranspose2d(
+                self.config.feature_channels,
+                self.config.feature_channels,
+                kernel_size=3,
+                stride=2,
+                padding=1,
+                output_padding=self.config.decoder_stage3_output_padding,
+                **dd,
+            ),
+            out_channels=self.config.feature_channels,
+            num_groups=self.config.num_groups,
+            omega_0=self.config.sine_omega_0,
             **dd,
         )
 
-        self.decoder_stage2 = IntrinsicConvStage(
+        self.decoder_stage2 = IntrinsicSineStage(
             channels=self.config.feature_channels,
             depth=stage_depths[1],
             num_groups=self.config.num_groups,
+            omega_0=self.config.sine_omega_0,
             **dd,
         )
-        self.upsample2 = nn.ConvTranspose2d(
-            self.config.feature_channels,
-            self.config.feature_channels,
-            kernel_size=3,
-            stride=2,
-            padding=1,
-            output_padding=self.config.decoder_stage2_output_padding,
+        self.upsample2 = IntrinsicSineConvBlock(
+            nn.ConvTranspose2d(
+                self.config.feature_channels,
+                self.config.feature_channels,
+                kernel_size=3,
+                stride=2,
+                padding=1,
+                output_padding=self.config.decoder_stage2_output_padding,
+                **dd,
+            ),
+            out_channels=self.config.feature_channels,
+            num_groups=self.config.num_groups,
+            omega_0=self.config.sine_omega_0,
             **dd,
         )
 
-        self.decoder_stage1 = IntrinsicConvStage(
+        self.decoder_stage1 = IntrinsicSineStage(
             channels=self.config.feature_channels,
             depth=stage_depths[0],
             num_groups=self.config.num_groups,
+            omega_0=self.config.sine_omega_0,
             **dd,
         )
-        self.upsample1 = nn.ConvTranspose2d(
-            self.config.feature_channels,
-            self.config.feature_channels,
-            kernel_size=3,
-            stride=2,
-            padding=1,
-            output_padding=self.config.decoder_stage1_output_padding,
+        self.upsample1 = IntrinsicSineConvBlock(
+            nn.ConvTranspose2d(
+                self.config.feature_channels,
+                self.config.feature_channels,
+                kernel_size=3,
+                stride=2,
+                padding=1,
+                output_padding=self.config.decoder_stage1_output_padding,
+                **dd,
+            ),
+            out_channels=self.config.feature_channels,
+            num_groups=self.config.num_groups,
+            omega_0=self.config.sine_omega_0,
             **dd,
         )
 
-        self.output_resblock = ResBlock(
+        self.output_resblock = IntrinsicSineResBlock(
             in_channels=self.config.feature_channels,
             out_channels=self.config.feature_channels,
             num_groups=self.config.num_groups,
+            omega_0=self.config.sine_omega_0,
             **dd,
         )
         self.output_proj = nn.Conv2d(
@@ -392,7 +532,7 @@ class FuXiIntrinsic(nn.Module):
         h = self.encoder_stage3(h)
 
         batch_size = h.shape[0]
-        z_intrinsic = self.to_intrinsic(h).reshape(batch_size, self.config.d_intrinsic)
+        z_intrinsic = self.latent_activation(self.to_intrinsic(h).reshape(batch_size, self.config.d_intrinsic))
         if self.config.apply_tanh:
             z_intrinsic = torch.tanh(z_intrinsic)
         return z_intrinsic
@@ -444,15 +584,17 @@ class FuXiIntrinsic(nn.Module):
             "num_heads": self.config.num_heads,
             "num_groups": self.config.num_groups,
             "mlp_hidden_dim": self.config.mlp_hidden_dim,
+            "sine_omega_0": self.config.sine_omega_0,
             "apply_tanh": self.config.apply_tanh,
             "architecture": "conv_autoencoder",
             "transformer_type": "none",
-            "block_type": "resblock_conv",
+            "block_type": "sine_resblock_conv",
+            "activation": "sin" if not self.config.apply_tanh else "sin+tanh_latent",
             "uses_attention": False,
             "uses_windowed_attention": False,
             "uses_positional_embeddings": False,
             "downsample_count": 3,
-            "bottleneck_projection": "global_conv_1x1_code",
+            "bottleneck_projection": "global_conv_sine_1x1_code",
             "bottleneck_kernel_size": list(self.config.bottleneck_kernel_size),
             "input_feature_name": "second_block_features",
             "reconstruction_name": "second_block_features_recon",

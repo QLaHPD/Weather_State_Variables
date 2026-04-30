@@ -20,8 +20,9 @@ forecast_model:
 intrinsic_model:
   feature_channels: 1024
   resblocks_per_stage: [2, 2, 2]
-  d_intrinsic: 2
+  d_intrinsic: 64
   num_groups: 32
+  sine_omega_0: 1.0
   apply_tanh: false
   device: meta
   dtype: float32
@@ -107,9 +108,9 @@ train_intrinsic:
   batch_size: 2
   num_workers: 0
   gradient_accumulation_steps: 16
-  learning_rate: 1.0e-5
-  weight_decay: 0.005
-  max_epochs: 8
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  max_epochs: 16
   device: auto
   model_dtype: float32
   use_amp: true
@@ -125,23 +126,25 @@ train_intrinsic:
   save_every_optimizer_steps: null
   main_checkpoint_path: runs/main/main_best.pt
   detach_second_block_features: false
-  smoothness_weight: 0.1
-  smoothness_l0: 0.5
+  smoothness_weight: 1.0
+  smoothness_l0: 1e-4
   smoothness_eta: 1.0
-  smoothness_use_tanh_projection: true
+  smoothness_use_tanh_projection: false
   space_filling_weight: 1.0
-  space_filling_sinkhorn_epsilon: 0.1
-  space_filling_sinkhorn_iters: 50
+  space_filling_sinkhorn_epsilon: 0.2
+  space_filling_sinkhorn_iters: 200
   space_filling_reference_sample_count: null
   space_filling_use_tanh_projection: true
-  space_filling_beta_ramp_optimizer_steps: 200
-  space_filling_beta_hold_optimizer_steps: 200
+  regularizer_warmup_epochs: 3
+  space_filling_beta_ramp_optimizer_steps: 4000
+  space_filling_beta_hold_optimizer_steps: 4000
+  skip_non_finite_batches: true
   train_start_time: 2000-01-01 00:00:00
   train_end_time: 2011-12-31 23:00:00
   val_start_time: 2012-01-01 00:00:00
   val_end_time: 2012-12-31 23:00:00
   max_train_batches: 100000
-  max_val_batches: 100
+  max_val_batches: 1000
   log_every: 1
   print_model_summary: true
   summary_depth: 3
@@ -151,8 +154,8 @@ train_bottleneck_compressor:
   batch_size: 2
   num_workers: 0
   gradient_accumulation_steps: 8
-  learning_rate: 1.0e-5
-  weight_decay: 0.0
+  learning_rate: 5.0e-5
+  weight_decay: 0.005
   max_epochs: 5
   device: auto
   model_dtype: float32

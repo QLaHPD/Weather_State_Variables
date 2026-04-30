@@ -31,15 +31,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--intrinsic-checkpoint",
         default=None,
-        help="Optional intrinsic checkpoint path. When set, rollout can route selected autoregressive steps through the intrinsic model.",
+        help=(
+            "Optional intrinsic checkpoint path. When set, rollout can trace the intrinsic bottleneck "
+            "from the main-model bottleneck. Pair with --intrinsic-frequency to explicitly route "
+            "selected autoregressive steps through the intrinsic reconstruction."
+        ),
     )
     parser.add_argument(
         "--intrinsic-frequency",
         type=int,
         default=None,
         help=(
-            "Use the intrinsic chain every N generated rollout steps, counted 1-indexed. "
-            "For example, --intrinsic-frequency 4 applies the intrinsic at steps 4, 8, 12, ..."
+            "Explicitly enable intrinsic forecast chaining every N generated rollout steps, counted "
+            "1-indexed. For example, --intrinsic-frequency 4 applies the intrinsic reconstruction at "
+            "steps 4, 8, 12, ..."
+        ),
+    )
+    parser.add_argument(
+        "--save-intrinsic-latent-plot",
+        action="store_true",
+        help=(
+            "Record the intrinsic 2D bottleneck at each rollout step and save a cold-to-hot "
+            "latent-space trajectory plot with time-direction arrows. Requires --intrinsic-checkpoint."
         ),
     )
     parser.add_argument(
@@ -90,6 +103,7 @@ def main() -> None:
         checkpoint_path=args.checkpoint,
         intrinsic_checkpoint_path=args.intrinsic_checkpoint,
         intrinsic_frequency=args.intrinsic_frequency,
+        save_intrinsic_latent_plot=args.save_intrinsic_latent_plot,
         split=args.split,
         sample_index=args.sample_index,
         future_steps=args.future_steps,

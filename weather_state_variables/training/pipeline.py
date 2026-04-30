@@ -16,7 +16,7 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel
 from torch.optim import AdamW, Optimizer
-from torch.utils.data import DataLoader, Dataset, Sampler
+from torch.utils.data import DataLoader, Dataset, Sampler, default_collate
 try:
     from torchinfo import summary as torchinfo_summary
 except ImportError:
@@ -314,6 +314,39 @@ def _print_json_block(title: str, payload: Any) -> None:
 def _print_if_primary(runtime: DistributedRuntime, message: str) -> None:
     if runtime.is_primary:
         print(message)
+
+
+def _format_full_precision_float(value: float) -> str:
+    return repr(float(value))
+
+
+def _non_finite_tensor_names(named_tensors: dict[str, Tensor | None]) -> list[str]:
+    names: list[str] = []
+    for name, tensor in named_tensors.items():
+        if tensor is None:
+            continue
+        if not isinstance(tensor, Tensor):
+            raise TypeError(f"Expected Tensor or None for {name}, got {type(tensor).__name__}")
+        if not bool(torch.isfinite(tensor.detach()).all().item()):
+            names.append(str(name))
+    return names
+
+
+def _module_non_finite_gradient_parameter_names(
+    module: nn.Module,
+    *,
+    max_names: int = 8,
+) -> list[str]:
+    names: list[str] = []
+    for name, parameter in module.named_parameters():
+        gradient = parameter.grad
+        if gradient is None:
+            continue
+        if not bool(torch.isfinite(gradient.detach()).all().item()):
+            names.append(name)
+            if len(names) >= max(int(max_names), 1):
+                break
+    return names
 
 
 def _reduced_sum_and_count(
@@ -1244,11 +1277,180 @@ def _should_use_intrinsic_for_rollout_step(
     if intrinsic_model is None:
         return False
     if intrinsic_frequency is None:
-        return True
+        return False
     resolved_frequency = int(intrinsic_frequency)
     if resolved_frequency <= 0:
         raise ValueError(f"intrinsic_frequency must be positive when set, got {resolved_frequency}")
     return (int(rollout_step) + 1) % resolved_frequency == 0
+
+
+def _run_main_rollout_step_with_optional_intrinsic_trace(
+    main_model: FuXiLowerRes,
+    intrinsic_model: FuXiIntrinsic | None,
+    *,
+    model_inputs: Tensor,
+    temb: Tensor,
+    static_features: Tensor | None,
+    use_intrinsic_for_forecast: bool,
+    record_intrinsic_latent: bool,
+) -> dict[str, Tensor]:
+    if intrinsic_model is None:
+        outputs = main_model(
+            model_inputs,
+            temb,
+            static_features=static_features,
+        )
+        return {
+            "forecast": outputs["forecast"],
+        }
+
+    if not use_intrinsic_for_forecast and not record_intrinsic_latent:
+        outputs = main_model(
+            model_inputs,
+            temb,
+            static_features=static_features,
+        )
+        return {
+            "forecast": outputs["forecast"],
+        }
+
+    encoded = main_model.encoder(
+        model_inputs,
+        temb,
+        static_features=static_features,
+    )
+    intrinsic_outputs = intrinsic_model(encoded.second_block_features)
+    decoder_inputs = (
+        FuXiEncoderOutput(
+            second_block_features=intrinsic_outputs["second_block_features_recon"],
+            output_size=tuple(int(value) for value in model_inputs.shape[-2:]),
+        )
+        if use_intrinsic_for_forecast
+        else encoded
+    )
+    forecast = main_model.decoder(decoder_inputs)
+    return {
+        "forecast": forecast,
+        "z_intrinsic": intrinsic_outputs["z_intrinsic"],
+        "second_block_features": encoded.second_block_features,
+        "second_block_features_recon": intrinsic_outputs["second_block_features_recon"],
+    }
+
+
+def _save_intrinsic_rollout_latent_trajectory(
+    *,
+    output_dir: Path,
+    latent_points: Sequence[Sequence[float]],
+    horizon_hours: Sequence[int],
+    intrinsic_used_for_forecast: Sequence[bool],
+) -> dict[str, Any] | None:
+    if len(latent_points) <= 0:
+        return None
+    points = np.asarray(latent_points, dtype=np.float32)
+    if points.ndim != 2 or points.shape[1] != 2:
+        raise ValueError(
+            "Intrinsic rollout latent plotting requires 2D latent points shaped [N, 2], got "
+            f"{tuple(points.shape)}"
+        )
+    if len(horizon_hours) != points.shape[0]:
+        raise ValueError(
+            f"Expected horizon_hours length {points.shape[0]}, got {len(horizon_hours)}"
+        )
+    if len(intrinsic_used_for_forecast) != points.shape[0]:
+        raise ValueError(
+            f"Expected intrinsic_used_for_forecast length {points.shape[0]}, "
+            f"got {len(intrinsic_used_for_forecast)}"
+        )
+
+    plt = _import_pyplot()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    plot_path = output_dir / "intrinsic_latent_trajectory.png"
+    trace_path = output_dir / "intrinsic_latent_trajectory.json"
+
+    figure, axis = plt.subplots(figsize=(7.5, 6.5), dpi=160)
+    cmap = plt.get_cmap("coolwarm")
+    color_positions = np.linspace(0.0, 1.0, max(points.shape[0], 1))
+    colors = cmap(color_positions)
+
+    for point_index in range(points.shape[0] - 1):
+        axis.annotate(
+            "",
+            xy=(float(points[point_index + 1, 0]), float(points[point_index + 1, 1])),
+            xytext=(float(points[point_index, 0]), float(points[point_index, 1])),
+            arrowprops={
+                "arrowstyle": "->",
+                "color": colors[point_index + 1],
+                "linewidth": 1.5,
+                "alpha": 0.9,
+                "shrinkA": 0.0,
+                "shrinkB": 0.0,
+            },
+        )
+
+    scatter = axis.scatter(
+        points[:, 0],
+        points[:, 1],
+        c=np.arange(points.shape[0], dtype=np.float32),
+        cmap="coolwarm",
+        s=75,
+        edgecolors="black",
+        linewidths=0.5,
+        zorder=3,
+    )
+    used_mask = np.asarray(intrinsic_used_for_forecast, dtype=bool)
+    if bool(np.any(used_mask)):
+        axis.scatter(
+            points[used_mask, 0],
+            points[used_mask, 1],
+            s=150,
+            facecolors="none",
+            edgecolors="black",
+            linewidths=1.2,
+            zorder=4,
+            label="Intrinsic used for forecast",
+        )
+        axis.legend(loc="best")
+
+    if points.shape[0] <= 24:
+        for point_index, (x_coord, y_coord) in enumerate(points):
+            axis.annotate(
+                _format_rollout_hour_label(int(horizon_hours[point_index])),
+                (float(x_coord), float(y_coord)),
+                textcoords="offset points",
+                xytext=(6, 4),
+                fontsize=7,
+                color=colors[point_index],
+            )
+
+    colorbar = figure.colorbar(scatter, ax=axis)
+    colorbar.set_label("Rollout order (cold -> hot)")
+    axis.set_xlabel("Intrinsic z[0]")
+    axis.set_ylabel("Intrinsic z[1]")
+    axis.set_title("Intrinsic latent rollout trajectory")
+    axis.grid(alpha=0.25, linewidth=0.6)
+    figure.tight_layout()
+    figure.savefig(plot_path, bbox_inches="tight")
+    plt.close(figure)
+
+    trace_payload = {
+        "point_count": int(points.shape[0]),
+        "points": [
+            {
+                "rollout_step": int(point_index + 1),
+                "horizon_hours": int(horizon_hours[point_index]),
+                "intrinsic_used_for_forecast": bool(intrinsic_used_for_forecast[point_index]),
+                "z": [float(points[point_index, 0]), float(points[point_index, 1])],
+            }
+            for point_index in range(points.shape[0])
+        ],
+        "plot_path": str(plot_path),
+    }
+    trace_path.write_text(json.dumps(trace_payload, indent=2, sort_keys=True))
+    return {
+        "plot_path": str(plot_path),
+        "trace_path": str(trace_path),
+        "point_count": int(points.shape[0]),
+    }
 
 
 def _save_main_rollout_channel_frames(
@@ -1264,6 +1466,7 @@ def _save_main_rollout_channel_frames(
     future_steps: int,
     intrinsic_model: FuXiIntrinsic | None = None,
     intrinsic_frequency: int | None = None,
+    save_intrinsic_latent_plot: bool = False,
 ) -> dict[str, Any]:
     if sample_index < 0:
         raise ValueError(f"sample_index must be non-negative, got {sample_index}")
@@ -1274,11 +1477,6 @@ def _save_main_rollout_channel_frames(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     channel_specs = _forecast_rollout_channel_specs(data_config)
-    intrinsic_chain_model = (
-        None if intrinsic_model is None else _IntrinsicForecastChain(main_model, intrinsic_model)
-    )
-    if intrinsic_chain_model is not None:
-        intrinsic_chain_model.eval()
     lead_step_count = dataset._step_count(data_config.lead_time_hours)
     input_offset_steps = [dataset._step_count(hours) for hours in data_config.input_time_offsets_hours]
     dataset_step_hours = dataset._dataset_frequency_hours()
@@ -1294,6 +1492,7 @@ def _save_main_rollout_channel_frames(
     static_features = dataset._build_static_features().to(runtime.device)
     sample_output_dir = output_dir / f"sample_{sample_index:05d}"
     sample_output_dir.mkdir(parents=True, exist_ok=True)
+    intrinsic_forecast_chain_enabled = intrinsic_model is not None and intrinsic_frequency is not None
 
     initial_anchor_index = int(valid_anchor_indices[sample_index])
     seed_input_indices = [initial_anchor_index + offset for offset in input_offset_steps]
@@ -1308,6 +1507,9 @@ def _save_main_rollout_channel_frames(
     saved_horizons: list[int] = []
     intrinsic_used_rollout_steps: list[int] = []
     intrinsic_used_horizon_hours: list[int] = []
+    intrinsic_latent_points: list[list[float]] = []
+    intrinsic_latent_horizon_hours: list[int] = []
+    intrinsic_latent_used_for_forecast: list[bool] = []
     total_time_steps = len(time_values)
 
     for rollout_step in range(int(future_steps)):
@@ -1334,14 +1536,17 @@ def _save_main_rollout_channel_frames(
             intrinsic_model=intrinsic_model,
             intrinsic_frequency=intrinsic_frequency,
         )
-        step_model: nn.Module = intrinsic_chain_model if use_intrinsic and intrinsic_chain_model is not None else main_model
 
         with torch.no_grad():
             with _amp_autocast_context(use_amp, runtime.device, amp_dtype):
-                outputs = step_model(
-                    model_inputs_norm.unsqueeze(0).to(runtime.device),
-                    temb.unsqueeze(0),
+                outputs = _run_main_rollout_step_with_optional_intrinsic_trace(
+                    main_model,
+                    intrinsic_model,
+                    model_inputs=model_inputs_norm.unsqueeze(0).to(runtime.device),
+                    temb=temb.unsqueeze(0),
                     static_features=static_features,
+                    use_intrinsic_for_forecast=use_intrinsic,
+                    record_intrinsic_latent=save_intrinsic_latent_plot,
                 )
         prediction_norm = outputs["forecast"][0, 0].detach().cpu().float()
         frame_store[int(target_index)] = prediction_norm.clone()
@@ -1352,6 +1557,22 @@ def _save_main_rollout_channel_frames(
         if use_intrinsic:
             intrinsic_used_rollout_steps.append(int(rollout_step + 1))
             intrinsic_used_horizon_hours.append(horizon_hours)
+        if save_intrinsic_latent_plot:
+            z_intrinsic = outputs.get("z_intrinsic")
+            if z_intrinsic is None:
+                raise RuntimeError(
+                    "Intrinsic latent plotting was requested, but the rollout step did not "
+                    "produce z_intrinsic. Pass an intrinsic checkpoint to enable latent tracing."
+                )
+            z_vector = z_intrinsic[0].detach().cpu().float().reshape(-1)
+            if z_vector.numel() != 2:
+                raise ValueError(
+                    "Intrinsic latent plotting requires a 2D latent bottleneck, got "
+                    f"{int(z_vector.numel())} dimensions."
+                )
+            intrinsic_latent_points.append([float(z_vector[0].item()), float(z_vector[1].item())])
+            intrinsic_latent_horizon_hours.append(horizon_hours)
+            intrinsic_latent_used_for_forecast.append(bool(use_intrinsic))
         saved_image_paths.extend(
             _save_rollout_prediction_frame_images(
                 output_dir=sample_output_dir,
@@ -1360,6 +1581,17 @@ def _save_main_rollout_channel_frames(
                 horizon_hours=horizon_hours,
             )
         )
+
+    intrinsic_latent_plot_report = (
+        None
+        if not save_intrinsic_latent_plot
+        else _save_intrinsic_rollout_latent_trajectory(
+            output_dir=sample_output_dir,
+            latent_points=intrinsic_latent_points,
+            horizon_hours=intrinsic_latent_horizon_hours,
+            intrinsic_used_for_forecast=intrinsic_latent_used_for_forecast,
+        )
+    )
 
     manifest = {
         "sample_index": sample_index,
@@ -1370,9 +1602,13 @@ def _save_main_rollout_channel_frames(
         "future_steps_generated": len(saved_horizons),
         "saved_horizon_hours": saved_horizons,
         "intrinsic_enabled": intrinsic_model is not None,
-        "intrinsic_frequency": None if intrinsic_model is None else int(intrinsic_frequency or 1),
+        "intrinsic_forecast_chain_enabled": bool(intrinsic_forecast_chain_enabled),
+        "intrinsic_frequency": None if not intrinsic_forecast_chain_enabled else int(intrinsic_frequency),
+        "intrinsic_latent_plot_enabled": bool(save_intrinsic_latent_plot),
         "intrinsic_used_rollout_steps": intrinsic_used_rollout_steps,
         "intrinsic_used_horizon_hours": intrinsic_used_horizon_hours,
+        "intrinsic_latent_horizon_hours": intrinsic_latent_horizon_hours,
+        "intrinsic_latent_plot": intrinsic_latent_plot_report,
         "channel_folders": [
             {
                 "channel_index": spec.channel_index,
@@ -1396,9 +1632,13 @@ def _save_main_rollout_channel_frames(
         "future_steps_generated": len(saved_horizons),
         "saved_horizon_hours": saved_horizons,
         "intrinsic_enabled": intrinsic_model is not None,
-        "intrinsic_frequency": None if intrinsic_model is None else int(intrinsic_frequency or 1),
+        "intrinsic_forecast_chain_enabled": bool(intrinsic_forecast_chain_enabled),
+        "intrinsic_frequency": None if not intrinsic_forecast_chain_enabled else int(intrinsic_frequency),
+        "intrinsic_latent_plot_enabled": bool(save_intrinsic_latent_plot),
         "intrinsic_used_rollout_steps": intrinsic_used_rollout_steps,
         "intrinsic_used_horizon_hours": intrinsic_used_horizon_hours,
+        "intrinsic_latent_horizon_hours": intrinsic_latent_horizon_hours,
+        "intrinsic_latent_plot": intrinsic_latent_plot_report,
         "channel_folder_count": len(channel_specs),
         "saved_images": len(saved_image_paths),
         "manifest_path": str(manifest_path),
@@ -1689,8 +1929,10 @@ class IntrinsicTrainingConfig:
     space_filling_sinkhorn_iters: int = 50
     space_filling_reference_sample_count: int | None = None
     space_filling_use_tanh_projection: bool = True
+    regularizer_warmup_epochs: int = 0
     space_filling_beta_ramp_optimizer_steps: int = 0
     space_filling_beta_hold_optimizer_steps: int = 0
+    skip_non_finite_batches: bool = True
     train_start_time: pd.Timestamp | None = None
     train_end_time: pd.Timestamp | None = None
     val_start_time: pd.Timestamp | None = None
@@ -1771,6 +2013,11 @@ class IntrinsicTrainingConfig:
             space_filling_use_tanh_projection=bool(
                 data.get("space_filling_use_tanh_projection", True)
             ),
+            regularizer_warmup_epochs=_to_non_negative_int(
+                data.get("regularizer_warmup_epochs"),
+                default=0,
+                field_name="train_intrinsic.regularizer_warmup_epochs",
+            ),
             space_filling_beta_ramp_optimizer_steps=_to_non_negative_int(
                 data.get("space_filling_beta_ramp_optimizer_steps"),
                 default=0,
@@ -1781,6 +2028,7 @@ class IntrinsicTrainingConfig:
                 default=0,
                 field_name="train_intrinsic.space_filling_beta_hold_optimizer_steps",
             ),
+            skip_non_finite_batches=bool(data.get("skip_non_finite_batches", True)),
             train_start_time=_to_optional_timestamp(data.get("train_start_time")),
             train_end_time=_to_optional_timestamp(data.get("train_end_time")),
             val_start_time=_to_optional_timestamp(data.get("val_start_time")),
@@ -2105,18 +2353,33 @@ def _build_intrinsic_training_objects(
         device=runtime.device,
         dtype=model_dtype,
     )
-    intrinsic_config = replace(
-        FuXiIntrinsicConfig.from_yaml(config_path),
-        device=runtime.device,
-        dtype=model_dtype,
-        input_channels=encoder_config.embed_dim,
-        spatial_size=encoder_config.latent_grid,
+    intrinsic_config = _build_runtime_intrinsic_config(
+        config_path,
+        encoder_config=encoder_config,
+        runtime_device=runtime.device,
+        model_dtype=model_dtype,
     )
     data_config = replace(
         ArcoEra5FuXiDataConfig.from_yaml(config_path),
         forecast_steps=encoder_config.forecast_steps,
     )
     return train_config, encoder_config, intrinsic_config, data_config, runtime, model_dtype, amp_dtype
+
+
+def _build_runtime_intrinsic_config(
+    config_path: str | Path,
+    *,
+    encoder_config: FuXiLowerResConfig,
+    runtime_device: torch.device,
+    model_dtype: torch.dtype,
+) -> FuXiIntrinsicConfig:
+    return replace(
+        FuXiIntrinsicConfig.from_yaml(config_path),
+        device=runtime_device,
+        dtype=model_dtype,
+        input_channels=encoder_config.embed_dim,
+        spatial_size=encoder_config.latent_grid,
+    )
 
 
 def _build_bottleneck_compressor_training_objects(
@@ -2194,12 +2457,11 @@ def _build_latent_dynamics_training_objects(
         device=runtime.device,
         dtype=model_dtype,
     )
-    intrinsic_config = replace(
-        FuXiIntrinsicConfig.from_yaml(config_path),
-        device=runtime.device,
-        dtype=model_dtype,
-        input_channels=encoder_config.embed_dim,
-        spatial_size=encoder_config.latent_grid,
+    intrinsic_config = _build_runtime_intrinsic_config(
+        config_path,
+        encoder_config=encoder_config,
+        runtime_device=runtime.device,
+        model_dtype=model_dtype,
     )
     latent_dynamics_config = replace(
         LatentDynamicsConfig.from_yaml(config_path),
@@ -2429,6 +2691,125 @@ def _build_eval_dataset(
         if runtime.enabled:
             _distributed_barrier(runtime)
     return dataset
+
+
+def _dataloader_batch_plan(
+    loader: DataLoader[dict[str, Any]],
+    *,
+    max_batches: int | None,
+) -> list[list[int]]:
+    sampler = getattr(loader, "sampler", None)
+    if sampler is None:
+        ordered_indices = list(range(len(loader.dataset)))
+    else:
+        ordered_indices = [int(index) for index in sampler]
+    batch_size = loader.batch_size
+    if batch_size is None or int(batch_size) <= 0:
+        raise ValueError(f"Expected a positive DataLoader batch_size, got {batch_size}")
+    batch_plan = [
+        ordered_indices[start : start + int(batch_size)]
+        for start in range(0, len(ordered_indices), int(batch_size))
+    ]
+    if max_batches is not None:
+        batch_plan = batch_plan[: int(max_batches)]
+    return batch_plan
+
+
+def _dataloader_batch_plan_entries(
+    loader: DataLoader[dict[str, Any]],
+    *,
+    max_batches: int | None,
+) -> list[tuple[list[int], list[bool]]]:
+    sampler = getattr(loader, "sampler", None)
+    if sampler is None:
+        ordered_indices = list(range(len(loader.dataset)))
+        local_valid_sample_count = len(ordered_indices)
+    else:
+        ordered_indices = [int(index) for index in sampler]
+        local_valid_sample_count = len(ordered_indices)
+        if isinstance(sampler, ContiguousDistributedSampler) and not sampler.drop_last:
+            dataset_length = len(loader.dataset)
+            start_index = int(sampler.rank) * int(sampler.num_samples)
+            local_valid_sample_count = max(
+                min(dataset_length, start_index + int(sampler.num_samples)) - start_index,
+                0,
+            )
+
+    batch_size = loader.batch_size
+    if batch_size is None or int(batch_size) <= 0:
+        raise ValueError(f"Expected a positive DataLoader batch_size, got {batch_size}")
+    flat_valid_mask = [position < local_valid_sample_count for position in range(len(ordered_indices))]
+    batch_plan_entries = [
+        (
+            ordered_indices[start : start + int(batch_size)],
+            flat_valid_mask[start : start + int(batch_size)],
+        )
+        for start in range(0, len(ordered_indices), int(batch_size))
+    ]
+    if max_batches is not None:
+        batch_plan_entries = batch_plan_entries[: int(max_batches)]
+    return batch_plan_entries
+
+
+def _load_batch_from_dataset_indices(
+    dataset: Dataset[dict[str, Any]],
+    batch_indices: Sequence[int],
+) -> dict[str, Any]:
+    if len(batch_indices) <= 0:
+        raise ValueError("batch_indices must be non-empty.")
+    samples = [dataset[int(index)] for index in batch_indices]
+    return default_collate(samples)
+
+
+def _batch_anchor_indices_from_dataset_indices(
+    dataset: ArcoEra5FuXiDataset,
+    batch_indices: Sequence[int],
+) -> Tensor:
+    valid_anchor_indices = dataset._build_valid_anchor_indices()
+    return torch.as_tensor(
+        [int(valid_anchor_indices[int(index)]) for index in batch_indices],
+        dtype=torch.long,
+    )
+
+
+def _masked_reconstruction_loss_terms(
+    prediction: Tensor,
+    target: Tensor,
+    valid_mask: Tensor,
+) -> dict[str, Any]:
+    if prediction.shape != target.shape:
+        raise ValueError(
+            f"Prediction/target shape mismatch for masked reconstruction loss: "
+            f"{tuple(prediction.shape)} vs {tuple(target.shape)}"
+        )
+    if valid_mask.ndim != 1 or valid_mask.shape[0] != prediction.shape[0]:
+        raise ValueError(
+            "Expected valid_mask shaped [B] aligned with prediction batch dimension, got "
+            f"{tuple(valid_mask.shape)} for {tuple(prediction.shape)}"
+        )
+
+    valid_mask = valid_mask.to(device=prediction.device, dtype=torch.bool)
+    connected_zero = prediction.sum() * 0.0
+    valid_count = int(valid_mask.sum().item())
+    if valid_count <= 0:
+        return {
+            "mean": connected_zero,
+            "sum": connected_zero,
+            "count": 0,
+        }
+
+    per_sample_mse = (
+        (prediction.float() - target.float())
+        .reshape(prediction.shape[0], -1)
+        .pow(2)
+        .mean(dim=1)
+    )
+    valid_values = per_sample_mse[valid_mask]
+    return {
+        "mean": valid_values.mean(),
+        "sum": valid_values.sum(),
+        "count": valid_count,
+    }
 
 
 def _save_checkpoint(path: Path, payload: dict[str, Any]) -> None:
@@ -4086,6 +4467,23 @@ def _intrinsic_regularizer_beta(
     return float(position) / float(max(int(ramp_steps), 1))
 
 
+def _intrinsic_regularizers_requested(train_config: IntrinsicTrainingConfig) -> bool:
+    return bool(
+        float(train_config.smoothness_weight) > 0.0
+        or float(train_config.space_filling_weight) > 0.0
+    )
+
+
+def _intrinsic_regularizers_active_for_epoch(
+    train_config: IntrinsicTrainingConfig,
+    *,
+    epoch: int,
+) -> bool:
+    if not _intrinsic_regularizers_requested(train_config):
+        return False
+    return int(epoch) > int(train_config.regularizer_warmup_epochs)
+
+
 def _project_intrinsic_latents_for_regularizer(
     z_intrinsic: Tensor,
     *,
@@ -4140,6 +4538,38 @@ def _gather_latent_points_for_regularizer(z_intrinsic: Tensor, runtime: Distribu
     return torch.cat(gathered, dim=0)
 
 
+def _sample_uniform_reference_points(
+    *,
+    sample_count: int,
+    feature_dim: int,
+    device: torch.device,
+    seed: int | None,
+) -> Tensor:
+    if sample_count <= 0:
+        raise ValueError(f"sample_count must be positive, got {sample_count}")
+    if feature_dim <= 0:
+        raise ValueError(f"feature_dim must be positive, got {feature_dim}")
+    if seed is None:
+        return 2.0 * torch.rand(
+            sample_count,
+            feature_dim,
+            device=device,
+            dtype=torch.float32,
+        ) - 1.0
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int(seed))
+    return (
+        2.0
+        * torch.rand(
+            sample_count,
+            feature_dim,
+            generator=generator,
+            dtype=torch.float32,
+        )
+        - 1.0
+    ).to(device=device)
+
+
 def _sinkhorn_transport_cost(
     source_points: Tensor,
     target_points: Tensor,
@@ -4184,6 +4614,76 @@ def _sinkhorn_transport_cost(
     return (transport_plan * cost).sum()
 
 
+def _intrinsic_smoothness_loss_from_ordered_points(
+    points: Tensor,
+    anchor_indices: Tensor,
+    *,
+    expected_stride_steps: int,
+    threshold_l0: float,
+    eta: float,
+) -> Tensor:
+    if points.ndim != 2:
+        raise ValueError(f"Expected points shaped [N, D], got {tuple(points.shape)}")
+    if anchor_indices.ndim != 1 or anchor_indices.shape[0] != points.shape[0]:
+        raise ValueError(
+            "Expected anchor_indices shaped [N] aligned with points, got "
+            f"{tuple(anchor_indices.shape)} for {tuple(points.shape)}"
+        )
+    if expected_stride_steps <= 0:
+        raise ValueError(f"expected_stride_steps must be positive, got {expected_stride_steps}")
+
+    smoothness_loss = points.new_zeros(())
+    if points.shape[0] >= 2:
+        one_step_mask = (anchor_indices[1:] - anchor_indices[:-1]) == int(expected_stride_steps)
+    else:
+        one_step_mask = torch.zeros(0, device=points.device, dtype=torch.bool)
+
+    if float(eta) > 0.0 and bool(one_step_mask.any()):
+        one_step_distances = torch.linalg.vector_norm(points[1:] - points[:-1], dim=1)
+        smoothness_loss = smoothness_loss + float(eta) * F.relu(
+            one_step_distances[one_step_mask] - float(threshold_l0)
+        ).mean()
+
+    if points.shape[0] >= 3:
+        two_step_mask = (
+            (anchor_indices[2:] - anchor_indices[:-2]) == 2 * int(expected_stride_steps)
+        )
+        if one_step_mask.numel() >= 2:
+            two_step_mask = two_step_mask & one_step_mask[:-1] & one_step_mask[1:]
+        if bool(two_step_mask.any()):
+            two_step_distances = torch.linalg.vector_norm(points[2:] - points[:-2], dim=1)
+            smoothness_loss = smoothness_loss + F.relu(
+                two_step_distances[two_step_mask] - 2.0 * float(threshold_l0)
+            ).mean()
+
+    return smoothness_loss
+
+
+def _intrinsic_space_filling_loss_from_points(
+    points: Tensor,
+    *,
+    epsilon: float,
+    iterations: int,
+    reference_sample_count: int | None,
+    seed: int | None = None,
+) -> Tensor:
+    if points.ndim != 2:
+        raise ValueError(f"Expected points shaped [N, D], got {tuple(points.shape)}")
+    resolved_reference_count = int(points.shape[0]) if reference_sample_count is None else int(reference_sample_count)
+    reference_points = _sample_uniform_reference_points(
+        sample_count=resolved_reference_count,
+        feature_dim=int(points.shape[1]),
+        device=points.device,
+        seed=seed,
+    )
+    return _sinkhorn_transport_cost(
+        points,
+        reference_points,
+        epsilon=epsilon,
+        iterations=iterations,
+    ).to(dtype=points.dtype)
+
+
 def _intrinsic_space_filling_loss(
     z_intrinsic: Tensor,
     *,
@@ -4203,36 +4703,12 @@ def _intrinsic_space_filling_loss(
         use_tanh_projection=use_tanh_projection,
     )
     points = _gather_latent_points_for_regularizer(points, runtime)
-
-    resolved_reference_count = int(points.shape[0]) if reference_sample_count is None else int(reference_sample_count)
-    if resolved_reference_count <= 0:
-        raise ValueError(
-            f"reference_sample_count must be positive when set, got {resolved_reference_count}"
-        )
-
-    if seed is None:
-        reference_points = 2.0 * torch.rand(
-            resolved_reference_count,
-            points.shape[1],
-            device=points.device,
-            dtype=torch.float32,
-        ) - 1.0
-    else:
-        generator = torch.Generator(device="cpu")
-        generator.manual_seed(int(seed))
-        reference_points = 2.0 * torch.rand(
-            resolved_reference_count,
-            points.shape[1],
-            generator=generator,
-            dtype=torch.float32,
-        ) - 1.0
-        reference_points = reference_points.to(device=points.device)
-
-    return _sinkhorn_transport_cost(
+    return _intrinsic_space_filling_loss_from_points(
         points,
-        reference_points,
         epsilon=epsilon,
         iterations=iterations,
+        reference_sample_count=reference_sample_count,
+        seed=seed,
     ).to(dtype=z_intrinsic.dtype)
 
 
@@ -4244,16 +4720,14 @@ def _intrinsic_loss_terms(
     train_config: IntrinsicTrainingConfig,
     optimizer_step: int,
     space_filling_seed: int | None,
+    regularizers_active: bool = True,
     beta_override: float | None = None,
 ) -> dict[str, Tensor]:
     reconstruction_loss = F.mse_loss(
         outputs["second_block_features_recon"],
         second_block_features,
     )
-    regularizers_enabled = (
-        train_config.smoothness_weight > 0.0 or train_config.space_filling_weight > 0.0
-    )
-    if not regularizers_enabled:
+    if not _intrinsic_regularizers_requested(train_config) or not regularizers_active:
         beta = reconstruction_loss.new_tensor(0.0)
         smoothness_loss = reconstruction_loss.new_zeros(())
         space_filling_loss = reconstruction_loss.new_zeros(())
@@ -4305,6 +4779,187 @@ def _intrinsic_loss_terms(
         "space_filling_loss": space_filling_loss,
         "beta": beta,
         "total_loss": total_loss,
+    }
+
+
+def _intrinsic_group_regularizer_terms(
+    local_z_intrinsic: Tensor,
+    local_anchor_indices: Tensor,
+    *,
+    local_valid_mask: Tensor | None,
+    runtime: DistributedRuntime,
+    train_config: IntrinsicTrainingConfig,
+    expected_stride_steps: int,
+    space_filling_seed: int | None,
+    regularizers_active: bool = True,
+    beta_override: float | None = None,
+    optimizer_step: int = 0,
+) -> dict[str, Tensor]:
+    if local_z_intrinsic.ndim != 2:
+        raise ValueError(
+            f"Expected local_z_intrinsic shaped [N, D], got {tuple(local_z_intrinsic.shape)}"
+        )
+    if local_anchor_indices.ndim != 1 or local_anchor_indices.shape[0] != local_z_intrinsic.shape[0]:
+        raise ValueError(
+            "Expected local_anchor_indices shaped [N] aligned with local_z_intrinsic, got "
+            f"{tuple(local_anchor_indices.shape)} for {tuple(local_z_intrinsic.shape)}"
+        )
+    if local_valid_mask is None:
+        local_valid_mask = torch.ones(
+            local_z_intrinsic.shape[0],
+            device=local_z_intrinsic.device,
+            dtype=torch.bool,
+        )
+    elif local_valid_mask.ndim != 1 or local_valid_mask.shape[0] != local_z_intrinsic.shape[0]:
+        raise ValueError(
+            "Expected local_valid_mask shaped [N] aligned with local_z_intrinsic, got "
+            f"{tuple(local_valid_mask.shape)} for {tuple(local_z_intrinsic.shape)}"
+        )
+    else:
+        local_valid_mask = local_valid_mask.to(device=local_z_intrinsic.device, dtype=torch.bool)
+
+    local_z_leaf = local_z_intrinsic.detach().requires_grad_(True)
+    connected_zero = local_z_leaf.sum() * 0.0
+    if not _intrinsic_regularizers_requested(train_config) or not regularizers_active:
+        return {
+            "local_z_leaf": local_z_leaf,
+            "beta": connected_zero.detach(),
+            "smoothness_loss": connected_zero.detach(),
+            "space_filling_loss": connected_zero.detach(),
+            "total_regularizer_loss": connected_zero.detach(),
+            "backward_regularizer_loss": connected_zero,
+        }
+
+    beta = local_z_intrinsic.new_tensor(
+        float(
+            _intrinsic_regularizer_beta(
+                optimizer_step=int(optimizer_step),
+                ramp_steps=int(train_config.space_filling_beta_ramp_optimizer_steps),
+                hold_steps=int(train_config.space_filling_beta_hold_optimizer_steps),
+            )
+            if beta_override is None
+            else float(beta_override)
+        )
+    )
+    if runtime.enabled:
+        gathered_z = [torch.zeros_like(local_z_leaf) for _ in range(runtime.world_size)]
+        dist.all_gather(gathered_z, local_z_leaf.detach())
+        gathered_z[runtime.rank] = local_z_leaf
+        gathered_anchor_indices = [
+            torch.zeros_like(local_anchor_indices) for _ in range(runtime.world_size)
+        ]
+        dist.all_gather(gathered_anchor_indices, local_anchor_indices)
+        gathered_valid_masks = [
+            torch.zeros_like(local_valid_mask) for _ in range(runtime.world_size)
+        ]
+        dist.all_gather(gathered_valid_masks, local_valid_mask)
+        global_z = torch.cat(gathered_z, dim=0)
+        global_anchor_indices = torch.cat(gathered_anchor_indices, dim=0)
+        global_valid_mask = torch.cat(gathered_valid_masks, dim=0)
+    else:
+        global_z = local_z_leaf
+        global_anchor_indices = local_anchor_indices
+        global_valid_mask = local_valid_mask
+
+    valid_global_z = global_z[global_valid_mask]
+    valid_global_anchor_indices = global_anchor_indices[global_valid_mask]
+    if valid_global_z.shape[0] > 0:
+        sort_order = torch.argsort(valid_global_anchor_indices, stable=True)
+        sorted_anchor_indices = valid_global_anchor_indices.index_select(0, sort_order)
+        sorted_points = valid_global_z.index_select(0, sort_order)
+    else:
+        sorted_anchor_indices = valid_global_anchor_indices
+        sorted_points = valid_global_z
+
+    if sorted_points.shape[0] > 0:
+        smoothness_points = _project_intrinsic_latents_for_regularizer(
+            sorted_points,
+            use_tanh_projection=bool(train_config.smoothness_use_tanh_projection),
+        )
+    else:
+        smoothness_points = sorted_points
+    if valid_global_z.shape[0] > 0:
+        space_filling_points = _project_intrinsic_latents_for_regularizer(
+            valid_global_z,
+            use_tanh_projection=bool(train_config.space_filling_use_tanh_projection),
+        )
+    else:
+        space_filling_points = valid_global_z
+
+    smoothness_loss = (
+        connected_zero
+        if train_config.smoothness_weight <= 0.0 or smoothness_points.shape[0] <= 0
+        else _intrinsic_smoothness_loss_from_ordered_points(
+            smoothness_points,
+            sorted_anchor_indices,
+            expected_stride_steps=int(expected_stride_steps),
+            threshold_l0=float(train_config.smoothness_l0),
+            eta=float(train_config.smoothness_eta),
+        )
+    )
+    space_filling_loss = (
+        connected_zero
+        if train_config.space_filling_weight <= 0.0 or space_filling_points.shape[0] <= 0
+        else _intrinsic_space_filling_loss_from_points(
+            space_filling_points,
+            epsilon=float(train_config.space_filling_sinkhorn_epsilon),
+            iterations=int(train_config.space_filling_sinkhorn_iters),
+            reference_sample_count=train_config.space_filling_reference_sample_count,
+            seed=space_filling_seed,
+        )
+    )
+    regularizer_total = beta * (
+        local_z_leaf.new_tensor(float(train_config.smoothness_weight)) * smoothness_loss
+        + local_z_leaf.new_tensor(float(train_config.space_filling_weight)) * space_filling_loss
+    )
+    backward_regularizer_total = (
+        regularizer_total * runtime.world_size if runtime.enabled else regularizer_total
+    )
+    return {
+        "local_z_leaf": local_z_leaf,
+        "beta": beta,
+        "smoothness_loss": smoothness_loss,
+        "space_filling_loss": space_filling_loss,
+        "total_regularizer_loss": regularizer_total,
+        "backward_regularizer_loss": backward_regularizer_total,
+    }
+
+
+def _intrinsic_group_regularizer_cached_grad(
+    local_z_intrinsic: Tensor,
+    local_anchor_indices: Tensor,
+    *,
+    local_valid_mask: Tensor | None,
+    runtime: DistributedRuntime,
+    train_config: IntrinsicTrainingConfig,
+    expected_stride_steps: int,
+    space_filling_seed: int | None,
+    regularizers_active: bool = True,
+    beta_override: float | None = None,
+    optimizer_step: int = 0,
+) -> dict[str, Tensor]:
+    terms = _intrinsic_group_regularizer_terms(
+        local_z_intrinsic,
+        local_anchor_indices,
+        local_valid_mask=local_valid_mask,
+        runtime=runtime,
+        train_config=train_config,
+        expected_stride_steps=expected_stride_steps,
+        space_filling_seed=space_filling_seed,
+        regularizers_active=regularizers_active,
+        beta_override=beta_override,
+        optimizer_step=optimizer_step,
+    )
+    terms["backward_regularizer_loss"].backward()
+    local_z_grad = terms["local_z_leaf"].grad
+    if local_z_grad is None:
+        raise RuntimeError("Failed to populate cached intrinsic-regularizer gradients.")
+    return {
+        "cached_z_grad": local_z_grad.detach(),
+        "beta": terms["beta"].detach(),
+        "smoothness_loss": terms["smoothness_loss"].detach(),
+        "space_filling_loss": terms["space_filling_loss"].detach(),
+        "total_regularizer_loss": terms["total_regularizer_loss"].detach(),
     }
 
 
@@ -4964,6 +5619,7 @@ def rollout_main_model(
     checkpoint_path: str | Path | None = None,
     intrinsic_checkpoint_path: str | Path | None = None,
     intrinsic_frequency: int | None = None,
+    save_intrinsic_latent_plot: bool = False,
     split: str = "val",
     sample_index: int = 0,
     future_steps: int = 8,
@@ -4985,6 +5641,11 @@ def rollout_main_model(
             raise ValueError(
                 "intrinsic_frequency was provided, but no intrinsic_checkpoint_path was set. "
                 "Pass an intrinsic checkpoint to enable intrinsic rollout chaining."
+            )
+        if intrinsic_checkpoint_path is None and save_intrinsic_latent_plot:
+            raise ValueError(
+                "save_intrinsic_latent_plot was requested, but no intrinsic_checkpoint_path was set. "
+                "Pass an intrinsic checkpoint to trace and plot intrinsic latents during rollout."
             )
         if intrinsic_frequency is not None and int(intrinsic_frequency) <= 0:
             raise ValueError(f"intrinsic_frequency must be positive when set, got {intrinsic_frequency}")
@@ -5041,12 +5702,11 @@ def rollout_main_model(
         intrinsic_model: FuXiIntrinsic | None = None
         intrinsic_checkpoint_metadata: dict[str, Any] | None = None
         if resolved_intrinsic_checkpoint_path is not None:
-            intrinsic_config = replace(
-                FuXiIntrinsicConfig.from_yaml(config_path),
-                device=runtime.device,
-                dtype=model_config.dtype,
-                input_channels=model_config.embed_dim,
-                spatial_size=model_config.patch_grid,
+            intrinsic_config = _build_runtime_intrinsic_config(
+                config_path,
+                encoder_config=model_config,
+                runtime_device=runtime.device,
+                model_dtype=model_config.dtype,
             )
             intrinsic_model = FuXiIntrinsic(intrinsic_config).to(runtime.device)
             if print_model_summary and runtime.is_primary:
@@ -5093,9 +5753,19 @@ def rollout_main_model(
                 "future_steps_generated": 0,
                 "saved_horizon_hours": [],
                 "intrinsic_enabled": intrinsic_model is not None,
-                "intrinsic_frequency": None if intrinsic_model is None else int(intrinsic_frequency or 1),
+                "intrinsic_forecast_chain_enabled": (
+                    intrinsic_model is not None and intrinsic_frequency is not None
+                ),
+                "intrinsic_frequency": (
+                    None
+                    if intrinsic_model is None or intrinsic_frequency is None
+                    else int(intrinsic_frequency)
+                ),
+                "intrinsic_latent_plot_enabled": bool(save_intrinsic_latent_plot),
                 "intrinsic_used_rollout_steps": [],
                 "intrinsic_used_horizon_hours": [],
+                "intrinsic_latent_horizon_hours": [],
+                "intrinsic_latent_plot": None,
                 "channel_folder_count": 0,
                 "saved_images": 0,
                 "manifest_path": None,
@@ -5117,6 +5787,7 @@ def rollout_main_model(
                 future_steps=future_steps,
                 intrinsic_model=intrinsic_model,
                 intrinsic_frequency=intrinsic_frequency,
+                save_intrinsic_latent_plot=save_intrinsic_latent_plot,
             )
 
         result = {
@@ -5141,7 +5812,13 @@ def rollout_main_model(
             "future_steps": int(future_steps),
             "lead_time_hours": int(data_config.lead_time_hours),
             "intrinsic_enabled": intrinsic_model is not None,
-            "intrinsic_frequency": None if intrinsic_model is None else int(intrinsic_frequency or 1),
+            "intrinsic_forecast_chain_enabled": intrinsic_model is not None and intrinsic_frequency is not None,
+            "intrinsic_frequency": (
+                None
+                if intrinsic_model is None or intrinsic_frequency is None
+                else int(intrinsic_frequency)
+            ),
+            "intrinsic_latent_plot_enabled": bool(save_intrinsic_latent_plot),
             "distributed": runtime.enabled,
             "world_size": runtime.world_size,
             "rollout": rollout_report,
@@ -5151,7 +5828,8 @@ def rollout_main_model(
                 runtime,
                 f"[main][rollout] split={normalized_split} sample_index={sample_index} "
                 f"future_steps={future_steps} saved_images={rollout_report['saved_images']} "
-                f"intrinsic_enabled={intrinsic_model is not None}",
+                f"intrinsic_enabled={intrinsic_model is not None} "
+                f"intrinsic_forecast_chain_enabled={result['intrinsic_forecast_chain_enabled']}",
             )
             _print_json_block("main_rollout_result", result)
         return result
@@ -7088,7 +7766,8 @@ def train_intrinsic_model(
             _print_if_primary(
                 runtime,
                 (
-                    f"[intrinsic] regularizer_beta_ramp_steps={train_config.space_filling_beta_ramp_optimizer_steps} "
+                    f"[intrinsic] regularizer_warmup_epochs={train_config.regularizer_warmup_epochs} "
+                    f"regularizer_beta_ramp_steps={train_config.space_filling_beta_ramp_optimizer_steps} "
                     f"regularizer_beta_hold_steps={train_config.space_filling_beta_hold_optimizer_steps} "
                     f"space_filling_weight={train_config.space_filling_weight} "
                     f"sinkhorn_epsilon={train_config.space_filling_sinkhorn_epsilon} "
@@ -7117,6 +7796,11 @@ def train_intrinsic_model(
                     "[intrinsic] smoothness loss is enabled with batch_size=2, so only the one-step term "
                     "is active. Increase batch_size to >= 3 to activate the two-step term too.",
                 )
+        if train_config.skip_non_finite_batches:
+            _print_if_primary(
+                runtime,
+                "[intrinsic] skip_non_finite_batches=True",
+            )
 
         total_train_batches = _limited_length(train_loader, train_config.max_train_batches)
         total_val_batches = 0 if val_loader is None else _limited_length(val_loader, train_config.max_val_batches)
@@ -7163,13 +7847,33 @@ def train_intrinsic_model(
         optimizer_steps = 0 if resume_state is None else resume_state.optimizer_steps
         global_batch_steps = 0 if resume_state is None else resume_state.global_batch_steps
         start_epoch = 1 if resume_state is None else resume_state.start_epoch
+        regularizer_optimizer_steps = 0
+        if resume_checkpoint is not None:
+            regularizer_optimizer_steps = int(
+                resume_checkpoint.get(
+                    "regularizer_optimizer_step",
+                    history[-1].get(
+                        "regularizer_optimizer_steps",
+                        0
+                        if start_epoch <= int(train_config.regularizer_warmup_epochs) + 1
+                        else optimizer_steps,
+                    )
+                    if history
+                    else (
+                        0
+                        if start_epoch <= int(train_config.regularizer_warmup_epochs) + 1
+                        else optimizer_steps
+                    ),
+                )
+            )
         if resume_state is not None:
             _print_if_primary(
                 runtime,
                 f"[intrinsic] resuming from {resume_state.checkpoint_path} "
                 f"checkpoint_epoch={resume_state.checkpoint_epoch} start_epoch={resume_state.start_epoch} "
                 f"resume_batch={resume_state.resume_batch_index} optimizer_steps={resume_state.optimizer_steps} "
-                f"global_batch_steps={resume_state.global_batch_steps}",
+                f"global_batch_steps={resume_state.global_batch_steps} "
+                f"regularizer_optimizer_steps={regularizer_optimizer_steps}",
             )
             if start_epoch > train_config.max_epochs:
                 raise ValueError(
@@ -7177,11 +7881,145 @@ def train_intrinsic_model(
                     f"but train_intrinsic.max_epochs={train_config.max_epochs}. Increase max_epochs to continue training."
                 )
 
+        regularizers_enabled = (
+            train_config.smoothness_weight > 0.0 or train_config.space_filling_weight > 0.0
+        )
+        expected_stride_steps: int | None = None
+        train_batch_plan_entries: list[tuple[list[int], list[bool]]] | None = None
+        val_batch_plan_entries: list[tuple[list[int], list[bool]]] | None = None
+        if regularizers_enabled:
+            if train_config.save_every_train_batches is not None:
+                raise ValueError(
+                    "train_intrinsic.save_every_train_batches is not supported when smoothness/space-filling "
+                    "regularizers are enabled, because batch checkpoints inside an accumulation window cannot be "
+                    "resumed exactly. Use save_every_optimizer_steps and/or save_epoch_checkpoint instead."
+                )
+            if not isinstance(train_loader.dataset, ArcoEra5FuXiDataset):
+                raise TypeError(
+                    "Expected train_loader.dataset to be an ArcoEra5FuXiDataset for intrinsic regularizer training."
+                )
+            expected_stride_steps = train_loader.dataset._step_count(data_config.sample_stride_hours)
+            train_batch_plan_entries = _dataloader_batch_plan_entries(
+                train_loader,
+                max_batches=train_config.max_train_batches,
+            )
+            if len(train_batch_plan_entries) != total_train_batches:
+                raise RuntimeError(
+                    "Intrinsic train batch plan length does not match total_train_batches."
+                )
+            if val_loader is not None:
+                val_batch_plan_entries = _dataloader_batch_plan_entries(
+                    val_loader,
+                    max_batches=train_config.max_val_batches,
+                )
+                if len(val_batch_plan_entries) != total_val_batches:
+                    raise RuntimeError(
+                        "Intrinsic validation batch plan length does not match total_val_batches."
+                    )
+            if (
+                resume_state is not None
+                and resume_state.resume_batch_index > 0
+                and resume_state.replay_start_batch_index < resume_state.resume_batch_index
+            ):
+                raise ValueError(
+                    f"Resume checkpoint {resume_state.checkpoint_path} was saved mid-accumulation "
+                    "while intrinsic smoothness/space-filling regularizers were enabled. "
+                    "Resume from an epoch checkpoint or an optimizer-step checkpoint instead."
+                )
+            _print_if_primary(
+                runtime,
+                (
+                    f"[intrinsic] grouped-regularizer logical_batches={train_config.gradient_accumulation_steps} "
+                    f"sample_stride_steps={expected_stride_steps}"
+                ),
+            )
+
+        total_skipped_train_groups = 0
+        total_skipped_train_microbatches = 0
+        total_skipped_val_groups = 0
+        total_skipped_val_microbatches = 0
+
+        def make_intrinsic_checkpoint_payload(
+            *,
+            epoch: int,
+            batch_index_within_epoch: int | None = None,
+            checkpoint_best_val_loss: float | None = None,
+        ) -> dict[str, Any]:
+            payload = {
+                "epoch": epoch,
+                "global_batch_step": int(global_batch_steps),
+                "optimizer_step": int(optimizer_steps),
+                "regularizer_optimizer_step": int(regularizer_optimizer_steps),
+                "intrinsic_state_dict": _unwrap_model(intrinsic_model).state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scaler_state_dict": scaler.state_dict(),
+                "history": history,
+                "best_val_loss": (
+                    best_val_loss if checkpoint_best_val_loss is None else checkpoint_best_val_loss
+                ),
+                "train_config": _to_plain_data(asdict(train_config)),
+                "encoder_config": _to_plain_data(asdict(encoder_config)),
+                "intrinsic_config": _to_plain_data(asdict(intrinsic_config)),
+                "data_config": _to_plain_data(asdict(data_config)),
+                "main_checkpoint_path": (
+                    str(train_config.main_checkpoint_path)
+                    if train_config.main_checkpoint_path
+                    else None
+                ),
+                "distributed_runtime": {
+                    "enabled": runtime.enabled,
+                    "backend": runtime.backend,
+                    "world_size": runtime.world_size,
+                },
+                "effective_batch_size": effective_batch_size,
+                "gradient_accumulation_steps": train_config.gradient_accumulation_steps,
+            }
+            if batch_index_within_epoch is not None:
+                payload["batch_index_within_epoch"] = int(batch_index_within_epoch)
+            return payload
+
+        def log_intrinsic_non_finite_skip(
+            *,
+            split_name: str,
+            epoch: int,
+            batch_end: int,
+            reason: str,
+        ) -> None:
+            _print_if_primary(
+                runtime,
+                f"[intrinsic][epoch {epoch}] skipping {split_name} batch-window ending at "
+                f"{batch_end} due to {reason}",
+            )
+
         for epoch in range(start_epoch, train_config.max_epochs + 1):
             if train_sampler is not None:
                 train_sampler.set_epoch(epoch)
             if val_sampler is not None:
                 val_sampler.set_epoch(epoch)
+            epoch_regularizers_active = _intrinsic_regularizers_active_for_epoch(
+                train_config,
+                epoch=epoch,
+            )
+            if regularizers_enabled and not epoch_regularizers_active:
+                _print_if_primary(
+                    runtime,
+                    (
+                        f"[intrinsic][epoch {epoch}] regularizer warmup active; "
+                        f"smoothness and space-filling stay disabled through epoch "
+                        f"{train_config.regularizer_warmup_epochs}"
+                    ),
+                )
+            elif (
+                regularizers_enabled
+                and epoch == int(train_config.regularizer_warmup_epochs) + 1
+            ):
+                _print_if_primary(
+                    runtime,
+                    (
+                        f"[intrinsic][epoch {epoch}] regularizer warmup finished; "
+                        "smoothness and space-filling are now active"
+                    ),
+                )
 
             intrinsic_model.train()
             optimizer.zero_grad(set_to_none=True)
@@ -7191,6 +8029,10 @@ def train_intrinsic_model(
             running_smoothness_loss = 0.0
             running_space_filling_loss = 0.0
             train_steps = 0
+            skipped_train_groups_epoch = 0
+            skipped_train_microbatches_epoch = 0
+            skipped_val_groups_epoch = 0
+            skipped_val_microbatches_epoch = 0
             resume_batch_index = (
                 0
                 if resume_state is None or resume_state.resume_epoch != epoch
@@ -7215,108 +8057,281 @@ def train_intrinsic_model(
                         runtime,
                         f"[intrinsic][epoch {epoch}] skipping directly to batch {resume_batch_index + 1}",
                     )
+            if regularizers_enabled:
+                if train_batch_plan_entries is None or expected_stride_steps is None:
+                    raise RuntimeError("Grouped intrinsic regularizer state was not initialized.")
+                train_loader_iterator = iter(train_loader)
+                for group_start in range(0, total_train_batches, train_config.gradient_accumulation_steps):
+                    group_end = min(
+                        group_start + train_config.gradient_accumulation_steps,
+                        total_train_batches,
+                    )
+                    group_entries = train_batch_plan_entries[group_start:group_end]
+                    group_cpu_batches: list[dict[str, Any]] = []
+                    for _ in range(group_start, group_end):
+                        try:
+                            group_cpu_batches.append(next(train_loader_iterator))
+                        except StopIteration as exc:
+                            raise RuntimeError(
+                                "Intrinsic train DataLoader ended before the planned batch count."
+                            ) from exc
 
-            for batch_index, batch in _iter_prefetched_batches(
-                train_loader,
-                runtime=runtime,
-                max_batches=train_config.max_train_batches,
-            ):
-                if batch_index < resume_batch_index:
-                    if batch_index < replay_start_batch_index:
+                    if group_end <= resume_batch_index:
                         continue
-                    should_step = _should_optimizer_step(
-                        total_train_batches,
-                        batch_index,
-                        train_config.gradient_accumulation_steps,
-                    )
-                    if should_step:
+                    if group_start < resume_batch_index < group_end:
                         raise RuntimeError(
-                            "Resume replay encountered an optimizer-step batch. "
-                            "This indicates the checkpoint resume window was computed incorrectly."
+                            "Grouped intrinsic resume landed inside an accumulation window. "
+                            "This should have been rejected during resume validation."
                         )
-                    loss_divisor = float(
-                        _accumulation_divisor(
-                            total_train_batches,
-                            batch_index,
-                            train_config.gradient_accumulation_steps,
+
+                    non_blocking = runtime.device.type == "cuda"
+                    group_non_finite_reason: str | None = None
+                    local_group_z: list[Tensor] = []
+                    local_group_anchor_indices: list[Tensor] = []
+                    local_group_valid_masks: list[Tensor] = []
+                    for cpu_batch, (batch_indices, valid_flags) in zip(group_cpu_batches, group_entries, strict=True):
+                        batch = _move_batch_to_device(
+                            cpu_batch,
+                            runtime.device,
+                            non_blocking=non_blocking,
                         )
-                    )
-                    sync_context = nullcontext()
-                    if runtime.enabled and isinstance(intrinsic_model, DistributedDataParallel):
-                        sync_context = intrinsic_model.no_sync()
-                    second_block_features = _encode_second_block_features_for_intrinsic(
-                        encoder,
-                        batch,
-                        detach_features=train_config.detach_second_block_features,
-                        clear_encoder_grads=True,
-                    )
-                    replay_seed = int(epoch) * 1_000_000 + int(batch_index)
-                    with sync_context:
-                        with _amp_autocast_context(train_config.use_amp, runtime.device, amp_dtype):
-                            outputs = intrinsic_model(second_block_features)
-                            loss_terms = _intrinsic_loss_terms(
-                                outputs,
-                                second_block_features,
-                                runtime=runtime,
-                                train_config=train_config,
-                                optimizer_step=int(optimizer_steps),
-                                space_filling_seed=replay_seed,
+                        valid_mask = torch.as_tensor(
+                            valid_flags,
+                            device=runtime.device,
+                            dtype=torch.bool,
+                        )
+                        anchor_indices = _batch_anchor_indices_from_dataset_indices(
+                            train_loader.dataset,
+                            batch_indices,
+                        ).to(runtime.device, non_blocking=non_blocking)
+                        with torch.no_grad():
+                            with _amp_autocast_context(train_config.use_amp, runtime.device, amp_dtype):
+                                second_block_features = _encode_second_block_features_for_intrinsic(
+                                    encoder,
+                                    batch,
+                                    detach_features=train_config.detach_second_block_features,
+                                    clear_encoder_grads=True,
+                                )
+                                outputs = intrinsic_model(second_block_features)
+                        if train_config.skip_non_finite_batches:
+                            first_pass_non_finite = _non_finite_tensor_names(
+                                {
+                                    "second_block_features": second_block_features,
+                                    "z_intrinsic": outputs.get("z_intrinsic"),
+                                }
                             )
-                            scaled_loss = loss_terms["total_loss"] / loss_divisor
-                        if scaler.is_enabled():
-                            scaler.scale(scaled_loss).backward()
-                        else:
-                            scaled_loss.backward()
-                    continue
+                            if first_pass_non_finite:
+                                group_non_finite_reason = (
+                                    "non-finite first-pass tensors: "
+                                    + ", ".join(first_pass_non_finite)
+                                )
+                                break
+                        local_group_z.append(outputs["z_intrinsic"])
+                        local_group_anchor_indices.append(anchor_indices)
+                        local_group_valid_masks.append(valid_mask)
 
-                should_step = _should_optimizer_step(
-                    total_train_batches,
-                    batch_index,
-                    train_config.gradient_accumulation_steps,
-                )
-                global_batch_steps += 1
-                loss_divisor = float(
-                    _accumulation_divisor(
-                        total_train_batches,
-                        batch_index,
-                        train_config.gradient_accumulation_steps,
-                    )
-                )
-                sync_context = nullcontext()
-                if runtime.enabled and isinstance(intrinsic_model, DistributedDataParallel) and not should_step:
-                    sync_context = intrinsic_model.no_sync()
-
-                second_block_features = _encode_second_block_features_for_intrinsic(
-                    encoder,
-                    batch,
-                    detach_features=train_config.detach_second_block_features,
-                    clear_encoder_grads=True,
-                )
-                space_filling_seed = int(epoch) * 1_000_000 + int(batch_index)
-
-                with sync_context:
-                    with _amp_autocast_context(train_config.use_amp, runtime.device, amp_dtype):
-                        outputs = intrinsic_model(second_block_features)
-                        loss_terms = _intrinsic_loss_terms(
-                            outputs,
-                            second_block_features,
-                            runtime=runtime,
-                            train_config=train_config,
-                            optimizer_step=int(optimizer_steps),
-                            space_filling_seed=space_filling_seed,
+                    if group_non_finite_reason is not None:
+                        optimizer.zero_grad(set_to_none=True)
+                        encoder.zero_grad(set_to_none=True)
+                        global_batch_steps += len(group_entries)
+                        skipped_train_groups_epoch += 1
+                        skipped_train_microbatches_epoch += len(group_entries)
+                        total_skipped_train_groups += 1
+                        total_skipped_train_microbatches += len(group_entries)
+                        log_intrinsic_non_finite_skip(
+                            split_name="train",
+                            epoch=epoch,
+                            batch_end=group_end,
+                            reason=group_non_finite_reason,
                         )
-                        loss = loss_terms["total_loss"]
-                        scaled_loss = loss / loss_divisor
+                        continue
 
+                    local_group_z_tensor = torch.cat(local_group_z, dim=0)
+                    local_group_anchor_tensor = torch.cat(local_group_anchor_indices, dim=0)
+                    local_group_valid_tensor = torch.cat(local_group_valid_masks, dim=0)
+                    regularizer_seed = int(epoch) * 1_000_000 + int(group_end - 1)
+                    regularizer_terms = _intrinsic_group_regularizer_cached_grad(
+                        local_group_z_tensor,
+                        local_group_anchor_tensor,
+                        local_valid_mask=local_group_valid_tensor,
+                        runtime=runtime,
+                        train_config=train_config,
+                        expected_stride_steps=int(expected_stride_steps),
+                        space_filling_seed=regularizer_seed,
+                        regularizers_active=epoch_regularizers_active,
+                        optimizer_step=int(regularizer_optimizer_steps),
+                    )
+                    if train_config.skip_non_finite_batches:
+                        regularizer_non_finite = _non_finite_tensor_names(
+                            {
+                                "group_z_intrinsic": local_group_z_tensor,
+                                "cached_z_grad": regularizer_terms.get("cached_z_grad"),
+                                "smoothness_loss": regularizer_terms.get("smoothness_loss"),
+                                "space_filling_loss": regularizer_terms.get("space_filling_loss"),
+                                "regularizer_total_loss": regularizer_terms.get("total_regularizer_loss"),
+                            }
+                        )
+                        if regularizer_non_finite:
+                            optimizer.zero_grad(set_to_none=True)
+                            encoder.zero_grad(set_to_none=True)
+                            global_batch_steps += len(group_entries)
+                            skipped_train_groups_epoch += 1
+                            skipped_train_microbatches_epoch += len(group_entries)
+                            total_skipped_train_groups += 1
+                            total_skipped_train_microbatches += len(group_entries)
+                            log_intrinsic_non_finite_skip(
+                                split_name="train",
+                                epoch=epoch,
+                                batch_end=group_end,
+                                reason=(
+                                    "non-finite grouped regularizer tensors: "
+                                    + ", ".join(regularizer_non_finite)
+                                ),
+                            )
+                            continue
+                    cached_group_grad = regularizer_terms["cached_z_grad"]
+                    _, global_valid_sample_count = _reduced_sum_and_count(
+                        0.0,
+                        int(local_group_valid_tensor.sum().item()),
+                        runtime,
+                    )
+                    group_reconstruction_sum_local = 0.0
+                    group_reconstruction_count_local = 0
+                    z_offset = 0
+                    for local_batch_offset, (cpu_batch, (_batch_indices, valid_flags)) in enumerate(
+                        zip(group_cpu_batches, group_entries, strict=True)
+                    ):
+                        batch = _move_batch_to_device(
+                            cpu_batch,
+                            runtime.device,
+                            non_blocking=non_blocking,
+                        )
+                        valid_mask = torch.as_tensor(
+                            valid_flags,
+                            device=runtime.device,
+                            dtype=torch.bool,
+                        )
+                        local_batch_size = int(valid_mask.shape[0])
+                        cached_grad_slice = cached_group_grad[z_offset : z_offset + local_batch_size]
+                        z_offset += local_batch_size
+
+                        sync_context = nullcontext()
+                        if (
+                            runtime.enabled
+                            and isinstance(intrinsic_model, DistributedDataParallel)
+                            and local_batch_offset + 1 < len(group_entries)
+                        ):
+                            sync_context = intrinsic_model.no_sync()
+
+                        with sync_context:
+                            with _amp_autocast_context(train_config.use_amp, runtime.device, amp_dtype):
+                                second_block_features = _encode_second_block_features_for_intrinsic(
+                                    encoder,
+                                    batch,
+                                    detach_features=train_config.detach_second_block_features,
+                                    clear_encoder_grads=True,
+                                )
+                                outputs = intrinsic_model(second_block_features)
+                                reconstruction_terms = _masked_reconstruction_loss_terms(
+                                    outputs["second_block_features_recon"],
+                                    second_block_features,
+                                    valid_mask,
+                                )
+                                if global_valid_sample_count > 0:
+                                    reconstruction_backward_loss = (
+                                        reconstruction_terms["sum"]
+                                        / float(global_valid_sample_count)
+                                    )
+                                    if runtime.enabled:
+                                        reconstruction_backward_loss = (
+                                            reconstruction_backward_loss * runtime.world_size
+                                        )
+                                else:
+                                    reconstruction_backward_loss = reconstruction_terms["sum"] * 0.0
+                                surrogate_regularizer_loss = (
+                                    outputs["z_intrinsic"] * cached_grad_slice.detach()
+                                ).sum()
+                                scaled_loss = (
+                                    reconstruction_backward_loss + surrogate_regularizer_loss
+                                )
+                                if train_config.skip_non_finite_batches:
+                                    second_pass_non_finite = _non_finite_tensor_names(
+                                        {
+                                            "second_block_features": second_block_features,
+                                            "second_block_features_recon": outputs.get(
+                                                "second_block_features_recon"
+                                            ),
+                                            "z_intrinsic": outputs.get("z_intrinsic"),
+                                            "cached_z_grad": cached_grad_slice,
+                                            "reconstruction_mean": reconstruction_terms.get("mean"),
+                                            "reconstruction_sum": reconstruction_terms.get("sum"),
+                                            "reconstruction_backward_loss": reconstruction_backward_loss,
+                                            "surrogate_regularizer_loss": surrogate_regularizer_loss,
+                                            "scaled_loss": scaled_loss,
+                                        }
+                                    )
+                                    if second_pass_non_finite:
+                                        group_non_finite_reason = (
+                                            "non-finite second-pass tensors: "
+                                            + ", ".join(second_pass_non_finite)
+                                        )
+                            if scaler.is_enabled():
+                                if group_non_finite_reason is None:
+                                    scaler.scale(scaled_loss).backward()
+                            else:
+                                if group_non_finite_reason is None:
+                                    scaled_loss.backward()
+
+                        if group_non_finite_reason is not None:
+                            break
+
+                        group_reconstruction_sum_local += float(reconstruction_terms["sum"].item())
+                        group_reconstruction_count_local += int(reconstruction_terms["count"])
+
+                    if z_offset != cached_group_grad.shape[0]:
+                        raise RuntimeError("Intrinsic cached-regularizer gradients were sliced inconsistently.")
+
+                    if group_non_finite_reason is not None:
+                        optimizer.zero_grad(set_to_none=True)
+                        encoder.zero_grad(set_to_none=True)
+                        global_batch_steps += len(group_entries)
+                        skipped_train_groups_epoch += 1
+                        skipped_train_microbatches_epoch += len(group_entries)
+                        total_skipped_train_groups += 1
+                        total_skipped_train_microbatches += len(group_entries)
+                        log_intrinsic_non_finite_skip(
+                            split_name="train",
+                            epoch=epoch,
+                            batch_end=group_end,
+                            reason=group_non_finite_reason,
+                        )
+                        continue
+
+                    global_batch_steps += len(group_entries)
                     if scaler.is_enabled():
-                        scaler.scale(scaled_loss).backward()
-                    else:
-                        scaled_loss.backward()
-
-                if should_step:
+                        scaler.unscale_(optimizer)
+                    if train_config.skip_non_finite_batches:
+                        non_finite_grad_names = _module_non_finite_gradient_parameter_names(
+                            _unwrap_model(intrinsic_model)
+                        )
+                        if non_finite_grad_names:
+                            optimizer.zero_grad(set_to_none=True)
+                            encoder.zero_grad(set_to_none=True)
+                            skipped_train_groups_epoch += 1
+                            skipped_train_microbatches_epoch += len(group_entries)
+                            total_skipped_train_groups += 1
+                            total_skipped_train_microbatches += len(group_entries)
+                            log_intrinsic_non_finite_skip(
+                                split_name="train",
+                                epoch=epoch,
+                                batch_end=group_end,
+                                reason=(
+                                    "non-finite gradients in parameters: "
+                                    + ", ".join(non_finite_grad_names)
+                                ),
+                            )
+                            continue
                     if train_config.gradient_clip_norm is not None:
-                        if scaler.is_enabled():
-                            scaler.unscale_(optimizer)
                         torch.nn.utils.clip_grad_norm_(
                             _unwrap_model(intrinsic_model).parameters(),
                             train_config.gradient_clip_norm,
@@ -7329,99 +8344,250 @@ def train_intrinsic_model(
                         optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
                     optimizer_steps += 1
+                    if epoch_regularizers_active:
+                        regularizer_optimizer_steps += 1
 
                     if (
                         runtime.is_primary
                         and train_config.save_every_optimizer_steps is not None
                         and int(optimizer_steps) % train_config.save_every_optimizer_steps == 0
                     ):
-                        step_checkpoint_payload = {
-                            "epoch": epoch,
-                            "optimizer_step": int(optimizer_steps),
-                            "batch_index_within_epoch": batch_index + 1,
-                            "intrinsic_state_dict": _unwrap_model(intrinsic_model).state_dict(),
-                            "optimizer_state_dict": optimizer.state_dict(),
-                            "scaler_state_dict": scaler.state_dict(),
-                            "history": history,
-                            "best_val_loss": best_val_loss,
-                            "train_config": _to_plain_data(asdict(train_config)),
-                            "encoder_config": _to_plain_data(asdict(encoder_config)),
-                            "intrinsic_config": _to_plain_data(asdict(intrinsic_config)),
-                            "data_config": _to_plain_data(asdict(data_config)),
-                            "main_checkpoint_path": str(train_config.main_checkpoint_path) if train_config.main_checkpoint_path else None,
-                            "distributed_runtime": {
-                                "enabled": runtime.enabled,
-                                "backend": runtime.backend,
-                                "world_size": runtime.world_size,
-                            },
-                            "effective_batch_size": effective_batch_size,
-                            "gradient_accumulation_steps": train_config.gradient_accumulation_steps,
-                        }
                         _save_checkpoint(
-                            _step_checkpoint_path(output_dir, train_config.checkpoint_name, int(optimizer_steps)),
-                            step_checkpoint_payload,
+                            _step_checkpoint_path(
+                                output_dir,
+                                train_config.checkpoint_name,
+                                int(optimizer_steps),
+                            ),
+                            make_intrinsic_checkpoint_payload(
+                                epoch=epoch,
+                                batch_index_within_epoch=group_end,
+                            ),
                         )
 
-                if (
-                    runtime.is_primary
-                    and train_config.save_every_train_batches is not None
-                    and int(global_batch_steps) % train_config.save_every_train_batches == 0
+                    group_reconstruction_sum, group_reconstruction_count = _reduced_sum_and_count(
+                        group_reconstruction_sum_local,
+                        group_reconstruction_count_local,
+                        runtime,
+                    )
+                    group_reconstruction_loss = group_reconstruction_sum / max(
+                        group_reconstruction_count,
+                        1,
+                    )
+                    group_smoothness_loss = float(regularizer_terms["smoothness_loss"].item())
+                    group_space_filling_loss = float(regularizer_terms["space_filling_loss"].item())
+                    group_total_loss = (
+                        group_reconstruction_loss
+                        + float(regularizer_terms["total_regularizer_loss"].item())
+                    )
+                    running_loss += group_total_loss
+                    running_reconstruction_loss += group_reconstruction_loss
+                    running_smoothness_loss += group_smoothness_loss
+                    running_space_filling_loss += group_space_filling_loss
+                    train_steps += 1
+                    if group_end % max(train_config.log_every, 1) == 0 or group_end == total_train_batches:
+                        display_loss = _reduced_mean_scalar(group_total_loss, runtime)
+                        display_reconstruction_loss = _reduced_mean_scalar(
+                            group_reconstruction_loss,
+                            runtime,
+                        )
+                        display_smoothness_loss = _reduced_mean_scalar(
+                            group_smoothness_loss,
+                            runtime,
+                        )
+                        display_space_filling_loss = _reduced_mean_scalar(
+                            group_space_filling_loss,
+                            runtime,
+                        )
+                        _print_if_primary(
+                            runtime,
+                            f"[intrinsic][epoch {epoch}] batch {group_end} "
+                            f"loss={_format_full_precision_float(display_loss)} "
+                            f"recon={_format_full_precision_float(display_reconstruction_loss)} "
+                            f"smooth={_format_full_precision_float(display_smoothness_loss)} "
+                            f"space={_format_full_precision_float(display_space_filling_loss)} "
+                            f"beta={_format_full_precision_float(float(regularizer_terms['beta'].item()))}",
+                        )
+            else:
+                for batch_index, batch in _iter_prefetched_batches(
+                    train_loader,
+                    runtime=runtime,
+                    max_batches=train_config.max_train_batches,
                 ):
-                    batch_checkpoint_payload = {
-                        "epoch": epoch,
-                        "global_batch_step": int(global_batch_steps),
-                        "optimizer_step": int(optimizer_steps),
-                        "batch_index_within_epoch": batch_index + 1,
-                        "intrinsic_state_dict": _unwrap_model(intrinsic_model).state_dict(),
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "scaler_state_dict": scaler.state_dict(),
-                        "history": history,
-                        "best_val_loss": best_val_loss,
-                        "train_config": _to_plain_data(asdict(train_config)),
-                        "encoder_config": _to_plain_data(asdict(encoder_config)),
-                        "intrinsic_config": _to_plain_data(asdict(intrinsic_config)),
-                        "data_config": _to_plain_data(asdict(data_config)),
-                        "main_checkpoint_path": str(train_config.main_checkpoint_path) if train_config.main_checkpoint_path else None,
-                        "distributed_runtime": {
-                            "enabled": runtime.enabled,
-                            "backend": runtime.backend,
-                            "world_size": runtime.world_size,
-                        },
-                        "effective_batch_size": effective_batch_size,
-                        "gradient_accumulation_steps": train_config.gradient_accumulation_steps,
-                    }
-                    _save_checkpoint(
-                        _step_checkpoint_path(output_dir, train_config.checkpoint_name, int(global_batch_steps)),
-                        batch_checkpoint_payload,
-                    )
+                    if batch_index < resume_batch_index:
+                        if batch_index < replay_start_batch_index:
+                            continue
+                        should_step = _should_optimizer_step(
+                            total_train_batches,
+                            batch_index,
+                            train_config.gradient_accumulation_steps,
+                        )
+                        if should_step:
+                            raise RuntimeError(
+                                "Resume replay encountered an optimizer-step batch. "
+                                "This indicates the checkpoint resume window was computed incorrectly."
+                            )
+                        loss_divisor = float(
+                            _accumulation_divisor(
+                                total_train_batches,
+                                batch_index,
+                                train_config.gradient_accumulation_steps,
+                            )
+                        )
+                        sync_context = nullcontext()
+                        if runtime.enabled and isinstance(intrinsic_model, DistributedDataParallel):
+                            sync_context = intrinsic_model.no_sync()
+                        second_block_features = _encode_second_block_features_for_intrinsic(
+                            encoder,
+                            batch,
+                            detach_features=train_config.detach_second_block_features,
+                            clear_encoder_grads=True,
+                        )
+                        replay_seed = int(epoch) * 1_000_000 + int(batch_index)
+                        with sync_context:
+                            with _amp_autocast_context(train_config.use_amp, runtime.device, amp_dtype):
+                                outputs = intrinsic_model(second_block_features)
+                                loss_terms = _intrinsic_loss_terms(
+                                    outputs,
+                                    second_block_features,
+                                    runtime=runtime,
+                                    train_config=train_config,
+                                    optimizer_step=int(regularizer_optimizer_steps),
+                                    space_filling_seed=replay_seed,
+                                    regularizers_active=epoch_regularizers_active,
+                                )
+                                scaled_loss = loss_terms["total_loss"] / loss_divisor
+                            if scaler.is_enabled():
+                                scaler.scale(scaled_loss).backward()
+                            else:
+                                scaled_loss.backward()
+                        continue
 
-                running_loss += float(loss_terms["total_loss"].item())
-                running_reconstruction_loss += float(loss_terms["reconstruction_loss"].item())
-                running_smoothness_loss += float(loss_terms["smoothness_loss"].item())
-                running_space_filling_loss += float(loss_terms["space_filling_loss"].item())
-                train_steps += 1
-                if (batch_index + 1) % max(train_config.log_every, 1) == 0:
-                    display_loss = _reduced_mean_scalar(float(loss_terms["total_loss"].item()), runtime)
-                    display_reconstruction_loss = _reduced_mean_scalar(
-                        float(loss_terms["reconstruction_loss"].item()),
-                        runtime,
+                    should_step = _should_optimizer_step(
+                        total_train_batches,
+                        batch_index,
+                        train_config.gradient_accumulation_steps,
                     )
-                    display_smoothness_loss = _reduced_mean_scalar(
-                        float(loss_terms["smoothness_loss"].item()),
-                        runtime,
+                    global_batch_steps += 1
+                    loss_divisor = float(
+                        _accumulation_divisor(
+                            total_train_batches,
+                            batch_index,
+                            train_config.gradient_accumulation_steps,
+                        )
                     )
-                    display_space_filling_loss = _reduced_mean_scalar(
-                        float(loss_terms["space_filling_loss"].item()),
-                        runtime,
+                    sync_context = nullcontext()
+                    if runtime.enabled and isinstance(intrinsic_model, DistributedDataParallel) and not should_step:
+                        sync_context = intrinsic_model.no_sync()
+
+                    second_block_features = _encode_second_block_features_for_intrinsic(
+                        encoder,
+                        batch,
+                        detach_features=train_config.detach_second_block_features,
+                        clear_encoder_grads=True,
                     )
-                    _print_if_primary(
-                        runtime,
-                        f"[intrinsic][epoch {epoch}] batch {batch_index + 1} "
-                        f"loss={display_loss:.6f} recon={display_reconstruction_loss:.6f} "
-                        f"smooth={display_smoothness_loss:.6f} "
-                        f"space={display_space_filling_loss:.6f} "
-                        f"beta={float(loss_terms['beta'].item()):.4f}",
-                    )
+                    space_filling_seed = int(epoch) * 1_000_000 + int(batch_index)
+
+                    with sync_context:
+                        with _amp_autocast_context(train_config.use_amp, runtime.device, amp_dtype):
+                            outputs = intrinsic_model(second_block_features)
+                            loss_terms = _intrinsic_loss_terms(
+                                outputs,
+                                second_block_features,
+                                runtime=runtime,
+                                train_config=train_config,
+                                optimizer_step=int(regularizer_optimizer_steps),
+                                space_filling_seed=space_filling_seed,
+                                regularizers_active=epoch_regularizers_active,
+                            )
+                            loss = loss_terms["total_loss"]
+                            scaled_loss = loss / loss_divisor
+
+                        if scaler.is_enabled():
+                            scaler.scale(scaled_loss).backward()
+                        else:
+                            scaled_loss.backward()
+
+                    if should_step:
+                        if train_config.gradient_clip_norm is not None:
+                            if scaler.is_enabled():
+                                scaler.unscale_(optimizer)
+                            torch.nn.utils.clip_grad_norm_(
+                                _unwrap_model(intrinsic_model).parameters(),
+                                train_config.gradient_clip_norm,
+                            )
+
+                        if scaler.is_enabled():
+                            scaler.step(optimizer)
+                            scaler.update()
+                        else:
+                            optimizer.step()
+                        optimizer.zero_grad(set_to_none=True)
+                        optimizer_steps += 1
+                        if epoch_regularizers_active:
+                            regularizer_optimizer_steps += 1
+
+                        if (
+                            runtime.is_primary
+                            and train_config.save_every_optimizer_steps is not None
+                            and int(optimizer_steps) % train_config.save_every_optimizer_steps == 0
+                        ):
+                            _save_checkpoint(
+                                _step_checkpoint_path(
+                                    output_dir,
+                                    train_config.checkpoint_name,
+                                    int(optimizer_steps),
+                                ),
+                                make_intrinsic_checkpoint_payload(
+                                    epoch=epoch,
+                                    batch_index_within_epoch=batch_index + 1,
+                                ),
+                            )
+
+                    if (
+                        runtime.is_primary
+                        and train_config.save_every_train_batches is not None
+                        and int(global_batch_steps) % train_config.save_every_train_batches == 0
+                    ):
+                        _save_checkpoint(
+                            _step_checkpoint_path(
+                                output_dir,
+                                train_config.checkpoint_name,
+                                int(global_batch_steps),
+                            ),
+                            make_intrinsic_checkpoint_payload(
+                                epoch=epoch,
+                                batch_index_within_epoch=batch_index + 1,
+                            ),
+                        )
+
+                    running_loss += float(loss_terms["total_loss"].item())
+                    running_reconstruction_loss += float(loss_terms["reconstruction_loss"].item())
+                    running_smoothness_loss += float(loss_terms["smoothness_loss"].item())
+                    running_space_filling_loss += float(loss_terms["space_filling_loss"].item())
+                    train_steps += 1
+                    if (batch_index + 1) % max(train_config.log_every, 1) == 0:
+                        display_loss = _reduced_mean_scalar(float(loss_terms["total_loss"].item()), runtime)
+                        display_reconstruction_loss = _reduced_mean_scalar(
+                            float(loss_terms["reconstruction_loss"].item()),
+                            runtime,
+                        )
+                        display_smoothness_loss = _reduced_mean_scalar(
+                            float(loss_terms["smoothness_loss"].item()),
+                            runtime,
+                        )
+                        display_space_filling_loss = _reduced_mean_scalar(
+                            float(loss_terms["space_filling_loss"].item()),
+                            runtime,
+                        )
+                        _print_if_primary(
+                            runtime,
+                            f"[intrinsic][epoch {epoch}] batch {batch_index + 1} "
+                            f"loss={_format_full_precision_float(display_loss)} "
+                            f"recon={_format_full_precision_float(display_reconstruction_loss)} "
+                            f"smooth={_format_full_precision_float(display_smoothness_loss)} "
+                            f"space={_format_full_precision_float(display_space_filling_loss)} "
+                            f"beta={_format_full_precision_float(float(loss_terms['beta'].item()))}",
+                        )
 
             train_loss_sum, global_train_steps = _reduced_sum_and_count(running_loss, train_steps, runtime)
             train_loss = train_loss_sum / max(global_train_steps, 1)
@@ -7457,34 +8623,186 @@ def train_intrinsic_model(
                 val_running_space_filling_loss = 0.0
                 val_steps = 0
                 with torch.no_grad():
-                    for val_batch_index, batch in _iter_prefetched_batches(
-                        val_loader,
-                        runtime=runtime,
-                        max_batches=train_config.max_val_batches,
-                    ):
-                        second_block_features = _encode_second_block_features_for_intrinsic(
-                            encoder,
-                            batch,
-                            detach_features=train_config.detach_second_block_features,
-                            clear_encoder_grads=False,
-                        )
-                        val_space_seed = int(epoch) * 1_000_000 + int(val_batch_index)
-                        with _amp_autocast_context(train_config.use_amp, runtime.device, amp_dtype):
-                            outputs = intrinsic_model(second_block_features)
-                            loss_terms = _intrinsic_loss_terms(
-                                outputs,
-                                second_block_features,
+                    if regularizers_enabled:
+                        if val_batch_plan_entries is None:
+                            raise RuntimeError("Grouped intrinsic validation state was not initialized.")
+                        val_loader_iterator = iter(val_loader)
+                        for group_start in range(0, total_val_batches, train_config.gradient_accumulation_steps):
+                            group_end = min(
+                                group_start + train_config.gradient_accumulation_steps,
+                                total_val_batches,
+                            )
+                            group_entries = val_batch_plan_entries[group_start:group_end]
+                            group_non_finite_reason: str | None = None
+                            group_cpu_batches: list[dict[str, Any]] = []
+                            for _ in range(group_start, group_end):
+                                try:
+                                    group_cpu_batches.append(next(val_loader_iterator))
+                                except StopIteration as exc:
+                                    raise RuntimeError(
+                                        "Intrinsic validation DataLoader ended before the planned batch count."
+                                    ) from exc
+                            group_reconstruction_sum_local = 0.0
+                            group_reconstruction_count_local = 0
+                            local_group_z: list[Tensor] = []
+                            local_group_anchor_indices: list[Tensor] = []
+                            local_group_valid_masks: list[Tensor] = []
+                            for cpu_batch, (batch_indices, valid_flags) in zip(
+                                group_cpu_batches,
+                                group_entries,
+                                strict=True,
+                            ):
+                                batch = _move_batch_to_device(
+                                    cpu_batch,
+                                    runtime.device,
+                                    non_blocking=(runtime.device.type == "cuda"),
+                                )
+                                valid_mask = torch.as_tensor(
+                                    valid_flags,
+                                    device=runtime.device,
+                                    dtype=torch.bool,
+                                )
+                                anchor_indices = _batch_anchor_indices_from_dataset_indices(
+                                    val_loader.dataset,
+                                    batch_indices,
+                                ).to(runtime.device, non_blocking=(runtime.device.type == "cuda"))
+                                with _amp_autocast_context(train_config.use_amp, runtime.device, amp_dtype):
+                                    second_block_features = _encode_second_block_features_for_intrinsic(
+                                        encoder,
+                                        batch,
+                                        detach_features=train_config.detach_second_block_features,
+                                        clear_encoder_grads=False,
+                                    )
+                                    outputs = intrinsic_model(second_block_features)
+                                    reconstruction_terms = _masked_reconstruction_loss_terms(
+                                        outputs["second_block_features_recon"],
+                                        second_block_features,
+                                        valid_mask,
+                                    )
+                                if train_config.skip_non_finite_batches:
+                                    val_group_non_finite = _non_finite_tensor_names(
+                                        {
+                                            "second_block_features": second_block_features,
+                                            "second_block_features_recon": outputs.get(
+                                                "second_block_features_recon"
+                                            ),
+                                            "z_intrinsic": outputs.get("z_intrinsic"),
+                                            "reconstruction_mean": reconstruction_terms.get("mean"),
+                                            "reconstruction_sum": reconstruction_terms.get("sum"),
+                                        }
+                                    )
+                                    if val_group_non_finite:
+                                        group_non_finite_reason = (
+                                            "non-finite validation tensors: "
+                                            + ", ".join(val_group_non_finite)
+                                        )
+                                        break
+                                group_reconstruction_sum_local += float(reconstruction_terms["sum"].item())
+                                group_reconstruction_count_local += int(reconstruction_terms["count"])
+                                local_group_z.append(outputs["z_intrinsic"])
+                                local_group_anchor_indices.append(anchor_indices)
+                                local_group_valid_masks.append(valid_mask)
+
+                            if group_non_finite_reason is not None:
+                                skipped_val_groups_epoch += 1
+                                skipped_val_microbatches_epoch += len(group_entries)
+                                total_skipped_val_groups += 1
+                                total_skipped_val_microbatches += len(group_entries)
+                                log_intrinsic_non_finite_skip(
+                                    split_name="val",
+                                    epoch=epoch,
+                                    batch_end=group_end,
+                                    reason=group_non_finite_reason,
+                                )
+                                continue
+
+                            regularizer_terms = _intrinsic_group_regularizer_terms(
+                                torch.cat(local_group_z, dim=0),
+                                torch.cat(local_group_anchor_indices, dim=0),
+                                local_valid_mask=torch.cat(local_group_valid_masks, dim=0),
                                 runtime=runtime,
                                 train_config=train_config,
-                                optimizer_step=int(optimizer_steps),
-                                space_filling_seed=val_space_seed,
-                                beta_override=1.0 if train_config.space_filling_weight > 0.0 else 0.0,
+                                expected_stride_steps=int(expected_stride_steps),
+                                space_filling_seed=int(epoch) * 1_000_000 + int(group_end - 1),
+                                regularizers_active=epoch_regularizers_active,
+                                beta_override=1.0 if epoch_regularizers_active else 0.0,
+                                optimizer_step=int(regularizer_optimizer_steps),
                             )
-                        val_running_loss += float(loss_terms["total_loss"].item())
-                        val_running_reconstruction_loss += float(loss_terms["reconstruction_loss"].item())
-                        val_running_smoothness_loss += float(loss_terms["smoothness_loss"].item())
-                        val_running_space_filling_loss += float(loss_terms["space_filling_loss"].item())
-                        val_steps += 1
+                            if train_config.skip_non_finite_batches:
+                                val_regularizer_non_finite = _non_finite_tensor_names(
+                                    {
+                                        "group_z_intrinsic": torch.cat(local_group_z, dim=0),
+                                        "smoothness_loss": regularizer_terms.get("smoothness_loss"),
+                                        "space_filling_loss": regularizer_terms.get("space_filling_loss"),
+                                        "regularizer_total_loss": regularizer_terms.get(
+                                            "total_regularizer_loss"
+                                        ),
+                                    }
+                                )
+                                if val_regularizer_non_finite:
+                                    skipped_val_groups_epoch += 1
+                                    skipped_val_microbatches_epoch += len(group_entries)
+                                    total_skipped_val_groups += 1
+                                    total_skipped_val_microbatches += len(group_entries)
+                                    log_intrinsic_non_finite_skip(
+                                        split_name="val",
+                                        epoch=epoch,
+                                        batch_end=group_end,
+                                        reason=(
+                                            "non-finite validation regularizer tensors: "
+                                            + ", ".join(val_regularizer_non_finite)
+                                        ),
+                                    )
+                                    continue
+                            group_reconstruction_sum, group_reconstruction_count = _reduced_sum_and_count(
+                                group_reconstruction_sum_local,
+                                group_reconstruction_count_local,
+                                runtime,
+                            )
+                            group_reconstruction_loss = group_reconstruction_sum / max(
+                                group_reconstruction_count,
+                                1,
+                            )
+                            group_smoothness_loss = float(regularizer_terms["smoothness_loss"].item())
+                            group_space_filling_loss = float(regularizer_terms["space_filling_loss"].item())
+                            val_running_loss += (
+                                group_reconstruction_loss
+                                + float(regularizer_terms["total_regularizer_loss"].item())
+                            )
+                            val_running_reconstruction_loss += group_reconstruction_loss
+                            val_running_smoothness_loss += group_smoothness_loss
+                            val_running_space_filling_loss += group_space_filling_loss
+                            val_steps += 1
+                    else:
+                        for val_batch_index, batch in _iter_prefetched_batches(
+                            val_loader,
+                            runtime=runtime,
+                            max_batches=train_config.max_val_batches,
+                        ):
+                            second_block_features = _encode_second_block_features_for_intrinsic(
+                                encoder,
+                                batch,
+                                detach_features=train_config.detach_second_block_features,
+                                clear_encoder_grads=False,
+                            )
+                            val_space_seed = int(epoch) * 1_000_000 + int(val_batch_index)
+                            with _amp_autocast_context(train_config.use_amp, runtime.device, amp_dtype):
+                                outputs = intrinsic_model(second_block_features)
+                                loss_terms = _intrinsic_loss_terms(
+                                    outputs,
+                                    second_block_features,
+                                    runtime=runtime,
+                                    train_config=train_config,
+                                    optimizer_step=int(regularizer_optimizer_steps),
+                                    space_filling_seed=val_space_seed,
+                                    regularizers_active=epoch_regularizers_active,
+                                    beta_override=1.0 if epoch_regularizers_active else 0.0,
+                                )
+                            val_running_loss += float(loss_terms["total_loss"].item())
+                            val_running_reconstruction_loss += float(loss_terms["reconstruction_loss"].item())
+                            val_running_smoothness_loss += float(loss_terms["smoothness_loss"].item())
+                            val_running_space_filling_loss += float(loss_terms["space_filling_loss"].item())
+                            val_steps += 1
 
                 val_loss_sum, global_val_steps = _reduced_sum_and_count(val_running_loss, val_steps, runtime)
                 val_loss = val_loss_sum / max(global_val_steps, 1)
@@ -7514,7 +8832,10 @@ def train_intrinsic_model(
                 "train_smoothness_loss": train_smoothness_loss,
                 "train_space_filling_loss": train_space_filling_loss,
                 "optimizer_steps": float(optimizer_steps),
+                "regularizer_optimizer_steps": float(regularizer_optimizer_steps),
                 "global_batch_steps": float(global_batch_steps),
+                "skipped_train_groups": float(skipped_train_groups_epoch),
+                "skipped_train_microbatches": float(skipped_train_microbatches_epoch),
             }
             if val_loss is not None:
                 epoch_record["val_loss"] = val_loss
@@ -7524,21 +8845,35 @@ def train_intrinsic_model(
                 epoch_record["val_smoothness_loss"] = val_smoothness_loss
             if val_space_filling_loss is not None:
                 epoch_record["val_space_filling_loss"] = val_space_filling_loss
+            if val_loader is not None:
+                epoch_record["skipped_val_groups"] = float(skipped_val_groups_epoch)
+                epoch_record["skipped_val_microbatches"] = float(skipped_val_microbatches_epoch)
             history.append(epoch_record)
             _print_if_primary(
                 runtime,
-                f"[intrinsic][epoch {epoch}] train_loss={train_loss:.6f} "
-                f"train_recon={train_reconstruction_loss:.6f} "
-                f"train_smooth={train_smoothness_loss:.6f} "
-                f"train_space={train_space_filling_loss:.6f}"
+                f"[intrinsic][epoch {epoch}] "
+                f"train_loss={_format_full_precision_float(train_loss)} "
+                f"train_recon={_format_full_precision_float(train_reconstruction_loss)} "
+                f"train_smooth={_format_full_precision_float(train_smoothness_loss)} "
+                f"train_space={_format_full_precision_float(train_space_filling_loss)}"
                 + (
                     ""
                     if val_loss is None
                     else (
-                        f" val_loss={val_loss:.6f}"
-                        f" val_recon={val_reconstruction_loss:.6f}"
-                        f" val_smooth={val_smoothness_loss:.6f}"
-                        f" val_space={val_space_filling_loss:.6f}"
+                        f" val_loss={_format_full_precision_float(val_loss)}"
+                        f" val_recon={_format_full_precision_float(val_reconstruction_loss)}"
+                        f" val_smooth={_format_full_precision_float(val_smoothness_loss)}"
+                        f" val_space={_format_full_precision_float(val_space_filling_loss)}"
+                    )
+                )
+                + (
+                    ""
+                    if skipped_train_groups_epoch <= 0 and skipped_val_groups_epoch <= 0
+                    else (
+                        f" skipped_train_groups={skipped_train_groups_epoch}"
+                        f" skipped_train_microbatches={skipped_train_microbatches_epoch}"
+                        f" skipped_val_groups={skipped_val_groups_epoch}"
+                        f" skipped_val_microbatches={skipped_val_microbatches_epoch}"
                     )
                 ),
             )
@@ -7547,28 +8882,10 @@ def train_intrinsic_model(
                 checkpoint_best_val_loss = (
                     min(best_val_loss, float(val_loss)) if val_loss is not None else best_val_loss
                 )
-                checkpoint_payload = {
-                    "epoch": epoch,
-                    "global_batch_step": int(global_batch_steps),
-                    "optimizer_step": int(optimizer_steps),
-                    "intrinsic_state_dict": _unwrap_model(intrinsic_model).state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "scaler_state_dict": scaler.state_dict(),
-                    "history": history,
-                    "best_val_loss": checkpoint_best_val_loss,
-                    "train_config": _to_plain_data(asdict(train_config)),
-                    "encoder_config": _to_plain_data(asdict(encoder_config)),
-                    "intrinsic_config": _to_plain_data(asdict(intrinsic_config)),
-                    "data_config": _to_plain_data(asdict(data_config)),
-                    "main_checkpoint_path": str(train_config.main_checkpoint_path) if train_config.main_checkpoint_path else None,
-                    "distributed_runtime": {
-                        "enabled": runtime.enabled,
-                        "backend": runtime.backend,
-                        "world_size": runtime.world_size,
-                    },
-                    "effective_batch_size": effective_batch_size,
-                    "gradient_accumulation_steps": train_config.gradient_accumulation_steps,
-                }
+                checkpoint_payload = make_intrinsic_checkpoint_payload(
+                    epoch=epoch,
+                    checkpoint_best_val_loss=checkpoint_best_val_loss,
+                )
                 _save_checkpoint(output_dir / train_config.checkpoint_name, checkpoint_payload)
 
                 if train_config.save_best_checkpoint and val_loss is not None and val_loss < best_val_loss:
@@ -7586,9 +8903,14 @@ def train_intrinsic_model(
             "effective_batch_size": effective_batch_size,
             "gradient_accumulation_steps": train_config.gradient_accumulation_steps,
             "optimizer_steps": int(history[-1]["optimizer_steps"]) if history else 0,
+            "regularizer_optimizer_steps": int(history[-1]["regularizer_optimizer_steps"]) if history else 0,
             "global_batch_steps": int(history[-1]["global_batch_steps"]) if history else 0,
             "train_batches": total_train_batches,
             "val_batches": total_val_batches,
+            "skipped_train_groups": int(total_skipped_train_groups),
+            "skipped_train_microbatches": int(total_skipped_train_microbatches),
+            "skipped_val_groups": int(total_skipped_val_groups),
+            "skipped_val_microbatches": int(total_skipped_val_microbatches),
         }
         if runtime.is_primary:
             _print_json_block("intrinsic_training_result", result)

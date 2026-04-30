@@ -1,5 +1,5 @@
 Weather_State_Variables Project Summary
-Generated: 2026-04-19
+Generated: 2026-04-30
 
 This file summarizes the main engineering work completed so far in this repo.
 It is meant to be a practical snapshot of the current state of the project, not
@@ -7,14 +7,14 @@ an exhaustive changelog.
 
 1. Data pipeline and loading
 
-- Reworked the dataloader/prefetch path so sequential training can keep data in
-  RAM more effectively and reduce NVMe stalls.
-- Added ring-buffer style dynamic caching logic for time windows so batches can
-  be overwritten in RAM as they are consumed.
+- Reworked the dataloader and prefetch path so sequential training can keep
+  overlapping weather windows in RAM more effectively and reduce NVMe stalls.
+- Added ring-buffer style dynamic caching for time windows so batches can be
+  overwritten in RAM as they are consumed.
 - Preserved sequential locality for weather time series instead of breaking
   overlap reuse across many workers.
-- Current goal of this pipeline is to keep sample loading smoother and reduce
-  the bursty storage behavior that was throttling throughput after a few
+- The current goal of this pipeline is to keep sample loading smoother and
+  reduce the bursty storage behavior that was throttling throughput after a few
   hundred batches.
 
 2. Data normalization
@@ -43,20 +43,22 @@ an exhaustive changelog.
   main forecast model.
 - The decoder was changed so it depends on the bottleneck representation rather
   than relying on extra skip-style shortcuts across the split.
-- The temporal embedding (temb) remains algorithm-generated metadata, not an ERA
-  source variable.
+- The temporal embedding (temb) remains algorithm-generated metadata, not an
+  ERA source variable.
+- The main model bottleneck used for downstream intrinsic work is the output of
+  the second transformer block, exposed as `second_block_features`.
 
 5. Main model validation and rollout tooling
 
 - Added standalone main-model validation script:
-  scripts/validate_main.py
+  `scripts/validate_main.py`
 - Added rollout plotting and image export support.
 - Validation can save rollout plots with real input, real target, prediction,
   and denormalized error views.
 - Added standalone autoregressive rollout script:
-  scripts/rollout_main.py
+  `scripts/rollout_main.py`
 - Rollout exports each channel to its own folder with filenames like:
-  t3h.png, t6h.png, t9h.png, ...
+  `t3h.png`, `t6h.png`, `t9h.png`, ...
 - Rollout supports iterative one-step autoregressive prediction.
 
 6. Main model rollout with intrinsic chaining
@@ -65,9 +67,16 @@ an exhaustive changelog.
 - If an intrinsic checkpoint is supplied, rollout can run:
   main encoder -> intrinsic model -> main decoder
 - Added intrinsic application frequency control:
-  --intrinsic-frequency N
+  `--intrinsic-frequency N`
 - Example meaning:
   frequency 4 => use intrinsic on rollout steps 4, 8, 12, ...
+- Added optional intrinsic latent-space recording during rollout:
+  `--save-intrinsic-latent-plot`
+- When enabled with a 2D intrinsic bottleneck, rollout now saves:
+  `intrinsic_latent_trajectory.png`
+  `intrinsic_latent_trajectory.json`
+- The latent trajectory plot uses a cold-to-hot color ramp over time and arrows
+  to show temporal direction.
 
 7. Intrinsic model evolution
 
@@ -76,7 +85,9 @@ The intrinsic model went through several design iterations:
 - Initial transformer-based variants were discussed and partially implemented.
 - The current intrinsic model is a convolutional autoencoder rather than a
   transformer.
-- It reconstructs the main model encoder patch-grid representation.
+- Earlier intrinsic experiments targeted the patch-grid representation, but the
+  current intrinsic path correctly reconstructs the main model bottleneck:
+  `second_block_features`.
 - Large flatten-then-linear bottlenecks were replaced by convolutional
   bottleneck projection.
 - The current architecture uses:
@@ -90,46 +101,108 @@ The intrinsic model went through several design iterations:
 
 Current intrinsic-model config controls include:
 
-- feature_channels
-- resblocks_per_stage
-- d_intrinsic
-- num_groups
-- apply_tanh
+- `feature_channels`
+- `resblocks_per_stage`
+- `d_intrinsic`
+- `num_groups`
+- `apply_tanh`
 
-Important note:
+Important notes:
+
 - The intrinsic model is currently conv-based, not Swin-based and not using
   standard transformer encoder blocks anymore.
 - It does not use positional embeddings.
+- Current intrinsic checkpoints are meant to compress the true main-model
+  bottleneck, not the patch-grid features.
 
 8. Intrinsic training and validation
 
-- Added intrinsic training path using frozen main encoder features as the target
-  reconstruction space.
-- The intrinsic objective is standard MSE reconstruction of the encoder output.
+- Added intrinsic training path using frozen main-encoder bottleneck features as
+  the target reconstruction space.
 - The main encoder is frozen, but gradients are allowed to flow through the
   latent path as needed for reconstruction loss computation.
 - Added standalone intrinsic validation script:
-  scripts/validate_intrinsic.py
-- Validation supports a "chain" mode:
+  `scripts/validate_intrinsic.py`
+- Validation supports a `chain` mode:
   main encoder -> intrinsic -> main decoder
 - This chain mode can produce the same kind of forecast-style plots for
   qualitative inspection.
 
-9. Forecast/data semantics clarified
+8.1 Intrinsic losses
+
+- The intrinsic objective started as standard MSE reconstruction of the encoder
+  output.
+- Added space-filling regularization inspired by the NSV paper. The loss uses a
+  Sinkhorn transport distance between latent samples and a uniform reference
+  distribution on `[-1, 1]^d`.
+- Added smoothness regularization using one-step and two-step temporal hinge
+  constraints in latent space.
+- Added cyclic beta scheduling so reconstruction dominates early in a cycle and
+  the latent regularizers ramp in later.
+
+8.2 Grouped intrinsic regularizer path
+
+- Reworked intrinsic training so smoothness and space-filling are no longer
+  limited to a single per-GPU microbatch.
+- The trainer now treats one gradient-accumulation window as the true logical
+  regularizer batch.
+- It runs a GradCache-style two-pass scheme:
+  first pass caches `z_intrinsic`
+  grouped regularizer computes one cached latent gradient
+  second pass recomputes each microbatch and injects the cached latent gradient
+- This makes the temporal regularizer mathematically correct even when
+  `batch_size=2`, as long as the logical batch contains enough consecutive
+  samples.
+- DDP tail padding is masked out so duplicated trailing samples do not create
+  fake temporal neighbors or contaminate the space-filling distribution.
+
+8.3 Intrinsic training stability safeguards
+
+- Added full-precision intrinsic loss logging so tiny nonzero values are not
+  hidden by fixed `:.6f` formatting.
+- Added non-finite detection for grouped intrinsic training and validation.
+- If enabled, bad accumulation windows are skipped before `optimizer.step()` so
+  one unstable regularizer window does not poison the weights for all following
+  batches.
+- Added config control:
+  `train_intrinsic.skip_non_finite_batches`
+- The trainer now reports skipped train/validation groups and skipped
+  microbatches in epoch summaries and final result payloads.
+
+9. Bottleneck-compressor experiment
+
+- Added a separate bottleneck-compressor model used mainly as an experiment for
+  dimensionality-estimation behavior.
+- This model is distinct from the main intrinsic path.
+- It can load main-model encoder features, compress them, reconstruct them, and
+  can also be used as a latent source for intrinsic-dimension estimation.
+
+10. Latent dynamics model
+
+- Implemented a latent-dynamics training path based on the intrinsic bottleneck.
+- Added standalone training script:
+  `scripts/train_latent_dynamics.py`
+- The latent dynamics model uses a vector field over `z_intrinsic` and is
+  trained with rollout-style trajectory loss rather than only local
+  finite-difference regression.
+- Added latent-trajectory preprocessing, optional large-jump filtering, cyclic
+  rho scheduling, and fixed-step RK4 integration.
+
+11. Forecast and data semantics clarified
 
 Clarified config behavior for:
 
-- input_time_offsets_hours
-- lead_time_hours
-- forecast_steps
-- sample_stride_hours
+- `input_time_offsets_hours`
+- `lead_time_hours`
+- `forecast_steps`
+- `sample_stride_hours`
 
 Example:
 
-input_time_offsets_hours: [-3, 0]
-lead_time_hours: 3
-forecast_steps: 2
-sample_stride_hours: 1
+`input_time_offsets_hours: [-3, 0]`
+`lead_time_hours: 3`
+`forecast_steps: 2`
+`sample_stride_hours: 1`
 
 This means:
 
@@ -137,62 +210,61 @@ This means:
 - targets are +3h and +6h
 - anchors advance every 1 hour through the dataset
 
-10. Scaling-law and model size support
+12. Scaling-law and model-size support
 
 - Added utilities to instantiate the model on CPU and inspect parameter count.
-- Used this to reason about model scale versus number of training tokens/patches.
+- Used this to reason about model scale versus number of training tokens or
+  patches.
 - This was intended for scaling-law sanity checks without occupying GPU memory.
 
-11. Intrinsic-dimension estimation
+13. Intrinsic-dimension estimation
 
-This area saw the most recent development.
+13.1 Initial estimator
 
-11.1 Initial estimator
-
-- Implemented Levina-Bickel intrinsic-dimension estimation for the main model
+- Implemented Levina-Bickel intrinsic-dimension estimation for the main-model
   latent.
 - The main latent source defaults to the output of the second transformer block.
 - Latents are flattened to vectors before estimation.
 
-11.2 Two-NN estimator
+13.2 Two-NN estimator
 
 - Added Two-NN as an alternative and later made it the default method.
-- Implemented the Two-NN fit using the r2/r1 ratio and origin-constrained line
+- Implemented the Two-NN fit using the `r2/r1` ratio and origin-constrained line
   fit from the paper.
 - Added configurable tail trimming:
-  --two-nn-discard-fraction
+  `--two-nn-discard-fraction`
 
-11.3 Effective-ID plateau search
+13.3 Effective-ID plateau search
 
-- Added automated plateau search to estimate a relevant/effective intrinsic
+- Added automated plateau search to estimate a relevant or effective intrinsic
   dimension for learning rather than only a single full-pool estimate.
 - Plateau search uses one cached latent pool and does not regenerate samples for
   each subset size.
-- If max_samples is 1024, the code generates those 1024 samples once and then
+- If `max_samples` is 1024, the code generates those 1024 samples once and then
   uses random subsets from that same pool for sizes like 128, 256, 512, 1024.
 - Added automatic doubling schedule and optional explicit subset-size override.
-- Plateau output includes a recommended_effective_dimension.
+- Plateau output includes a `recommended_effective_dimension`.
 
-11.4 Multi-GPU intrinsic-dimension estimation
+13.4 Multi-GPU intrinsic-dimension estimation
 
-- Added support for distributed latent generation with torchrun.
-- batch_size is interpreted as per-GPU batch size.
-- effective batch size is now:
-  batch_size * world_size
+- Added support for distributed latent generation with `torchrun`.
+- `batch_size` is interpreted as per-GPU batch size.
+- Effective batch size is:
+  `batch_size * world_size`
 - A fixed shard sampler avoids padding and duplicate sample generation across
   ranks.
 - Rank 0 gathers latent shards and performs the final intrinsic-dimension
   calculation.
 
-11.5 Progress reporting
+13.5 Progress reporting
 
 - Added a progress bar for latent-sample generation.
 - In multi-GPU mode the progress reflects the total global sample count.
 - JSON mode suppresses the progress bar automatically.
 - Manual disable flag:
-  --no-progress
+  `--no-progress`
 
-12. Current behavior of intrinsic-dimension estimation
+14. Current behavior of intrinsic-dimension estimation
 
 Current execution stages:
 
@@ -206,56 +278,66 @@ Current execution stages:
 
 Important caveat:
 
-- The actual distance-matrix calculation for Two-NN / Levina-Bickel is still
+- The actual distance-matrix calculation for Two-NN or Levina-Bickel is still
   CPU-side on rank 0.
-- For large max_samples (for example 4096) this can take a long time after the
-  progress bar reaches 100%.
+- For large `max_samples` values such as 4096, this can take a long time after
+  the progress bar reaches 100%.
 - This is not a deadlock by default; it is usually the expensive pairwise
   distance step.
 
-13. Distributed runtime fixes
+15. Distributed runtime fixes
 
-- Fixed NCCL device binding warnings by explicitly binding init_process_group to
-  the current CUDA device when supported.
+- Fixed NCCL device binding warnings by explicitly binding
+  `init_process_group` to the current CUDA device when supported.
 - Added a helper so distributed barriers use the correct CUDA device id.
 - This makes the multi-GPU intrinsic-dimension path safer and less likely to
   hang because of ambiguous device mapping.
 
-14. Useful scripts currently available
+16. Useful scripts currently available
 
-- scripts/train_main.py
-- scripts/validate_main.py
-- scripts/rollout_main.py
-- scripts/validate_intrinsic.py
-- scripts/estimate_intrinsic_dimension.py
+- `scripts/train_main.py`
+- `scripts/validate_main.py`
+- `scripts/rollout_main.py`
+- `scripts/train_intrinsic.py`
+- `scripts/validate_intrinsic.py`
+- `scripts/train_latent_dynamics.py`
+- `scripts/estimate_intrinsic_dimension.py`
 
-15. Files worth knowing
+17. Files worth knowing
 
-- configs/model_config.yaml
+- `configs/model_config.yaml`
   Main central config file.
-- weather_state_variables/training/pipeline.py
-  Most training, validation, rollout, checkpoint, and intrinsic-dimension logic.
-- weather_state_variables/models/fuxi_lower_res.py
+- `weather_state_variables/training/pipeline.py`
+  Most training, validation, rollout, checkpoint, intrinsic-regularizer,
+  latent-dynamics, and intrinsic-dimension logic.
+- `weather_state_variables/models/fuxi_lower_res.py`
   Main forecast model and encoder/decoder bottleneck behavior.
-- weather_state_variables/models/fuxi_intrinsic.py
+- `weather_state_variables/models/fuxi_intrinsic.py`
   Current intrinsic conv autoencoder.
-- tests/test_training_pipeline.py
+- `weather_state_variables/models/latent_dynamics.py`
+  Current latent-dynamics model.
+- `tests/test_training_pipeline.py`
   Most regression tests for recent pipeline work.
 
-16. Current open caveats / next useful improvements
+18. Current open caveats and next useful improvements
 
 - The intrinsic-dimension distance computation is still CPU-bound and may need
   chunking or a GPU-backed implementation for very large sample counts.
-- A second progress indicator for the pairwise-distance / plateau stage would
+- A second progress indicator for the pairwise-distance or plateau stage would
   make long runs easier to interpret.
 - Saving a plateau plot (dimension estimate vs sample size) would make the
   effective-ID selection easier to inspect visually.
+- The intrinsic non-finite skip path is a safety net, not a substitute for
+  fixing unstable hyperparameters. If many windows are skipped, the regularizer
+  configuration still needs tuning.
+- The smoothness startup warning in intrinsic training still reflects raw
+  `batch_size` rather than full logical-batch size and should be updated.
 
-17. Practical interpretation of recent intrinsic-dimension results
+19. Practical interpretation of recent intrinsic-dimension results
 
 - The single-shot full-pool Two-NN estimate can be notably higher than the
   plateau-based effective dimension.
-- For learning, the plateau-based recommended_effective_dimension is the more
+- For learning, the plateau-based `recommended_effective_dimension` is the more
   relevant quantity.
 - If the full-pool estimate is much larger than the plateau value, that usually
   suggests finer-scale or noisier directions become visible at larger sample

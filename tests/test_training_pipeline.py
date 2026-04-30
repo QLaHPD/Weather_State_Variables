@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 import unittest
 
@@ -79,6 +80,196 @@ class _ZeroForecastModel(nn.Module):
 
 
 class TestTrainingSmoke(unittest.TestCase):
+    def test_dataloader_batch_plan_entries_marks_contiguous_sampler_padding_invalid(self) -> None:
+        class _TinyDataset(Dataset[dict[str, torch.Tensor]]):
+            def __len__(self) -> int:
+                return 5
+
+            def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+                return {"value": torch.tensor([float(index)], dtype=torch.float32)}
+
+        dataset = _TinyDataset()
+        sampler = training_pipeline.ContiguousDistributedSampler(
+            dataset,
+            num_replicas=2,
+            rank=1,
+        )
+        loader = DataLoader(
+            dataset,
+            batch_size=2,
+            shuffle=False,
+            sampler=sampler,
+        )
+
+        batch_plan_entries = training_pipeline._dataloader_batch_plan_entries(
+            loader,
+            max_batches=None,
+        )
+        self.assertEqual(
+            batch_plan_entries,
+            [
+                ([3, 4], [True, True]),
+                ([4], [False]),
+            ],
+        )
+
+    def test_masked_reconstruction_loss_terms_ignore_invalid_samples(self) -> None:
+        prediction = torch.tensor(
+            [
+                [[[1.0]]],
+                [[[10.0]]],
+                [[[3.0]]],
+            ]
+        )
+        target = torch.zeros_like(prediction)
+        valid_mask = torch.tensor([True, False, True])
+
+        terms = training_pipeline._masked_reconstruction_loss_terms(
+            prediction,
+            target,
+            valid_mask,
+        )
+
+        self.assertEqual(int(terms["count"]), 2)
+        self.assertAlmostEqual(float(terms["sum"].item()), 10.0, places=5)
+        self.assertAlmostEqual(float(terms["mean"].item()), 5.0, places=5)
+
+    def test_intrinsic_group_regularizer_ignores_invalid_tail_padding(self) -> None:
+        runtime = training_pipeline.DistributedRuntime(
+            enabled=False,
+            backend=None,
+            rank=0,
+            local_rank=0,
+            world_size=1,
+            device=torch.device("cpu"),
+        )
+        train_config = IntrinsicTrainingConfig(
+            smoothness_weight=1.0,
+            smoothness_l0=0.25,
+            smoothness_eta=1.0,
+            smoothness_use_tanh_projection=False,
+            space_filling_weight=0.0,
+        )
+        local_z_intrinsic = torch.tensor(
+            [
+                [0.0],
+                [1.0],
+                [100.0],
+            ],
+            dtype=torch.float32,
+        )
+        local_anchor_indices = torch.tensor([0, 1, 1], dtype=torch.long)
+        local_valid_mask = torch.tensor([True, True, False], dtype=torch.bool)
+
+        terms = training_pipeline._intrinsic_group_regularizer_cached_grad(
+            local_z_intrinsic,
+            local_anchor_indices,
+            local_valid_mask=local_valid_mask,
+            runtime=runtime,
+            train_config=train_config,
+            expected_stride_steps=1,
+            space_filling_seed=None,
+            optimizer_step=0,
+        )
+
+        self.assertAlmostEqual(float(terms["smoothness_loss"].item()), 0.75, places=5)
+        self.assertAlmostEqual(float(terms["total_regularizer_loss"].item()), 0.75, places=5)
+        self.assertAlmostEqual(
+            float(terms["cached_z_grad"][2].abs().sum().item()),
+            0.0,
+            places=7,
+        )
+
+    def test_non_finite_tensor_names_reports_bad_tensors(self) -> None:
+        bad_names = training_pipeline._non_finite_tensor_names(
+            {
+                "finite": torch.tensor([1.0, 2.0], dtype=torch.float32),
+                "nan_tensor": torch.tensor([float("nan")], dtype=torch.float32),
+                "inf_tensor": torch.tensor([float("inf")], dtype=torch.float32),
+            }
+        )
+        self.assertEqual(bad_names, ["nan_tensor", "inf_tensor"])
+
+    def test_module_non_finite_gradient_parameter_names_reports_bad_grads(self) -> None:
+        module = nn.Linear(2, 2)
+        module.weight.grad = torch.full_like(module.weight, float("nan"))
+        module.bias.grad = torch.ones_like(module.bias)
+
+        bad_names = training_pipeline._module_non_finite_gradient_parameter_names(module)
+        self.assertEqual(bad_names, ["weight"])
+
+    def test_run_main_rollout_step_with_optional_intrinsic_trace(self) -> None:
+        class _DummyEncoder(nn.Module):
+            def forward(
+                self,
+                x: torch.Tensor,
+                temb: torch.Tensor,
+                static_features: torch.Tensor | None = None,
+            ) -> training_pipeline.FuXiEncoderOutput:
+                del temb, static_features
+                features = x.sum(dim=1)
+                return training_pipeline.FuXiEncoderOutput(
+                    second_block_features=features,
+                    output_size=tuple(int(value) for value in x.shape[-2:]),
+                )
+
+        class _DummyDecoder(nn.Module):
+            def forward(self, encoded: training_pipeline.FuXiEncoderOutput) -> torch.Tensor:
+                return encoded.second_block_features.unsqueeze(1)
+
+        class _DummyMainModel(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.encoder = _DummyEncoder()
+                self.decoder = _DummyDecoder()
+
+            def forward(
+                self,
+                x: torch.Tensor,
+                temb: torch.Tensor,
+                static_features: torch.Tensor | None = None,
+            ) -> dict[str, torch.Tensor]:
+                encoded = self.encoder(x, temb, static_features=static_features)
+                return {"forecast": self.decoder(encoded)}
+
+        class _DummyIntrinsicModel(nn.Module):
+            def forward(self, second_block_features: torch.Tensor) -> dict[str, torch.Tensor]:
+                batch_size = int(second_block_features.shape[0])
+                pooled = second_block_features.mean(dim=(1, 2, 3), keepdim=False).reshape(batch_size, 1)
+                return {
+                    "z_intrinsic": torch.cat([pooled, pooled + 1.0], dim=1),
+                    "second_block_features_recon": second_block_features + 5.0,
+                }
+
+        main_model = _DummyMainModel()
+        intrinsic_model = _DummyIntrinsicModel()
+        model_inputs = torch.ones(1, 2, 1, 2, 2)
+        temb = torch.zeros(1, 12)
+
+        traced_only = training_pipeline._run_main_rollout_step_with_optional_intrinsic_trace(
+            main_model,
+            intrinsic_model,
+            model_inputs=model_inputs,
+            temb=temb,
+            static_features=None,
+            use_intrinsic_for_forecast=False,
+            record_intrinsic_latent=True,
+        )
+        used_intrinsic = training_pipeline._run_main_rollout_step_with_optional_intrinsic_trace(
+            main_model,
+            intrinsic_model,
+            model_inputs=model_inputs,
+            temb=temb,
+            static_features=None,
+            use_intrinsic_for_forecast=True,
+            record_intrinsic_latent=True,
+        )
+
+        self.assertTrue(torch.allclose(traced_only["forecast"], torch.full((1, 1, 1, 2, 2), 2.0)))
+        self.assertTrue(torch.allclose(used_intrinsic["forecast"], torch.full((1, 1, 1, 2, 2), 7.0)))
+        self.assertTrue(torch.allclose(traced_only["z_intrinsic"], torch.tensor([[2.0, 3.0]])))
+        self.assertTrue(torch.allclose(used_intrinsic["z_intrinsic"], torch.tensor([[2.0, 3.0]])))
+
     def test_training_configs_expose_gradient_accumulation(self) -> None:
         main_config = MainTrainingConfig.from_yaml()
         intrinsic_config = IntrinsicTrainingConfig.from_yaml()
@@ -155,6 +346,10 @@ class TestTrainingSmoke(unittest.TestCase):
             intrinsic_config.space_filling_use_tanh_projection,
             bool(intrinsic_yaml.get("space_filling_use_tanh_projection", True)),
         )
+        self.assertEqual(
+            intrinsic_config.skip_non_finite_batches,
+            bool(intrinsic_yaml.get("skip_non_finite_batches", True)),
+        )
         self.assertGreaterEqual(compressor_config.gradient_accumulation_steps, 1)
         self.assertEqual(
             compressor_config.save_epoch_checkpoint,
@@ -203,7 +398,7 @@ class TestTrainingSmoke(unittest.TestCase):
 
     def test_build_intrinsic_training_objects_preserves_intrinsic_feature_controls(self) -> None:
         config_path, intrinsic_yaml = load_config_section("intrinsic_model")
-        _, encoder_config, intrinsic_config, _data_config, runtime, _model_dtype, _amp_dtype = (
+        train_config, encoder_config, intrinsic_config, _data_config, runtime, _model_dtype, _amp_dtype = (
             training_pipeline._build_intrinsic_training_objects(config_path)
         )
 
@@ -226,8 +421,30 @@ class TestTrainingSmoke(unittest.TestCase):
             self.assertEqual(intrinsic_config.feature_channels, int(intrinsic_yaml["feature_channels"]))
             self.assertEqual(intrinsic_config.spatial_size, encoder_config.latent_grid)
             self.assertEqual(intrinsic_config.resblocks_per_stage, expected_resblocks)
+            self.assertEqual(intrinsic_config.sine_omega_0, float(intrinsic_yaml.get("sine_omega_0", 1.0)))
+            self.assertEqual(
+                train_config.regularizer_warmup_epochs,
+                int(load_config_section("train_intrinsic")[1].get("regularizer_warmup_epochs", 0)),
+            )
         finally:
             training_pipeline._cleanup_distributed_runtime(runtime)
+
+    def test_build_runtime_intrinsic_config_targets_encoder_latent_grid(self) -> None:
+        encoder_config = replace(
+            FuXiLowerResConfig.from_yaml(),
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        intrinsic_config = training_pipeline._build_runtime_intrinsic_config(
+            "configs/model_config.yaml",
+            encoder_config=encoder_config,
+            runtime_device=torch.device("cpu"),
+            model_dtype=torch.float32,
+        )
+
+        self.assertEqual(intrinsic_config.input_channels, encoder_config.embed_dim)
+        self.assertEqual(intrinsic_config.spatial_size, encoder_config.latent_grid)
+        self.assertNotEqual(intrinsic_config.spatial_size, encoder_config.patch_grid)
 
     def test_build_bottleneck_compressor_training_objects_targets_encoder_bottleneck(self) -> None:
         config_path, compressor_yaml = load_config_section("bottleneck_compressor_model")
@@ -412,7 +629,7 @@ class TestTrainingSmoke(unittest.TestCase):
         self.assertEqual(specs[len(data_config.pressure_levels)].folder_name, "temperature_50hpa")
         self.assertEqual(specs[-1].folder_name, "total_precipitation")
 
-    def test_should_use_intrinsic_for_rollout_step_respects_frequency(self) -> None:
+    def test_should_use_intrinsic_for_rollout_step_requires_explicit_frequency(self) -> None:
         dummy_model = nn.Identity()
 
         self.assertFalse(
@@ -422,7 +639,7 @@ class TestTrainingSmoke(unittest.TestCase):
                 intrinsic_frequency=None,
             )
         )
-        self.assertTrue(
+        self.assertFalse(
             training_pipeline._should_use_intrinsic_for_rollout_step(
                 rollout_step=0,
                 intrinsic_model=dummy_model,
@@ -448,6 +665,32 @@ class TestTrainingSmoke(unittest.TestCase):
                 rollout_step=7,
                 intrinsic_model=dummy_model,
                 intrinsic_frequency=4,
+            )
+        )
+
+    def test_intrinsic_regularizers_activate_after_warmup_epochs(self) -> None:
+        train_config = IntrinsicTrainingConfig(
+            smoothness_weight=1.0,
+            space_filling_weight=1.0,
+            regularizer_warmup_epochs=3,
+        )
+
+        self.assertFalse(
+            training_pipeline._intrinsic_regularizers_active_for_epoch(
+                train_config,
+                epoch=1,
+            )
+        )
+        self.assertFalse(
+            training_pipeline._intrinsic_regularizers_active_for_epoch(
+                train_config,
+                epoch=3,
+            )
+        )
+        self.assertTrue(
+            training_pipeline._intrinsic_regularizers_active_for_epoch(
+                train_config,
+                epoch=4,
             )
         )
 
@@ -1008,6 +1251,30 @@ class TestTrainingSmoke(unittest.TestCase):
         self.assertEqual(report["second_block_features"]["shape"], [2, 16, 4, 8])
         self.assertEqual(report["intrinsic_output"]["z_intrinsic"]["shape"], [2, 3])
         self.assertEqual(report["intrinsic_output"]["second_block_features_recon"]["shape"], [2, 16, 4, 8])
+
+    def test_intrinsic_sine_latent_is_bounded_without_tanh(self) -> None:
+        intrinsic_config = FuXiIntrinsicConfig(
+            input_channels=8,
+            feature_channels=8,
+            spatial_size=(4, 8),
+            d_intrinsic=3,
+            depths=(1, 1),
+            num_heads=4,
+            num_groups=8,
+            mlp_hidden_dim=32,
+            sine_omega_0=1.0,
+            apply_tanh=False,
+            device="cpu",
+            dtype=torch.float32,
+        )
+        intrinsic_model = FuXiIntrinsic(intrinsic_config)
+        feature_grid = torch.randn(2, 8, 4, 8, dtype=torch.float32)
+
+        z_intrinsic = intrinsic_model.encode(feature_grid)
+
+        self.assertEqual(tuple(z_intrinsic.shape), (2, 3))
+        self.assertLessEqual(float(torch.max(z_intrinsic).item()), 1.0)
+        self.assertGreaterEqual(float(torch.min(z_intrinsic).item()), -1.0)
 
     def test_bottleneck_compressor_smoke_test_runs_on_tiny_models(self) -> None:
         encoder_config = FuXiLowerResConfig(

@@ -58,7 +58,31 @@ def parse_args() -> argparse.Namespace:
         "--chunk-hours",
         type=int,
         default=24,
-        help="Number of hourly timesteps to copy per write chunk.",
+        help=(
+            "Legacy compatibility option. The downloader now writes each timestep as soon "
+            "as it is ready, so this no longer controls the on-disk write granularity."
+        ),
+    )
+    parser.add_argument(
+        "--variable-workers",
+        "--surface-workers",
+        "--surface-variable-workers",
+        dest="variable_workers",
+        type=int,
+        default=5,
+        help=(
+            "Number of concurrent connections to use when loading variables across "
+            "the rolling download window."
+        ),
+    )
+    parser.add_argument(
+        "--prefetch-chunks",
+        type=int,
+        default=4,
+        help=(
+            "How many future timesteps to keep in the fetch queue at once. "
+            "Timesteps are still written to disk strictly in time order."
+        ),
     )
     parser.add_argument(
         "--gcs-token",
@@ -111,6 +135,8 @@ def main() -> None:
                     "start_time_override": args.start_time,
                     "end_time_override": args.end_time,
                     "chunk_hours": args.chunk_hours,
+                    "variable_workers": args.variable_workers,
+                    "prefetch_chunks": args.prefetch_chunks,
                     "skip_statics": args.skip_statics,
                     "resume": args.resume,
                     "progress_enabled": not args.no_progress,
@@ -140,6 +166,8 @@ def main() -> None:
         gcs_token=args.gcs_token,
         verbose=True,
         show_progress=not args.no_progress,
+        variable_download_workers=args.variable_workers,
+        prefetch_chunk_count=args.prefetch_chunks,
     )
     print(json.dumps(summary, indent=2, sort_keys=True))
 

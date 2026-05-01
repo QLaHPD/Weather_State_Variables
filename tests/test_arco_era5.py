@@ -10,6 +10,7 @@ import pandas as pd
 import torch
 import xarray as xr
 
+import weather_state_variables.data.arco_era5 as arco_era5
 from weather_state_variables.data import (
     ArcoEra5DownloadPlan,
     ArcoEra5FuXiDataConfig,
@@ -30,8 +31,8 @@ class TestArcoEra5Helpers(unittest.TestCase):
     def test_config_loads_from_yaml(self) -> None:
         config = ArcoEra5FuXiDataConfig.from_yaml()
 
-        self.assertEqual(config.input_time_offsets_hours, (-1, 0))
-        self.assertEqual(config.lead_time_hours, 1)
+        self.assertEqual(config.input_time_offsets_hours, (-3, 0))
+        self.assertEqual(config.lead_time_hours, 3)
         self.assertEqual(config.forecast_steps, 2)
         self.assertEqual(config.pressure_levels[0], 50)
         self.assertEqual(config.pressure_levels[-1], 1000)
@@ -141,8 +142,8 @@ class TestArcoEra5Helpers(unittest.TestCase):
 
         self.assertEqual(str(window.anchor_start), "2000-01-01 00:00:00")
         self.assertEqual(str(window.anchor_end), "2012-12-31 23:00:00")
-        self.assertEqual(str(window.raw_start), "1999-12-31 23:00:00")
-        self.assertEqual(str(window.raw_end), "2013-01-01 01:00:00")
+        self.assertEqual(str(window.raw_start), "1999-12-31 21:00:00")
+        self.assertEqual(str(window.raw_end), "2013-01-01 05:00:00")
 
     def test_contiguous_distributed_sampler_assigns_contiguous_ranges(self) -> None:
         dataset = list(range(10))
@@ -471,6 +472,7 @@ class TestArcoEra5Helpers(unittest.TestCase):
                 chunk_size=1,
                 verbose=False,
                 show_progress=False,
+                surface_variable_download_workers=3,
             )
             second_summary = download_arco_era5_subset(
                 output_path,
@@ -482,13 +484,15 @@ class TestArcoEra5Helpers(unittest.TestCase):
                 chunk_size=1,
                 verbose=False,
                 show_progress=False,
+                surface_variable_download_workers=3,
             )
 
-            downloaded = xr.open_zarr(output_path, consolidated=None)
+            downloaded = xr.open_zarr(output_path, consolidated=False)
 
             self.assertEqual(first_summary["time_steps"], 2)
             self.assertEqual(second_summary["time_steps"], 4)
             self.assertEqual(second_summary["resumed_from_time_steps"], 2)
+            self.assertEqual(second_summary["surface_variable_download_workers"], 3)
             self.assertEqual(int(downloaded.sizes["time"]), 4)
             self.assertIn("relative_humidity", downloaded.data_vars)
             self.assertNotIn("specific_humidity", downloaded.data_vars)
@@ -497,6 +501,216 @@ class TestArcoEra5Helpers(unittest.TestCase):
             self.assertEqual(str(pd.Timestamp(downloaded["time"].values[0])), "2018-01-01 00:00:00")
             self.assertEqual(str(pd.Timestamp(downloaded["time"].values[-1])), "2018-01-01 03:00:00")
             self.assertGreater(float(downloaded["latitude"].values[0]), float(downloaded["latitude"].values[-1]))
+
+    def test_load_download_source_chunk_parallelizes_surface_and_static_fields(self) -> None:
+        times = pd.date_range("2018-01-01 00:00:00", periods=3, freq="h")
+        levels = np.array([50, 1000], dtype=np.int64)
+        latitude = np.array([-90.0, 0.0, 90.0], dtype=np.float32)
+        longitude = np.array([0.0, 1.0], dtype=np.float32)
+
+        source_ds = xr.Dataset(
+            data_vars={
+                "geopotential": (
+                    ("time", "level", "latitude", "longitude"),
+                    np.arange(times.size * levels.size * latitude.size * longitude.size, dtype=np.float32).reshape(
+                        times.size,
+                        levels.size,
+                        latitude.size,
+                        longitude.size,
+                    ),
+                ),
+                "temperature": (
+                    ("time", "level", "latitude", "longitude"),
+                    np.arange(times.size * levels.size * latitude.size * longitude.size, dtype=np.float32).reshape(
+                        times.size,
+                        levels.size,
+                        latitude.size,
+                        longitude.size,
+                    )
+                    + 273.15,
+                ),
+                "2m_temperature": (
+                    ("time", "latitude", "longitude"),
+                    np.arange(times.size * latitude.size * longitude.size, dtype=np.float32).reshape(
+                        times.size,
+                        latitude.size,
+                        longitude.size,
+                    ),
+                ),
+                "mean_sea_level_pressure": (
+                    ("time", "latitude", "longitude"),
+                    np.arange(times.size * latitude.size * longitude.size, dtype=np.float32).reshape(
+                        times.size,
+                        latitude.size,
+                        longitude.size,
+                    )
+                    + 100000.0,
+                ),
+                "land_sea_mask": (
+                    ("latitude", "longitude"),
+                    np.ones((latitude.size, longitude.size), dtype=np.float32),
+                ),
+            },
+            coords={
+                "time": times,
+                "level": levels,
+                "latitude": latitude,
+                "longitude": longitude,
+            },
+        )
+
+        plan = ArcoEra5DownloadPlan(
+            source_pressure_variables=("geopotential", "temperature"),
+            source_surface_variables=("2m_temperature", "mean_sea_level_pressure"),
+            source_static_variables=("land_sea_mask",),
+            output_dynamic_variables=("geopotential", "temperature", "2m_temperature", "mean_sea_level_pressure"),
+            derive_relative_humidity=False,
+            pressure_levels=(50, 1000),
+        )
+
+        chunk = arco_era5._load_download_source_chunk(
+            source_ds,
+            plan,
+            start_index=0,
+            stop_index=2,
+            include_static_sources=True,
+            surface_variable_download_workers=3,
+        )
+
+        self.assertEqual(set(chunk.data_vars), {"geopotential", "temperature", "2m_temperature", "mean_sea_level_pressure", "land_sea_mask"})
+        self.assertEqual(tuple(chunk["geopotential"].shape), (2, 2, 3, 2))
+        self.assertEqual(tuple(chunk["2m_temperature"].shape), (2, 3, 2))
+        self.assertEqual(tuple(chunk["land_sea_mask"].shape), (3, 2))
+
+    def test_build_download_chunk_dataset_keeps_specific_humidity_when_requested(self) -> None:
+        times = pd.date_range("2018-01-01 00:00:00", periods=1, freq="h")
+        levels = np.array([50, 1000], dtype=np.int64)
+        latitude = np.array([-90.0, 90.0], dtype=np.float32)
+        longitude = np.array([0.0, 1.0], dtype=np.float32)
+
+        source_chunk = xr.Dataset(
+            data_vars={
+                "temperature": (
+                    ("time", "level", "latitude", "longitude"),
+                    np.full((1, 2, 2, 2), 290.0, dtype=np.float32),
+                ),
+                "specific_humidity": (
+                    ("time", "level", "latitude", "longitude"),
+                    np.full((1, 2, 2, 2), 0.008, dtype=np.float32),
+                ),
+                "2m_temperature": (
+                    ("time", "latitude", "longitude"),
+                    np.full((1, 2, 2), 280.0, dtype=np.float32),
+                ),
+            },
+            coords={
+                "time": times,
+                "level": levels,
+                "latitude": latitude,
+                "longitude": longitude,
+            },
+        )
+        plan = ArcoEra5DownloadPlan(
+            source_pressure_variables=("temperature", "specific_humidity"),
+            source_surface_variables=("2m_temperature",),
+            source_static_variables=(),
+            output_dynamic_variables=("temperature", "specific_humidity", "relative_humidity", "2m_temperature"),
+            derive_relative_humidity=True,
+            pressure_levels=(50, 1000),
+        )
+        config = ArcoEra5FuXiDataConfig(
+            upper_air_variables=("temperature", "specific_humidity", "relative_humidity"),
+            surface_variables=("2m_temperature",),
+        )
+
+        output = arco_era5._build_download_chunk_dataset(
+            source_chunk,
+            plan,
+            config,
+            include_static_sources=False,
+        )
+
+        self.assertIn("specific_humidity", output.data_vars)
+        self.assertIn("relative_humidity", output.data_vars)
+
+    def test_download_writer_squeezes_time_dependent_static_sources(self) -> None:
+        times = pd.date_range("2018-01-01 00:00:00", periods=1, freq="h")
+        levels = np.array([50, 1000], dtype=np.int64)
+        latitude = np.array([-90.0, 90.0], dtype=np.float32)
+        longitude = np.array([0.0, 1.0], dtype=np.float32)
+        selected = xr.Dataset(
+            coords={
+                "time": times,
+                "level": levels,
+                "latitude": latitude,
+                "longitude": longitude,
+            }
+        )
+        plan = ArcoEra5DownloadPlan(
+            source_pressure_variables=("temperature",),
+            source_surface_variables=("2m_temperature",),
+            source_static_variables=("land_sea_mask",),
+            output_dynamic_variables=("temperature", "2m_temperature"),
+            derive_relative_humidity=False,
+            pressure_levels=(50, 1000),
+        )
+        config = ArcoEra5FuXiDataConfig(
+            upper_air_variables=("temperature",),
+            surface_variables=("2m_temperature",),
+            static_variables=("land_sea_mask",),
+        )
+        output_chunk = xr.Dataset(
+            data_vars={
+                "temperature": (
+                    ("time", "level", "latitude", "longitude"),
+                    np.ones((1, 2, 2, 2), dtype=np.float32),
+                ),
+                "2m_temperature": (
+                    ("time", "latitude", "longitude"),
+                    np.ones((1, 2, 2), dtype=np.float32) * 2.0,
+                ),
+                "land_sea_mask": (
+                    ("time", "latitude", "longitude"),
+                    np.ones((1, 2, 2), dtype=np.float32) * 3.0,
+                ),
+            },
+            coords={
+                "time": times,
+                "level": levels,
+                "latitude": latitude,
+                "longitude": longitude,
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "download.zarr"
+            arco_era5._initialize_download_zarr_store(
+                output_path,
+                selected,
+                plan,
+                config,
+                include_static_sources=True,
+                total_time_size=1,
+                attrs={},
+            )
+            root = arco_era5._open_download_zarr_store_for_writes(output_path, {})
+            arco_era5._write_download_step_to_zarr(
+                root,
+                output_chunk,
+                arco_era5._DownloadStepRequest(
+                    step_number=1,
+                    time_index=0,
+                    time_value=pd.Timestamp(times[0]),
+                    variable_names=("temperature", "2m_temperature", "land_sea_mask"),
+                    include_static_sources=True,
+                ),
+                plan,
+            )
+            downloaded = xr.open_zarr(output_path, consolidated=False)
+
+            self.assertEqual(tuple(downloaded["land_sea_mask"].dims), ("latitude", "longitude"))
+            self.assertEqual(tuple(downloaded["land_sea_mask"].shape), (2, 2))
+            self.assertTrue(np.allclose(downloaded["land_sea_mask"].values, 3.0))
 
     def test_repair_local_zarr_time_consistency_trims_longer_arrays(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

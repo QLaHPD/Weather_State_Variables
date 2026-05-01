@@ -18,11 +18,10 @@ forecast_model:
   dtype: float32
 
 intrinsic_model:
-  feature_channels: 1024
+  feature_channels: 256
   resblocks_per_stage: [2, 2, 2]
-  d_intrinsic: 64
+  d_intrinsic: 3
   num_groups: 32
-  sine_omega_0: 1.0
   apply_tanh: false
   device: meta
   dtype: float32
@@ -135,7 +134,7 @@ train_intrinsic:
   space_filling_sinkhorn_iters: 200
   space_filling_reference_sample_count: null
   space_filling_use_tanh_projection: true
-  regularizer_warmup_epochs: 3
+  regularizer_warmup_epochs: 1
   space_filling_beta_ramp_optimizer_steps: 4000
   space_filling_beta_hold_optimizer_steps: 4000
   skip_non_finite_batches: true

@@ -421,7 +421,6 @@ class TestTrainingSmoke(unittest.TestCase):
             self.assertEqual(intrinsic_config.feature_channels, int(intrinsic_yaml["feature_channels"]))
             self.assertEqual(intrinsic_config.spatial_size, encoder_config.latent_grid)
             self.assertEqual(intrinsic_config.resblocks_per_stage, expected_resblocks)
-            self.assertEqual(intrinsic_config.sine_omega_0, float(intrinsic_yaml.get("sine_omega_0", 1.0)))
             self.assertEqual(
                 train_config.regularizer_warmup_epochs,
                 int(load_config_section("train_intrinsic")[1].get("regularizer_warmup_epochs", 0)),
@@ -1252,7 +1251,7 @@ class TestTrainingSmoke(unittest.TestCase):
         self.assertEqual(report["intrinsic_output"]["z_intrinsic"]["shape"], [2, 3])
         self.assertEqual(report["intrinsic_output"]["second_block_features_recon"]["shape"], [2, 16, 4, 8])
 
-    def test_intrinsic_sine_latent_is_bounded_without_tanh(self) -> None:
+    def test_intrinsic_tanh_latent_is_bounded(self) -> None:
         intrinsic_config = FuXiIntrinsicConfig(
             input_channels=8,
             feature_channels=8,
@@ -1262,8 +1261,7 @@ class TestTrainingSmoke(unittest.TestCase):
             num_heads=4,
             num_groups=8,
             mlp_hidden_dim=32,
-            sine_omega_0=1.0,
-            apply_tanh=False,
+            apply_tanh=True,
             device="cpu",
             dtype=torch.float32,
         )

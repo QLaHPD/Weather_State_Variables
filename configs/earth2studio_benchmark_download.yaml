@@ -1,0 +1,35 @@
+data:
+  dataset_url: gs://gcp-public-data-arco-era5/ar/full_37-1h-0p25deg-chunk-1.zarr-v3
+  input_time_offsets_hours: [-6, 0]
+  lead_time_hours: 24
+  forecast_steps: 5
+  sample_stride_hours: 3
+  pressure_levels: [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
+  upper_air_variables:
+    [
+      geopotential,
+      temperature,
+      u_component_of_wind,
+      v_component_of_wind,
+      relative_humidity,
+      specific_humidity,
+      vertical_velocity,
+    ]
+  surface_variables:
+    [
+      2m_temperature,
+      10m_u_component_of_wind,
+      10m_v_component_of_wind,
+      mean_sea_level_pressure,
+      total_precipitation,
+    ]
+  static_variables: [land_sea_mask, orography, cos_latitude, cos_longitude, sin_longitude]
+  humidity_source: auto
+  orography_source: geopotential_at_surface
+  convert_geopotential_to_height: true
+  latitude_descending: true
+  include_sample_metadata: false
+  dynamic_ram_cache_time_steps: 32
+  dynamic_prefetch_block_time_steps: 8
+  apply_normalization: false
+  gcs_token: anon

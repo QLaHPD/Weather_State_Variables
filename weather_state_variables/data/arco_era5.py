@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
 import math
 import threading
@@ -60,11 +61,15 @@ _MAX_DYNAMIC_RAM_CACHE_TIME_STEPS = 64
 _DEFAULT_DYNAMIC_PREFETCH_BLOCK_TIME_STEPS = 8
 _DEFAULT_NORMALIZATION_STATS_PATH = Path("runs/cache/era5_fuxi_normalization.json")
 _DEFAULT_NORMALIZATION_FIT_SAMPLE_COUNT = 128
+_DEFAULT_VARIABLE_DOWNLOAD_WORKERS = 5
+_DEFAULT_DOWNLOAD_PREFETCH_CHUNK_COUNT = 4
 _NORMALIZATION_STATS_VERSION = 1
 _MIN_NORMALIZATION_STD = 1.0e-6
 _DYNAMIC_ZSCORE_KIND = "zscore"
 _DYNAMIC_LOG1P_MM_ZSCORE_KIND = "log1p_mm_zscore"
 _IDENTITY_KIND = "identity"
+
+_DOWNLOAD_DATASET_CACHE = threading.local()
 
 
 def _to_int_tuple(values: Sequence[int]) -> tuple[int, ...]:
@@ -689,6 +694,32 @@ class ArcoEra5NormalizationStats:
         )
 
 
+@dataclass(frozen=True)
+class _DownloadStepRequest:
+    step_number: int
+    time_index: int
+    time_value: pd.Timestamp
+    variable_names: tuple[str, ...]
+    include_static_sources: bool
+
+
+@dataclass(frozen=True)
+class _DownloadVariableTask:
+    step_number: int
+    variable_name: str
+    time_index: int | None
+    time_value: pd.Timestamp | None
+
+
+@dataclass(frozen=True)
+class _LoadedDownloadVariable:
+    step_number: int
+    variable_name: str
+    values: np.ndarray
+    dims: tuple[str, ...]
+    coords: dict[str, np.ndarray]
+
+
 def build_arco_era5_download_plan(
     available_variables: Sequence[str],
     config: ArcoEra5FuXiDataConfig | None = None,
@@ -816,7 +847,8 @@ def _build_download_chunk_dataset(
         )
         relative_humidity.name = "relative_humidity"
         data_vars["relative_humidity"] = relative_humidity
-        del data_vars["specific_humidity"]
+        if "specific_humidity" not in plan.output_dynamic_variables:
+            del data_vars["specific_humidity"]
 
     for variable_name in plan.source_surface_variables:
         data_vars[variable_name] = source_chunk[variable_name].astype(np.float32)
@@ -831,6 +863,460 @@ def _build_download_chunk_dataset(
         if latitude_values.shape[0] > 1 and latitude_values[0] < latitude_values[-1]:
             output = output.isel(latitude=slice(None, None, -1))
     return output
+
+
+def _ordered_unique_names(values: Sequence[str]) -> tuple[str, ...]:
+    ordered: list[str] = []
+    for value in values:
+        if value not in ordered:
+            ordered.append(value)
+    return tuple(ordered)
+
+
+def _download_output_attrs(
+    *,
+    data_config: ArcoEra5FuXiDataConfig,
+    download_plan: ArcoEra5DownloadPlan,
+    requested_start: pd.Timestamp | None,
+    requested_end: pd.Timestamp | None,
+) -> dict[str, Any]:
+    return {
+        "source_dataset_url": describe_arco_era5_dataset_location(data_config.dataset_url),
+        "source_gcs_token": data_config.gcs_token,
+        "pressure_levels": list(download_plan.pressure_levels),
+        "derived_relative_humidity": bool(download_plan.derive_relative_humidity),
+        "requested_start_time": None if requested_start is None else str(requested_start),
+        "requested_end_time": None if requested_end is None else str(requested_end),
+    }
+
+
+def _download_output_coordinate_values(
+    selected: xr.Dataset,
+    data_config: ArcoEra5FuXiDataConfig,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    level_values = np.asarray(selected["level"].values)
+    latitude_values = np.asarray(selected["latitude"].values)
+    longitude_values = np.asarray(selected["longitude"].values)
+    if (
+        data_config.latitude_descending
+        and latitude_values.shape[0] > 1
+        and latitude_values[0] < latitude_values[-1]
+    ):
+        latitude_values = latitude_values[::-1]
+    return level_values, latitude_values, longitude_values
+
+
+def _create_zarr_coordinate(root: Any, name: str, values: np.ndarray) -> None:
+    chunk_size = max(1, int(values.shape[0]))
+    array = root.create_dataset(
+        name,
+        data=values,
+        chunks=(chunk_size,),
+        fill_value=None,
+        overwrite=True,
+    )
+    array.attrs["_ARRAY_DIMENSIONS"] = [name]
+
+
+def _create_resizable_zarr_time(root: Any, *, total_time_size: int) -> None:
+    chunk_size = max(1, min(int(total_time_size), 4096))
+    array = root.create_dataset(
+        "time",
+        shape=(0,),
+        chunks=(chunk_size,),
+        dtype=np.dtype("datetime64[ns]"),
+        fill_value=None,
+        overwrite=True,
+    )
+    array.attrs["_ARRAY_DIMENSIONS"] = ["time"]
+
+
+def _download_pressure_output_variables(
+    download_plan: ArcoEra5DownloadPlan,
+    data_config: ArcoEra5FuXiDataConfig,
+) -> tuple[str, ...]:
+    pressure_names = set(data_config.upper_air_variables)
+    return tuple(name for name in download_plan.output_dynamic_variables if name in pressure_names)
+
+
+def _download_surface_output_variables(
+    download_plan: ArcoEra5DownloadPlan,
+    data_config: ArcoEra5FuXiDataConfig,
+) -> tuple[str, ...]:
+    surface_names = set(data_config.surface_variables)
+    return tuple(name for name in download_plan.output_dynamic_variables if name in surface_names)
+
+
+def _initialize_download_zarr_store(
+    output_path: Path,
+    selected: xr.Dataset,
+    download_plan: ArcoEra5DownloadPlan,
+    data_config: ArcoEra5FuXiDataConfig,
+    *,
+    include_static_sources: bool,
+    total_time_size: int,
+    attrs: dict[str, Any],
+) -> None:
+    import zarr
+
+    root = zarr.open_group(str(output_path), mode="w")
+    root.attrs.update(attrs)
+
+    level_values, latitude_values, longitude_values = _download_output_coordinate_values(selected, data_config)
+    _create_resizable_zarr_time(root, total_time_size=total_time_size)
+    _create_zarr_coordinate(root, "level", level_values)
+    _create_zarr_coordinate(root, "latitude", latitude_values)
+    _create_zarr_coordinate(root, "longitude", longitude_values)
+
+    latitude_size = int(latitude_values.shape[0])
+    longitude_size = int(longitude_values.shape[0])
+    level_size = int(level_values.shape[0])
+    pressure_shape = (0, level_size, latitude_size, longitude_size)
+    pressure_chunks = (1, level_size, latitude_size, longitude_size)
+    surface_shape = (0, latitude_size, longitude_size)
+    surface_chunks = (1, latitude_size, longitude_size)
+    static_shape = (latitude_size, longitude_size)
+    static_chunks = static_shape
+
+    for variable_name in _download_pressure_output_variables(download_plan, data_config):
+        array = root.create_dataset(
+            variable_name,
+            shape=pressure_shape,
+            chunks=pressure_chunks,
+            dtype=np.float32,
+            fill_value=np.nan,
+        )
+        array.attrs["_ARRAY_DIMENSIONS"] = ["time", "level", "latitude", "longitude"]
+
+    for variable_name in _download_surface_output_variables(download_plan, data_config):
+        array = root.create_dataset(
+            variable_name,
+            shape=surface_shape,
+            chunks=surface_chunks,
+            dtype=np.float32,
+            fill_value=np.nan,
+        )
+        array.attrs["_ARRAY_DIMENSIONS"] = ["time", "latitude", "longitude"]
+
+    if include_static_sources:
+        for variable_name in download_plan.source_static_variables:
+            array = root.create_dataset(
+                variable_name,
+                shape=static_shape,
+                chunks=static_chunks,
+                dtype=np.float32,
+                fill_value=np.nan,
+            )
+            array.attrs["_ARRAY_DIMENSIONS"] = ["latitude", "longitude"]
+
+
+def _remove_download_zarr_consolidated_metadata(output_path: Path) -> None:
+    metadata_path = output_path / ".zmetadata"
+    if metadata_path.exists():
+        metadata_path.unlink()
+
+
+def _open_download_zarr_store_for_writes(output_path: Path, attrs: dict[str, Any]) -> Any:
+    import zarr
+
+    _remove_download_zarr_consolidated_metadata(output_path)
+    root = zarr.open_group(str(output_path), mode="r+")
+    root.attrs.update(attrs)
+    return root
+
+
+def _resize_zarr_time_array(array: Any, target_time_size: int) -> None:
+    if int(array.shape[0]) >= target_time_size:
+        return
+    array.resize((target_time_size, *array.shape[1:]))
+
+
+def _encode_download_time_value(time_array: Any, value: pd.Timestamp) -> Any:
+    if np.issubdtype(np.dtype(time_array.dtype), np.datetime64):
+        return np.datetime64(value.to_datetime64(), "ns")
+
+    units = time_array.attrs.get("units")
+    calendar = time_array.attrs.get("calendar")
+    if units is not None:
+        encoded, _, _ = xr.coding.times.encode_cf_datetime(
+            np.asarray([np.datetime64(value.to_datetime64(), "ns")]),
+            units=str(units),
+            calendar=None if calendar is None else str(calendar),
+            dtype=np.dtype(time_array.dtype),
+        )
+        return encoded[0]
+
+    return np.asarray([np.datetime64(value.to_datetime64(), "ns")]).astype(time_array.dtype)[0]
+
+
+def _write_download_step_to_zarr(
+    root: Any,
+    output_chunk: xr.Dataset,
+    step_request: _DownloadStepRequest,
+    download_plan: ArcoEra5DownloadPlan,
+) -> None:
+    target_time_size = int(step_request.time_index) + 1
+    dynamic_variable_names = _ordered_unique_names(download_plan.output_dynamic_variables)
+
+    for variable_name in dynamic_variable_names:
+        if variable_name not in output_chunk.data_vars:
+            raise KeyError(f"Prepared timestep is missing output variable {variable_name!r}")
+        array = root[variable_name]
+        _resize_zarr_time_array(array, target_time_size)
+        prepared = _select_prepared_output_time(output_chunk[variable_name], step_request)
+        target_dims = tuple(array.attrs.get("_ARRAY_DIMENSIONS", prepared.dims))
+        values = np.asarray(prepared.transpose(*target_dims).data, dtype=np.float32)
+        if values.shape[0] != 1:
+            raise ValueError(
+                f"Expected one time step for {variable_name!r}, got shape {values.shape} "
+                f"at step={step_request.step_number} time_index={step_request.time_index} "
+                f"time_value={step_request.time_value}"
+            )
+        array[int(step_request.time_index) : target_time_size, ...] = values
+
+    if step_request.include_static_sources:
+        for variable_name in download_plan.source_static_variables:
+            if variable_name not in output_chunk.data_vars:
+                raise KeyError(f"Prepared timestep is missing static variable {variable_name!r}")
+            array = root[variable_name]
+            prepared = _drop_single_time_dimension(
+                _select_prepared_output_time(output_chunk[variable_name], step_request)
+            )
+            target_dims = tuple(array.attrs.get("_ARRAY_DIMENSIONS", prepared.dims))
+            root[variable_name][...] = np.asarray(
+                prepared.transpose(*target_dims).data,
+                dtype=np.float32,
+            )
+
+    time_array = root["time"]
+    _resize_zarr_time_array(time_array, target_time_size)
+    time_array[int(step_request.time_index)] = _encode_download_time_value(
+        time_array,
+        step_request.time_value,
+    )
+
+
+def _detach_loaded_download_array(
+    variable_name: str,
+    step_number: int,
+    array: xr.DataArray,
+) -> _LoadedDownloadVariable:
+    loaded = array.load()
+    coords: dict[str, np.ndarray] = {}
+    for coord_name, coord in loaded.coords.items():
+        if all(dim in loaded.dims for dim in coord.dims):
+            coords[str(coord_name)] = np.asarray(coord.values)
+    return _LoadedDownloadVariable(
+        step_number=step_number,
+        variable_name=variable_name,
+        values=np.asarray(loaded.data),
+        dims=tuple(str(dim) for dim in loaded.dims),
+        coords=coords,
+    )
+
+
+def _select_download_task_time(array: xr.DataArray, task: _DownloadVariableTask) -> xr.DataArray:
+    if task.time_index is None or "time" not in array.dims:
+        return array
+
+    if task.time_value is not None:
+        try:
+            return array.sel(time=[task.time_value])
+        except (KeyError, TypeError, ValueError):
+            pass
+    return array.isel(time=slice(int(task.time_index), int(task.time_index) + 1))
+
+
+def _validate_loaded_download_variable(loaded: _LoadedDownloadVariable, task: _DownloadVariableTask) -> None:
+    if task.time_index is None or "time" not in loaded.dims:
+        return
+    time_axis = loaded.dims.index("time")
+    time_size = int(loaded.values.shape[time_axis])
+    if time_size != 1:
+        raise ValueError(
+            "Download worker loaded an unexpected number of time steps for "
+            f"{task.variable_name!r}: expected 1 at step={task.step_number} "
+            f"time_index={task.time_index} time_value={task.time_value}, "
+            f"got shape {loaded.values.shape}."
+        )
+
+
+def _select_prepared_output_time(
+    array: xr.DataArray,
+    step_request: _DownloadStepRequest,
+) -> xr.DataArray:
+    if "time" not in array.dims:
+        return array
+    time_size = int(array.sizes["time"])
+    if time_size == 1:
+        return array
+    try:
+        selected = array.sel(time=[step_request.time_value])
+    except (KeyError, TypeError, ValueError):
+        selected = array.isel(time=slice(int(step_request.time_index), int(step_request.time_index) + 1))
+    if int(selected.sizes["time"]) != 1:
+        raise ValueError(
+            f"Expected one time step for {array.name!r}, got shape {tuple(array.shape)} "
+            f"at step={step_request.step_number} time_index={step_request.time_index} "
+            f"time_value={step_request.time_value}."
+        )
+    return selected
+
+
+def _drop_single_time_dimension(array: xr.DataArray) -> xr.DataArray:
+    if "time" not in array.dims:
+        return array
+    if int(array.sizes["time"]) != 1:
+        raise ValueError(f"Expected a single time step for {array.name!r}, got shape {tuple(array.shape)}")
+    return array.isel(time=0, drop=True)
+
+
+def _loaded_download_variable_to_data_array(loaded: _LoadedDownloadVariable) -> xr.DataArray:
+    return xr.DataArray(
+        loaded.values,
+        dims=loaded.dims,
+        coords=loaded.coords,
+        name=loaded.variable_name,
+    )
+
+
+def _get_download_thread_local_dataset(
+    dataset_url: str | Path,
+    *,
+    gcs_token: str,
+    requested_start: pd.Timestamp | None,
+    requested_end: pd.Timestamp | None,
+    pressure_levels: Sequence[int],
+) -> xr.Dataset:
+    cache = getattr(_DOWNLOAD_DATASET_CACHE, "datasets", None)
+    if cache is None:
+        cache = {}
+        _DOWNLOAD_DATASET_CACHE.datasets = cache
+    key = (
+        str(dataset_url),
+        str(gcs_token),
+        None if requested_start is None else str(requested_start),
+        None if requested_end is None else str(requested_end),
+        tuple(int(level) for level in pressure_levels),
+    )
+    dataset = cache.get(key)
+    if dataset is None:
+        dataset = open_arco_era5_dataset(dataset_url, gcs_token=gcs_token)
+        if requested_start is not None or requested_end is not None:
+            dataset = dataset.sel(time=slice(requested_start, requested_end))
+        if "level" in dataset.coords:
+            dataset = dataset.sel(level=list(pressure_levels))
+        cache[key] = dataset
+    return dataset
+
+
+def _load_download_variable_task(
+    dataset_url: str | Path,
+    *,
+    gcs_token: str,
+    requested_start: pd.Timestamp | None,
+    requested_end: pd.Timestamp | None,
+    pressure_levels: Sequence[int],
+    task: _DownloadVariableTask,
+) -> _LoadedDownloadVariable:
+    source_dataset = _get_download_thread_local_dataset(
+        dataset_url,
+        gcs_token=gcs_token,
+        requested_start=requested_start,
+        requested_end=requested_end,
+        pressure_levels=pressure_levels,
+    )
+    array = source_dataset[task.variable_name]
+    array = _select_download_task_time(array, task)
+    loaded = _detach_loaded_download_array(task.variable_name, task.step_number, array)
+    _validate_loaded_download_variable(loaded, task)
+    return loaded
+
+
+def _build_download_step_requests(
+    *,
+    time_values: pd.Index,
+    start_index: int,
+    stop_index: int,
+    plan: ArcoEra5DownloadPlan,
+    include_static_sources: bool,
+) -> list[_DownloadStepRequest]:
+    requests: list[_DownloadStepRequest] = []
+    for step_number, time_index in enumerate(range(start_index, stop_index), start=1):
+        variable_names = list(plan.source_pressure_variables)
+        variable_names.extend(plan.source_surface_variables)
+        include_static_for_step = include_static_sources and time_index == 0 and step_number == 1
+        if include_static_for_step:
+            variable_names.extend(plan.source_static_variables)
+        requests.append(
+            _DownloadStepRequest(
+                step_number=step_number,
+                time_index=time_index,
+                time_value=pd.Timestamp(time_values[time_index]),
+                variable_names=_ordered_unique_names(variable_names),
+                include_static_sources=include_static_for_step,
+            )
+        )
+    return requests
+
+
+def _build_download_variable_tasks(
+    step_request: _DownloadStepRequest,
+    plan: ArcoEra5DownloadPlan,
+) -> tuple[_DownloadVariableTask, ...]:
+    tasks: list[_DownloadVariableTask] = []
+    for variable_name in step_request.variable_names:
+        tasks.append(
+            _DownloadVariableTask(
+                step_number=step_request.step_number,
+                variable_name=variable_name,
+                time_index=step_request.time_index,
+                time_value=step_request.time_value,
+            )
+        )
+    return tuple(tasks)
+
+
+def _load_download_source_chunk(
+    source_dataset: xr.Dataset,
+    plan: ArcoEra5DownloadPlan,
+    *,
+    start_index: int,
+    stop_index: int,
+    include_static_sources: bool,
+    variable_download_workers: int | None = None,
+    surface_variable_download_workers: int | None = None,
+) -> xr.Dataset:
+    if variable_download_workers is None:
+        variable_download_workers = surface_variable_download_workers
+    if variable_download_workers is None:
+        variable_download_workers = _DEFAULT_VARIABLE_DOWNLOAD_WORKERS
+    if variable_download_workers <= 0:
+        raise ValueError(
+            "variable_download_workers must be positive, "
+            f"got {variable_download_workers}"
+        )
+
+    variable_names = [
+        *plan.source_pressure_variables,
+        *plan.source_surface_variables,
+    ]
+    if include_static_sources:
+        variable_names.extend(plan.source_static_variables)
+    variable_names = list(_ordered_unique_names(variable_names))
+
+    def load_variable(variable_name: str) -> tuple[str, xr.DataArray]:
+        array = source_dataset[variable_name]
+        if "time" in array.dims:
+            array = array.isel(time=slice(start_index, stop_index))
+        return variable_name, array.load()
+
+    if int(variable_download_workers) == 1 or len(variable_names) <= 1:
+        loaded = [load_variable(variable_name) for variable_name in variable_names]
+    else:
+        with ThreadPoolExecutor(max_workers=int(variable_download_workers)) as executor:
+            loaded = list(executor.map(load_variable, variable_names))
+    return xr.Dataset({name: array for name, array in loaded})
 
 
 def download_arco_era5_subset(
@@ -848,9 +1334,23 @@ def download_arco_era5_subset(
     verbose: bool = True,
     show_progress: bool = True,
     repair_inconsistent_resume_store: bool = True,
+    variable_download_workers: int | None = None,
+    prefetch_chunk_count: int = _DEFAULT_DOWNLOAD_PREFETCH_CHUNK_COUNT,
+    surface_variable_download_workers: int | None = None,
 ) -> dict[str, Any]:
     if chunk_size <= 0:
         raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+    if variable_download_workers is None:
+        variable_download_workers = surface_variable_download_workers
+    if variable_download_workers is None:
+        variable_download_workers = _DEFAULT_VARIABLE_DOWNLOAD_WORKERS
+    if variable_download_workers <= 0:
+        raise ValueError(
+            "variable_download_workers must be positive, "
+            f"got {variable_download_workers}"
+        )
+    if prefetch_chunk_count <= 0:
+        raise ValueError(f"prefetch_chunk_count must be positive, got {prefetch_chunk_count}")
 
     data_config = ArcoEra5FuXiDataConfig.from_yaml(config_path)
     if dataset_url is not None:
@@ -880,6 +1380,8 @@ def download_arco_era5_subset(
             f"Requested time range: {requested_start!s} -> {requested_end!s}"
         )
 
+    time_size = int(selected.sizes["time"])
+    time_values = pd.Index(pd.to_datetime(selected["time"].values))
     resolved_output_path = Path(output_path).resolve()
     start_index = 0
     resumed_from_time_steps = 0
@@ -892,7 +1394,7 @@ def download_arco_era5_subset(
                 resolved_output_path.unlink()
         elif resume:
             try:
-                existing = xr.open_zarr(resolved_output_path, consolidated=None)
+                existing = xr.open_zarr(resolved_output_path, consolidated=False)
             except ValueError as exc:
                 if (
                     repair_inconsistent_resume_store
@@ -912,14 +1414,14 @@ def download_arco_era5_subset(
                             "[download_arco_era5_subset] repair summary: "
                             f"{json.dumps(repair_summary, sort_keys=True)}"
                         )
-                    existing = xr.open_zarr(resolved_output_path, consolidated=None)
+                    existing = xr.open_zarr(resolved_output_path, consolidated=False)
                 else:
                     raise
             existing_time_size = int(existing.sizes.get("time", 0))
-            if existing_time_size > int(selected.sizes["time"]):
+            if existing_time_size > time_size:
                 raise ValueError(
                     f"Existing output has {existing_time_size} time steps, "
-                    f"but the requested slice has only {int(selected.sizes['time'])}."
+                    f"but the requested slice has only {time_size}."
                 )
 
             expected_dynamic_variables = set(download_plan.output_dynamic_variables)
@@ -957,7 +1459,7 @@ def download_arco_era5_subset(
 
             start_index = existing_time_size
             resumed_from_time_steps = existing_time_size
-            already_complete = existing_time_size == int(selected.sizes["time"])
+            already_complete = existing_time_size == time_size
         else:
             raise FileExistsError(
                 f"Output path already exists: {resolved_output_path}. "
@@ -965,10 +1467,15 @@ def download_arco_era5_subset(
             )
     resolved_output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    time_size = int(selected.sizes["time"])
     remaining_time_steps = max(time_size - start_index, 0)
     total_chunks = (remaining_time_steps + chunk_size - 1) // chunk_size if remaining_time_steps else 0
     first_chunk_time_size = 0
+    output_attrs = _download_output_attrs(
+        data_config=data_config,
+        download_plan=download_plan,
+        requested_start=requested_start,
+        requested_end=requested_end,
+    )
     if already_complete:
         summary = {
             "output_path": str(resolved_output_path),
@@ -993,11 +1500,26 @@ def download_arco_era5_subset(
             "resume_enabled": resume,
             "resumed_from_time_steps": resumed_from_time_steps,
             "remaining_time_steps": remaining_time_steps,
+            "variable_download_workers": int(variable_download_workers),
+            "surface_variable_download_workers": int(variable_download_workers),
+            "prefetch_chunk_count": int(prefetch_chunk_count),
             "already_complete": True,
         }
         if verbose:
             print(f"[download_arco_era5_subset] output already complete at {resolved_output_path}")
         return summary
+
+    if not resolved_output_path.exists():
+        _initialize_download_zarr_store(
+            resolved_output_path,
+            selected,
+            download_plan,
+            data_config,
+            include_static_sources=include_static_sources,
+            total_time_size=time_size,
+            attrs=output_attrs,
+        )
+    output_root = _open_download_zarr_store_for_writes(resolved_output_path, output_attrs)
 
     progress_bar = None
     if show_progress and tqdm is not None:
@@ -1010,53 +1532,99 @@ def download_arco_era5_subset(
     elif show_progress and verbose and tqdm is None:
         print("[download_arco_era5_subset] tqdm is not installed; continuing without a progress bar.")
 
-    try:
-        for chunk_number, chunk_start_index in enumerate(range(start_index, time_size, chunk_size), start=1):
-            stop_index = min(chunk_start_index + chunk_size, time_size)
-            source_chunk = selected.isel(time=slice(chunk_start_index, stop_index)).load()
-            output_chunk = _build_download_chunk_dataset(
-                source_chunk,
-                download_plan,
-                data_config,
-                include_static_sources=include_static_sources and start_index == 0 and chunk_number == 1,
-            )
-            output_chunk.attrs.update(
-                {
-                    "source_dataset_url": describe_arco_era5_dataset_location(data_config.dataset_url),
-                    "source_gcs_token": data_config.gcs_token,
-                    "pressure_levels": list(download_plan.pressure_levels),
-                    "derived_relative_humidity": bool(download_plan.derive_relative_humidity),
-                    "requested_start_time": None if requested_start is None else str(requested_start),
-                    "requested_end_time": None if requested_end is None else str(requested_end),
-                }
-            )
+    step_requests = _build_download_step_requests(
+        time_values=time_values,
+        start_index=start_index,
+        stop_index=time_size,
+        plan=download_plan,
+        include_static_sources=include_static_sources,
+    )
+    step_requests_by_number = {request.step_number: request for request in step_requests}
+    step_results: dict[int, dict[str, _LoadedDownloadVariable]] = {}
+    ready_source_steps: dict[int, xr.Dataset] = {}
+    next_submit_index = 0
+    next_write_step_number = 1
+    prefetch_time_steps = int(prefetch_chunk_count)
 
-            is_first_write = chunk_start_index == 0 and chunk_number == 1
-            mode = "w" if is_first_write else "a"
-            append_dim = None if is_first_write else "time"
-            output_chunk.to_zarr(
-                resolved_output_path,
-                mode=mode,
-                append_dim=append_dim,
-                consolidated=False,
-            )
-            if is_first_write:
-                first_chunk_time_size = int(output_chunk.sizes.get("time", 0))
-
-            chunk_time_steps = stop_index - chunk_start_index
-            if progress_bar is not None:
-                chunk_start = pd.Timestamp(source_chunk["time"].values[0])
-                chunk_end = pd.Timestamp(source_chunk["time"].values[-1])
-                progress_bar.update(chunk_time_steps)
-                progress_bar.set_postfix_str(f"{chunk_start} -> {chunk_end}")
-
-            if verbose and progress_bar is None:
-                chunk_start = pd.Timestamp(source_chunk["time"].values[0])
-                chunk_end = pd.Timestamp(source_chunk["time"].values[-1])
-                print(
-                    f"[download_arco_era5_subset] wrote chunk {chunk_number}/{max(total_chunks, 1)} "
-                    f"({chunk_start} -> {chunk_end})"
+    def submit_prefetch_window(
+        executor: ThreadPoolExecutor,
+        pending_futures: dict[Any, _DownloadVariableTask],
+    ) -> None:
+        nonlocal next_submit_index
+        while next_submit_index < len(step_requests):
+            active_step_count = next_submit_index - (next_write_step_number - 1)
+            if active_step_count >= prefetch_time_steps:
+                break
+            step_request = step_requests[next_submit_index]
+            for task in _build_download_variable_tasks(step_request, download_plan):
+                future = executor.submit(
+                    _load_download_variable_task,
+                    data_config.dataset_url,
+                    gcs_token=data_config.gcs_token,
+                    requested_start=requested_start,
+                    requested_end=requested_end,
+                    pressure_levels=download_plan.pressure_levels,
+                    task=task,
                 )
+                pending_futures[future] = task
+            next_submit_index += 1
+
+    try:
+        pending_futures: dict[Any, _DownloadVariableTask] = {}
+        with ThreadPoolExecutor(max_workers=int(variable_download_workers)) as executor:
+            submit_prefetch_window(executor, pending_futures)
+
+            while pending_futures:
+                done, _ = wait(tuple(pending_futures.keys()), return_when=FIRST_COMPLETED)
+                for future in done:
+                    pending_futures.pop(future)
+                    loaded = future.result()
+                    step_number = loaded.step_number
+                    variable_name = loaded.variable_name
+                    step_request = step_requests_by_number[step_number]
+                    step_bucket = step_results.setdefault(step_number, {})
+                    step_bucket[variable_name] = loaded
+                    if len(step_bucket) == len(step_request.variable_names):
+                        ready_source_steps[step_number] = xr.Dataset(
+                            {
+                                name: _loaded_download_variable_to_data_array(step_bucket[name])
+                                for name in step_request.variable_names
+                            }
+                        )
+                        del step_results[step_number]
+
+                while next_write_step_number in ready_source_steps:
+                    step_request = step_requests_by_number[next_write_step_number]
+                    source_chunk = ready_source_steps.pop(next_write_step_number)
+                    output_chunk = _build_download_chunk_dataset(
+                        source_chunk,
+                        download_plan,
+                        data_config,
+                        include_static_sources=step_request.include_static_sources,
+                    )
+                    _write_download_step_to_zarr(
+                        output_root,
+                        output_chunk,
+                        step_request,
+                        download_plan,
+                    )
+                    if step_request.time_index == 0 and next_write_step_number == 1:
+                        first_chunk_time_size = int(output_chunk.sizes.get("time", 0))
+
+                    if progress_bar is not None:
+                        progress_bar.update(1)
+                        progress_bar.set_postfix_str(str(step_request.time_value))
+
+                    if verbose and progress_bar is None:
+                        print(
+                            f"[download_arco_era5_subset] wrote timestep {step_request.step_number}/{max(remaining_time_steps, 1)} "
+                            f"({step_request.time_value})"
+                        )
+
+                    del output_chunk
+                    del source_chunk
+                    next_write_step_number += 1
+                    submit_prefetch_window(executor, pending_futures)
     finally:
         if progress_bar is not None:
             progress_bar.close()
@@ -1089,6 +1657,9 @@ def download_arco_era5_subset(
         "resume_enabled": resume,
         "resumed_from_time_steps": resumed_from_time_steps,
         "remaining_time_steps": remaining_time_steps,
+        "variable_download_workers": int(variable_download_workers),
+        "surface_variable_download_workers": int(variable_download_workers),
+        "prefetch_chunk_count": int(prefetch_chunk_count),
         "already_complete": False,
     }
     if verbose:
